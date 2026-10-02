@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { siteKeys, getConfigDir } from './config.mjs';
 import { listAccounts, updateCreditDetail, markExhausted } from './pool.mjs';
-import { queryCredit } from './upstream.mjs';
+import { queryCredit, openChat, aggregateFrames } from './upstream.mjs';
 import { billingHeaders } from './headers.mjs';
 import { getAuth, ensureToken } from './auth.mjs';
 import { log, warn } from './log.mjs';
@@ -186,11 +186,83 @@ async function claimReward(cfg, site, auth, siteCfg, taskCode) {
 }
 
 /**
- * 成长任务扫描：报名所有可报名任务 + 领取所有达标奖励。
- * 进度类任务（对话 N 次）靠真实使用点亮，这里只做报名与领奖。
+ * 成长任务扫描：报名所有可报名任务 + 代打「对话体验类」任务 + 领取所有达标奖励。
+ *
+ * 代打范围（实测上游按真实对话计数）：code 为 Model_chat_<模型>（体验指定模型）、
+ * chat_<N>（聊天 N 次）、RichMeow_Chat（桌面端对话）这类任务，进度由真实对话点亮，
+ * 桥接发极小对话请求（max_tokens 16）即可完成，成本可忽略（x0.06 倍率 ≈ 0.01 积分/次）。
+ * 其余类型（公众号关注、体验客户端功能）无法从服务端代打，保持只报名+领奖。
+ */
+const CHAT_TASK_RE = [/^Model_chat_(.+)$/i, /^chat_\d+$/i, /^RichMeow_Chat$/i];
+
+function normalizeId(s) {
+  return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
+/** 从任务 code 反推要打的模型 id（GLM5.2 → glm-5.2/glm5.2/...），匹配不到用默认模型。 */
+function guessChatModel(suffix, cfg, site) {
+  const want = normalizeId(suffix);
+  const candidates = new Set();
+  for (const m of cfg.models || []) candidates.add(typeof m === 'string' ? m : m?.id);
+  // 懒加载目录太重，这里只用 cfg.models + 别名表；匹配不到就落到 defaultModel
+  let exact = null, partial = null;
+  for (const id of candidates) {
+    if (!id || id === 'auto') continue;
+    const n = normalizeId(id);
+    if (n === want) { exact = id; break; }
+    if (!partial && (n.includes(want) || want.includes(n))) partial = id;
+  }
+  return exact || partial || cfg.defaultModel;
+}
+
+function chatAttemptsFor(task) {
+  for (const re of CHAT_TASK_RE) {
+    const m = String(task.code || '').match(re);
+    if (m) return { match: true, suffix: m[1] || null };
+  }
+  return { match: false };
+}
+
+/** 对未达标的对话类任务代打极小请求，返回 { chats, tasks }（tasks 是代打过的任务标题）。 */
+async function autoCompleteChatTasks(cfg, site, accountId, tasks) {
+  const cap = Number(cfg.tasks?.maxChatsPerTask) || 5;
+  const todo = tasks.filter((t) => t.code && !t.claimed && t.acceptStatus === 'accepted' && t.current < t.target && chatAttemptsFor(t).match);
+  let chats = 0;
+  const touched = [];
+  for (const t of todo) {
+    const attempts = Math.min(t.target - t.current, cap);
+    const { suffix } = chatAttemptsFor(t);
+    const model = suffix ? guessChatModel(suffix, cfg, site) : cfg.defaultModel;
+    let okCount = 0;
+    for (let i = 0; i < attempts; i++) {
+      try {
+        const r = await openChat(cfg, site, {
+          model,
+          messages: [{ role: 'user', content: '回复"ok"两个字母即可' }],
+          max_tokens: 64,
+          stream: false,
+        }, { accountId });
+        // 消费完帧再关，保证上游把这次对话计数
+        for await (const _f of r.up.frames) { void _f; }
+        r.up.close();
+        okCount++;
+        chats++;
+      } catch (e) {
+        warn(`[${site}] 任务代打失败（${t.title} 第 ${i + 1} 次）：`, String(e.message || e).slice(0, 120));
+        break;
+      }
+    }
+    if (okCount) touched.push(`${t.title}×${okCount}`);
+  }
+  return { chats, tasks: touched };
+}
+
+/**
+ * 成长任务扫描：报名所有可报名任务 → 代打「对话体验类」任务 → 领取所有达标奖励。
+ * 非对话类任务（公众号关注、体验客户端功能等）无法服务端代打，保持只报名+领奖。
  */
 export async function growthScanAccount(cfg, site, accountId) {
-  const tasks = await listGrowthTasks(cfg, site, accountId);
+  let tasks = await listGrowthTasks(cfg, site, accountId);
   const auth = getAuth(site);
   const siteCfg = cfg.sites[site];
 
@@ -202,6 +274,18 @@ export async function growthScanAccount(cfg, site, accountId) {
       accepted = toAccept.length;
     } catch (e) {
       warn(`[${site}] 任务报名失败（${toAccept.join(',')}）：`, e.message);
+    }
+  }
+
+  // 对话体验类任务代打（可关）；打过之后重新拉一次列表，让新达标的奖励在本轮就被领走
+  let autoChats = 0;
+  let autoTasks = [];
+  if (cfg.tasks?.autoComplete !== false) {
+    try {
+      ({ chats: autoChats, tasks: autoTasks } = await autoCompleteChatTasks(cfg, site, accountId, tasks));
+      if (autoChats > 0) tasks = await listGrowthTasks(cfg, site, accountId);
+    } catch (e) {
+      warn(`[${site}] 对话类任务代打异常：`, e.message);
     }
   }
 
@@ -218,7 +302,7 @@ export async function growthScanAccount(cfg, site, accountId) {
       warn(`[${site}] 领奖失败（${t.title}）：`, e.message);
     }
   }
-  return { ok: true, accepted, claimed, creditGained, tasks: tasks.length };
+  return { ok: true, accepted, autoChats, autoTasks, claimed, creditGained, tasks: tasks.length };
 }
 
 /** 领奖后顺手刷新余额（积分到账要反映到调度缓存里）。 */
@@ -302,6 +386,20 @@ function hoursHit(hours) {
   return Array.isArray(hours) && hours.includes(new Date().getHours());
 }
 
+/**
+ * 判断此刻是否到点：优先用精确时点 ["HH:MM"]（checkinTimes/growthTimes），
+ * 未配置时回落到旧的小时数组（checkinHours/growthHours，整点语义）。
+ */
+function scheduledNow(cfg, kind, d = new Date()) {
+  const t = cfg.tasks || {};
+  const times = kind === 'checkin' ? t.checkinTimes : t.growthTimes;
+  if (Array.isArray(times) && times.length) {
+    const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    return times.includes(hhmm);
+  }
+  return hoursHit(kind === 'checkin' ? t.checkinHours : t.growthHours);
+}
+
 function summarize(result) {
   const out = {};
   for (const [k, list] of Object.entries(result || {})) {
@@ -314,7 +412,7 @@ function summarize(result) {
   return out;
 }
 
-/** 启动任务调度循环（每 10 分钟检查一次；每天每类任务最多触发一次）。 */
+/** 启动任务调度循环（每分钟检查到点；支持 ["HH:MM"] 精确时点与旧的小时数组；每天每类最多一次）。 */
 export function startTaskLoop(cfg) {
   if (timers.tasks) return;
   if (cfg.tasks?.enabled === false) {
@@ -324,9 +422,9 @@ export function startTaskLoop(cfg) {
   timers.tasks = setInterval(async () => {
     try {
       const today = todayKey();
-      const kind = hoursHit(cfg.tasks?.checkinHours) && firedDay.checkin !== today
+      const kind = scheduledNow(cfg, 'checkin') && firedDay.checkin !== today
         ? 'checkin'
-        : hoursHit(cfg.tasks?.growthHours) && firedDay.growth !== today
+        : scheduledNow(cfg, 'growth') && firedDay.growth !== today
           ? 'growth'
           : null;
       if (!kind) return;
@@ -338,9 +436,9 @@ export function startTaskLoop(cfg) {
     } catch (e) {
       warn('任务循环异常：', e.message);
     }
-  }, 10 * 60_000);
+  }, 60_000);
   timers.tasks.unref?.();
-  log('自动任务调度已启动（签到/成长任务）');
+  log('自动任务调度已启动（签到/成长任务，支持 HH:MM 精确时点）');
 }
 
 async function runAndLog(cfg, kind) {

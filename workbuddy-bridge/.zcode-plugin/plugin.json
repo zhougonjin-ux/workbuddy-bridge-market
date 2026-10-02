@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-bridge",
-  "version": "0.3.6",
+  "version": "0.3.7",
   "description": "Bridge ZCode to Tencent WorkBuddy/CodeBuddy credits and models: local OpenAI/Anthropic-compatible proxy, expiry-first credit scheduling across multiple accounts, local client account auto-import, WeChat QR login, visual management console, daily check-in/task automation, and automatic registration of WorkBuddy models into ZCode's model picker.",
   "author": {
     "name": "local"

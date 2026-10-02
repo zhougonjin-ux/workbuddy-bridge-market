@@ -292,6 +292,41 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, 200, { ok: true, kind, results });
   }
 
+  // 保存自动任务设置：精确时点（"HH:MM" 逗号分隔，空串=回退到旧的小时数组）、
+  // 对话体验类任务代打开关与单任务代打上限。立即落盘 config.json（调度循环热读取）。
+  if (p === '/tasks/config' && method === 'POST') {
+    const body = ctx.body || {};
+    const parseTimes = (v) => String(v ?? '')
+      .split(/[,，;；\s]+/)
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => s.padStart(5, '0'));
+    const norm = { checkinTimes: parseTimes(body.checkinTimes), growthTimes: parseTimes(body.growthTimes) };
+    for (const [k, arr] of Object.entries(norm)) {
+      if (arr.some((s) => !/^([01]?\d|2[0-3]):[0-5]\d$/.test(s))) {
+        return sendJson(res, 400, { ok: false, error: `${k} 里有非法时点（应为 HH:MM，如 09:30）：${arr.join(',')}` });
+      }
+    }
+    cfg.tasks.checkinTimes = norm.checkinTimes;
+    cfg.tasks.growthTimes = norm.growthTimes;
+    if (typeof body.autoComplete === 'boolean') cfg.tasks.autoComplete = body.autoComplete;
+    if (body.maxChatsPerTask !== undefined) {
+      const n = Number(body.maxChatsPerTask);
+      if (!Number.isInteger(n) || n < 1 || n > 20) return sendJson(res, 400, { ok: false, error: 'maxChatsPerTask 须为 1-20 整数' });
+      cfg.tasks.maxChatsPerTask = n;
+    }
+    saveConfig(cfg);
+    return sendJson(res, 200, {
+      ok: true,
+      saved: {
+        checkinTimes: cfg.tasks.checkinTimes,
+        growthTimes: cfg.tasks.growthTimes,
+        autoComplete: cfg.tasks.autoComplete,
+        maxChatsPerTask: cfg.tasks.maxChatsPerTask,
+      },
+    });
+  }
+
   // ---- workbuddy-bridge：导入本机已登录客户端的账号 ----
   if (p === '/local/import' && method === 'POST') {
     const result = await importLocalAccounts(cfg);

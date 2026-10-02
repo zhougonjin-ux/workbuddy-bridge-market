@@ -631,16 +631,33 @@ async function loadTasks() {
       return `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">${entries.map(([uid, e]) => `
         <div class="card" style="padding:11px 14px">
           <div class="row"><span class="badge ${e.ok ? 'ok' : 'bad'}">${e.ok ? '✓' : '✗'} ${esc(e.date || '')}</span><b style="font-size:13px">${esc(labelOf[uid] || uid.slice(0, 10) + '…')}</b></div>
-          <div class="muted" style="font-size:12px;margin-top:4px">${esc(e.msg || (e.claimed != null ? `报名 ${e.accepted} · 领奖 ${e.claimed} · +${e.creditGained} 积分` : ''))}</div>
+          <div class="muted" style="font-size:12px;margin-top:4px">${esc(e.msg || (e.claimed != null ? `报名 ${e.accepted} · 代打 ${e.autoChats ?? 0} · 领奖 ${e.claimed} · +${e.creditGained} 积分${(e.autoTasks || []).length ? '（' + e.autoTasks.join('、') + '）' : ''}` : ''))}</div>
         </div>`).join('')}</div>`;
     };
     el.innerHTML = `
-      <h2>自动任务 <span class="sub">config.json → tasks 可配置开关与时点</span></h2>
+      <h2>自动任务 <span class="sub">时点可自定义（HH:MM，逗号分隔多个）；不填则回退到整点小时</span></h2>
+      <div class="card" style="margin-bottom:14px">
+        <div class="row" style="flex-wrap:wrap;gap:10px">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px">签到时点
+            <input id="tkCheckinTimes" value="${esc((cfg.checkinTimes || []).join(', '))}" placeholder="09:00, 21:30" style="width:170px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px">成长任务时点
+            <input id="tkGrowthTimes" value="${esc((cfg.growthTimes || []).join(', '))}" placeholder="01:00, 13:20" style="width:170px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="成长任务里的「体验指定模型 / 聊天N次」类任务，由桥接代打极小请求点亮进度（单任务每次最多代打次数见下方数字）；公众号关注等人工任务无法代打">
+            <input type="checkbox" id="tkAuto" ${cfg.autoComplete === false ? '' : 'checked'}> 自动完成对话体验类任务
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px">单任务代打上限
+            <input id="tkMaxChats" type="number" min="1" max="20" value="${cfg.maxChatsPerTask ?? 5}" style="width:64px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
+          <button class="btn" id="tkSaveCfg">保存设置</button>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:8px">旧配置里的整点小时（checkinHours/growthHours）在时点留空时仍然生效。每天每类任务最多执行一次；抖动 ±${cfg.jitterMinutes ?? 0} 分钟。</div>
+      </div>
       <div class="row" style="margin-bottom:14px">
         <span class="badge ${cfg.enabled === false ? '' : 'ok'}">总开关：${cfg.enabled === false ? '关' : '开'}</span>
-        <span class="badge">签到：${cfg.checkin === false ? '关' : '开'}（${(cfg.checkinHours || []).join(':00, ')}:00）</span>
-        <span class="badge">成长任务：${cfg.growth === false ? '关' : '开'}（${(cfg.growthHours || []).join(':00, ')}:00）</span>
-        <span class="badge">抖动：±${cfg.jitterMinutes ?? 0} 分钟</span>
+        <span class="badge">签到：${cfg.checkin === false ? '关' : '开'}</span>
+        <span class="badge">成长任务：${cfg.growth === false ? '关' : '开'}</span>
         <span class="spacer"></span>
         <button class="btn" id="tkCheckin">立即签到</button>
         <button class="btn" id="tkGrowth">扫描成长任务</button>
@@ -651,10 +668,21 @@ async function loadTasks() {
       <div class="card" style="padding:0">${(t.history || []).length ? `<table><tbody>${t.history.slice(0, 15).map((h) => `
         <tr><td style="width:120px" class="muted">${esc(new Date(h.at).toLocaleString())}</td>
         <td style="width:70px"><span class="badge ${h.kind === 'checkin' ? 'acc' : 'ok'}">${h.kind === 'checkin' ? '签到' : '成长'}</span></td>
-        <td><span class="${h.ok ? 'ok' : 'bad'}">${h.ok ? '✓' : '✗'}</span> ${esc(h.msg || `报名${h.accepted ?? 0} 领奖${h.claimed ?? 0} +${h.creditGained ?? 0}分`)}</td></tr>`).join('')}</tbody></table>`
+        <td><span class="${h.ok ? 'ok' : 'bad'}">${h.ok ? '✓' : '✗'}</span> ${esc(h.msg || `报名${h.accepted ?? 0} 代打${h.autoChats ?? 0} 领奖${h.claimed ?? 0} +${h.creditGained ?? 0}分`)}</td></tr>`).join('')}</tbody></table>`
         : '<div class="muted" style="padding:18px;text-align:center">还没有运行记录</div>'}</div>`;
     $('#tkCheckin').onclick = () => runTask('checkin');
     $('#tkGrowth').onclick = () => runTask('growth');
+    $('#tkSaveCfg').onclick = async () => {
+      try {
+        const r = await api('/tasks/config', { method: 'POST', body: {
+          checkinTimes: $('#tkCheckinTimes').value,
+          growthTimes: $('#tkGrowthTimes').value,
+          autoComplete: $('#tkAuto').checked,
+          maxChatsPerTask: Number($('#tkMaxChats').value) || 5,
+        } });
+        toast('任务设置已保存：签到 ' + (r.saved.checkinTimes.join(', ') || '(整点回退)') + ' · 成长 ' + (r.saved.growthTimes.join(', ') || '(整点回退)'), 'ok');
+      } catch (e) { toast('保存失败：' + e.message, 'bad'); }
+    };
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 async function runTask(kind) {
