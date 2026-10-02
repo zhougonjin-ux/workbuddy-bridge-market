@@ -107,6 +107,7 @@ export function recordUsage({ site, model, mode, status, promptTokens = 0, compl
   day.promptTokens += promptTokens || 0;
   day.completionTokens += completionTokens || 0;
   day.credit += credit || 0;
+  day.ms = (day.ms || 0) + (ms || 0); // 供「平均输出速度」= Σcompletion / Σms 计算
   const key = `${site}/${model}`;
   if (!day.models[key]) day.models[key] = { site, model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, tools: 0 };
   const m = day.models[key];
@@ -143,7 +144,7 @@ export function usageSnapshot(days = 7) {
   const t = data.days[today] || { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, models: {} };
   const keys = Object.keys(data.days).sort().slice(-days);
   const recent = keys.map((k) => ({ date: k, ...data.days[k], models: undefined }));
-  const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0 };
+  const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0 };
   const byModel = new Map();
   for (const k of Object.keys(data.days)) {
     const d = data.days[k];
@@ -152,13 +153,15 @@ export function usageSnapshot(days = 7) {
     totals.promptTokens += d.promptTokens;
     totals.completionTokens += d.completionTokens;
     totals.credit += d.credit;
+    totals.ms += d.ms || 0;
     for (const [mid, m] of Object.entries(d.models || {})) {
-      const cur = byModel.get(mid) || { id: mid, site: m.site, model: m.model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0 };
+      const cur = byModel.get(mid) || { id: mid, site: m.site, model: m.model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0 };
       cur.calls += m.calls;
       cur.errors += m.errors;
       cur.promptTokens += m.promptTokens;
       cur.completionTokens += m.completionTokens;
       cur.credit += m.credit;
+      cur.ms += m.ms || 0;
       byModel.set(mid, cur);
     }
   }

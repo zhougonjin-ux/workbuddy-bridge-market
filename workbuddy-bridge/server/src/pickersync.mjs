@@ -66,7 +66,11 @@ export function buildModelRule(m) {
         },
       },
       optionSpecs: {
-        reasoningLevel: { values: ['disabled', 'enabled'], map: '{}' },
+        // 思考强度档位：值会原样作为 OpenAI 风格 reasoning_effort 发给上游，
+        // 实测上游呈梯度响应（none≈17 思考 tok / low≈169 / high≈185，trivial 题）。
+        // values 必须落在 ZCode 的枚举内（none/minimal/low/medium/high/xhigh），
+        // 否则序列化时被整字段丢弃。map 保持 '{}'：值即 effort，无需变换。
+        reasoningLevel: { values: ['none', 'low', 'medium', 'high'], map: '{}' },
         maxOutputTokens: { max: Number.isFinite(m.maxOutputTokens) && m.maxOutputTokens > 0 ? m.maxOutputTokens : 32000 },
       },
     },

@@ -214,13 +214,16 @@ export async function handleChatCompletions(ctx) {
     } finally {
       up.close();
       if (!res.writableEnded) res.end();
+      const streamMs = Date.now() - started;
+      const outTok = upstreamUsage?.completion_tokens ?? estimateTokens('x'.repeat(contentChars));
       requestLog({
         site,
         model,
         mode: 'stream',
         status: finished ? 200 : 499,
         ttfb_ms: ttfb ?? '-',
-        ms: Date.now() - started,
+        ms: streamMs,
+        tok_s: outTok && streamMs > 0 ? (outTok / (streamMs / 1000)).toFixed(1) : undefined,
         frames: valid,
       });
       recordUsage({
@@ -229,10 +232,10 @@ export async function handleChatCompletions(ctx) {
         mode: 'stream',
         status: finished ? 200 : 499,
         promptTokens: upstreamUsage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
-        completionTokens: upstreamUsage?.completion_tokens ?? estimateTokens('x'.repeat(contentChars)),
+        completionTokens: outTok,
         credit: await estimateCredit(cfg, site, model, upstreamUsage?.credit,
           upstreamUsage?.prompt_tokens ?? 0, upstreamUsage?.completion_tokens ?? 0),
-        ms: Date.now() - started,
+        ms: streamMs,
         tools,
       });
     }
@@ -302,6 +305,7 @@ export async function handleChatCompletions(ctx) {
     mode: 'json',
     status: 200,
     ms: Date.now() - started,
+    tok_s: usage.completion_tokens && Date.now() - started > 0 ? (usage.completion_tokens / ((Date.now() - started) / 1000)).toFixed(1) : undefined,
     prompt: usage.prompt_tokens,
     completion: usage.completion_tokens,
     tools: agg.toolCallList.length || undefined,

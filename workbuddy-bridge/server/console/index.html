@@ -676,8 +676,11 @@ async function loadUsage() {
     const today = u.today || {};
     const max = Math.max(1, ...(u.recent || []).map((d) => d.calls || 0));
     const bars = (u.recent || []).map((d) => `<div class="col" title="${esc(d.date)}：${d.calls} 次调用，${fmtCredit(d.credit ?? 0)} 积分"><span>${d.credit != null ? fmtCredit(d.credit) + '分' : ''}</span><i style="height:${Math.round((d.calls || 0) / max * 100)}%"></i><span>${esc(d.date.slice(5))}</span></div>`).join('');
-    const byModel = (u.byModel || []).slice(0, 10).map((x) => `
-      <tr><td><b>${esc(x.model)}</b> <span class="badge">${esc(x.site)}</span></td><td>${x.calls}</td><td>${x.promptTokens}</td><td>${x.completionTokens}</td><td><b>${fmtCredit(x.credit ?? 0)}</b></td></tr>`).join('');
+    const byModel = (u.byModel || []).slice(0, 10).map((x) => {
+      const speed = x.ms > 0 ? (x.completionTokens / (x.ms / 1000)).toFixed(1) + ' tok/s' : '—';
+      return `<tr><td><b>${esc(x.model)}</b> <span class="badge">${esc(x.site)}</span></td><td>${x.calls}</td><td>${x.promptTokens}</td><td>${x.completionTokens}</td><td>${speed}</td><td><b>${fmtCredit(x.credit ?? 0)}</b></td></tr>`;
+    }).join('');
+    const todaySpeed = (today.ms || 0) > 0 ? ((today.completionTokens || 0) / (today.ms / 1000)).toFixed(1) + ' tok/s' : '—';
     el.innerHTML = `
       <h2>今日 <span class="sub">自 ${esc(u.since || '')} 起累计统计 · 数据在数据目录 usage.json</span></h2>
       <div class="grid kpis">
@@ -685,12 +688,13 @@ async function loadUsage() {
         <div class="kpi"><b class="${(today.errors || 0) > 0 ? 'bad' : ''}">${today.errors ?? 0}</b><span>错误</span></div>
         <div class="kpi"><b>${(today.promptTokens ?? 0).toLocaleString()}</b><span>输入 tokens</span></div>
         <div class="kpi"><b>${(today.completionTokens ?? 0).toLocaleString()}</b><span>输出 tokens</span></div>
+        <div class="kpi"><b>${todaySpeed}</b><span title="今日输出 tokens ÷ 上游总耗时，粗粒度均值（含排队/网络）">平均输出速度</span></div>
         <div class="kpi"><b class="warn">${fmtCredit(today.credit ?? 0)}</b><span>消耗积分</span></div>
       </div>
       <h2>最近 7 天 <span class="sub">柱高 = 调用次数，标注 = 消耗积分</span></h2>
       <div class="card"><div class="bars">${bars || '<span class="muted">暂无数据</span>'}</div></div>
-      <h2>按模型排行 <span class="sub">累计 Top 10</span></h2>
-      <div class="card" style="padding:0">${byModel ? `<table><thead><tr><th>模型</th><th>调用</th><th>输入 tok</th><th>输出 tok</th><th>积分</th></tr></thead><tbody>${byModel}</tbody></table>` : '<div class="muted" style="padding:18px;text-align:center">暂无数据</div>'}</div>
+      <h2>按模型排行 <span class="sub">累计 Top 10 · 速度按该模型累计输出 tokens ÷ 累计上游耗时</span></h2>
+      <div class="card" style="padding:0">${byModel ? `<table><thead><tr><th>模型</th><th>调用</th><th>输入 tok</th><th>输出 tok</th><th>平均速度</th><th>积分</th></tr></thead><tbody>${byModel}</tbody></table>` : '<div class="muted" style="padding:18px;text-align:center">暂无数据</div>'}</div>
       <div class="row" style="margin-top:14px"><span class="spacer"></span><button class="btn danger" id="uReset">重置统计</button></div>`;
     $('#uReset').onclick = async () => {
       if (!confirm('清空全部用量统计？')) return;
