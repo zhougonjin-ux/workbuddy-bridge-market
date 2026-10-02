@@ -205,6 +205,12 @@ export function defaultConfig() {
     // 每个账号积分/到期明细的后台刷新间隔（分钟）。切换账号前不强刷——
     // 用缓存的到期序即可，接口抖动不该拖慢对话请求。
     creditRefreshMinutes: 30,
+    // ZCode 模型选择器里是否把调用倍率编码进模型 ID（如 "glm-5.3-flash (x0.06)"）。
+    // 关掉后选择器只显示裸 ID。调用时带不带后缀都能路由（自动剥离）。
+    pickerMultiplierSuffix: true,
+    // 模型池自动同步间隔（分钟）：定期把上游模型清单写进 ZCode 的个人供应商配置，
+    // 上游加/删模型或倍率变动时，选择器无需重启会话即可跟上。
+    providerSyncMinutes: 5,
     // 自动签到与成长任务（任务中心自动报名 + 达标领奖）
     tasks: {
       enabled: true,
@@ -449,6 +455,18 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
   if (!Number.isFinite(cfg.creditRefreshMinutes) || cfg.creditRefreshMinutes <= 0) {
     fix(`creditRefreshMinutes 必须是正数，已回退为 ${defaults.creditRefreshMinutes}`);
     cfg.creditRefreshMinutes = defaults.creditRefreshMinutes;
+  }
+
+  // ---- 选择器倍率开关 ----
+  if (cfg.pickerMultiplierSuffix !== undefined && typeof cfg.pickerMultiplierSuffix !== 'boolean') {
+    fix(`pickerMultiplierSuffix 必须是布尔值，已回退为 ${defaults.pickerMultiplierSuffix}`);
+    cfg.pickerMultiplierSuffix = defaults.pickerMultiplierSuffix;
+  }
+
+  // ---- 模型池自动同步间隔 ----
+  if (!Number.isFinite(cfg.providerSyncMinutes) || cfg.providerSyncMinutes <= 0) {
+    fix(`providerSyncMinutes 必须是正数，已回退为 ${defaults.providerSyncMinutes}`);
+    cfg.providerSyncMinutes = defaults.providerSyncMinutes;
   }
 
   // ---- 自动任务 ----

@@ -20,9 +20,10 @@ import { flushPool } from './src/pool.mjs';
 import { createRateLimiter } from './src/ratelimit.mjs';
 import { readJsonBody, sendJson, sendError } from './src/util.mjs';
 import { log, warn, error } from './src/log.mjs';
-import { bridgeStatus, setPolicy, refreshCreditsAll, startCreditLoop, stopCreditLoop } from './src/scheduler.mjs';
+import { bridgeStatus, setPolicy, refreshCreditsAll, startCreditLoop, stopCreditLoop, scheduleCreditRefreshSoon } from './src/scheduler.mjs';
 import { runTasks, taskStatus, startTaskLoop, stopTaskLoop } from './src/tasks.mjs';
 import { importLocalAccounts } from './src/localimport.mjs';
+import { startProviderConfigSync, stopProviderConfigSync } from './src/pickersync.mjs';
 
 // 配置读不出来时要给出可读提示，而不是抛一串裸栈。
 // 尤其是 JSON 语法错误——用户手改 config.json 很容易漏个逗号。
@@ -391,7 +392,9 @@ const server = http.createServer(async (req, res) => {
 
     if (isResponses) {
       const body = await readJsonBody(req);
-      return await handleResponses({ cfg, req, res, body, signal: ac.signal, pathname });
+      const out = await handleResponses({ cfg, req, res, body, signal: ac.signal, pathname });
+      scheduleCreditRefreshSoon(cfg); // 对话结束后尽快让控制台余额跟上真实消耗
+      return out;
     }
 
     if (isCountTokens) {
@@ -401,12 +404,16 @@ const server = http.createServer(async (req, res) => {
 
     if (isChat) {
       const body = await readJsonBody(req);
-      return await handleChatCompletions({ cfg, req, res, body, signal: ac.signal, pathname });
+      const out = await handleChatCompletions({ cfg, req, res, body, signal: ac.signal, pathname });
+      scheduleCreditRefreshSoon(cfg);
+      return out;
     }
 
     if (isMessages) {
       const body = await readJsonBody(req);
-      return await handleMessages({ cfg, req, res, body, signal: ac.signal, pathname });
+      const out = await handleMessages({ cfg, req, res, body, signal: ac.signal, pathname });
+      scheduleCreditRefreshSoon(cfg);
+      return out;
     }
 
     warn(`收到未知路径请求：${req.method} ${pathname}（可选路径见 GET /）`);
@@ -505,9 +512,10 @@ server.listen(cfg.port, cfg.host, () => {
   }
   log('  未登录的站点可在控制台「账号登录」里点一下，或运行：node login.mjs --site <站点名>');
   log(`  OpenAI 客户端：Base URL = http://${cfg.host}:${cfg.port}/v1`);
-  // workbuddy-bridge 后台循环：积分/到期明细刷新 + 自动签到/成长任务
+  // workbuddy-bridge 后台循环：积分/到期明细刷新 + 自动签到/成长任务 + 模型池自动同步
   startCreditLoop(cfg);
   startTaskLoop(cfg);
+  startProviderConfigSync(cfg, (e) => warn('模型池自动同步失败：', e.message));
   // 自动导入本机已登录客户端的账号（静默；客户端续期 token 后重启服务即自动跟进）
   importLocalAccounts(cfg, { silent: true }).catch((e) => warn('本机账号自动导入失败：', e.message));
 });
@@ -516,6 +524,7 @@ process.on('SIGINT', () => {
   log('收到退出信号，正在保存用量统计并关闭服务');
   stopCreditLoop();
   stopTaskLoop();
+  stopProviderConfigSync();
   flushUsage();
   flushPool();
   server.close(() => process.exit(0));

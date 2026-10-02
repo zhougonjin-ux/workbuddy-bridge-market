@@ -24,7 +24,8 @@ description: Use when the user asks about WorkBuddy/CodeBuddy credits (积分), 
 
 - 代理入口：`<插件目录>/server/server.mjs`（数据目录 `~/.zcode/workbuddy-bridge`，环境变量 `WB_CONFIG_DIR` 可覆盖）
 - 控制台：http://127.0.0.1:8788/console —— 可视化管理台，五个面板：账号与积分（策略切换/账号卡片/每批积分到期倒计时/微信扫码登录/消耗顺序）、模型（倍率/上下文容量/图片·工具·推理能力表/设默认）、自动任务、用量、日志。用户要「可视化」「界面」「扫码」时引导运行 /wb-console
-- 斜杠命令：`/wb`（会话内总览面板，免浏览器）· `/wb-start` · `/wb-status` · `/wb-switch` · `/wb-login` · `/wb-import` · `/wb-startup`（开机自启管理）· `/wb-console`
+- 斜杠命令：`/wbp`（会话内总览面板，免浏览器）· `/wb-start` · `/wb-status` · `/wb-switch` · `/wb-login` · `/wb-import` · `/wb-startup`（开机自启管理）· `/wb-console`
+- 模型选择器自动注册：SessionStart 钩子 `hooks/sync-provider.mjs` 把 WorkBuddy 供应商和 `/v1/models` 的模型清单自动写进 ZCode 的 `~/.zcode/v2/provider_config.json`（providerId `workbuddy-bridge`，显示名 WorkBuddy），模型选择器/管理模型里直接可选；模型清单随代理 `/v1/models` 自动跟随。想关掉：数据目录放 `sync-provider.json` 内容 `{"enabled":false}`。
 - ZCode 接入：模型 ID 填 `default`（跟随管理台「设为默认」变化），Base URL `http://127.0.0.1:8788/v1`，key 用控制台顶栏「⧉ 复制 ZCode 配置」一键取
 - 本机自动导入：`wb_import_local` 工具 / 「导入本机账号」按钮 —— 从 `~/.codebuddy/settings*.json` 的 `env.CODEBUDDY_AUTH_TOKEN` 提取本机客户端登录态（服务启动时也自动重扫）；无 refreshToken，到期后重跑导入即跟上客户端续期
 - 配置：`~/.zcode/workbuddy-bridge/config.json`（`pool.policy`、`pool.pinnedAccountId`、`tasks`、`apiKey`、`port`）

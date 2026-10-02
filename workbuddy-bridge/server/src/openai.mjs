@@ -3,7 +3,7 @@
 import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId } from './upstream.mjs';
 import { ensureToken } from './auth.mjs';
 import { isQuotaError } from './pool.mjs';
-import { resolveTarget, mergedModels, parseMultiplier, isExcluded } from './router.mjs';
+import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText } from './router.mjs';
 import { recordUsage } from './usage.mjs';
 import { startSSE, writeSSE, sendJson, sendError, estimateTokens } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
@@ -341,9 +341,10 @@ export async function handleModels(ctx) {
       name: info.name || m.id,
       site: m.site,
     };
+    let mult;
     if (info.credits) {
       item.credits = info.credits; // 上游原始串，如 "x0.79 credits"
-      const mult = parseMultiplier(info.credits);
+      mult = parseMultiplier(info.credits);
       if (Number.isFinite(mult)) item.credits_multiplier = mult;
     }
     if (info.contextWindow) item.context_window = info.contextWindow;
@@ -351,6 +352,15 @@ export async function handleModels(ctx) {
     if (info.supportsImages) item.supports_images = true;
     if (info.supportsToolCall) item.supports_tools = true;
     if (m.aliasOf) item.alias_of = m.aliasOf;
+    // 选择器倍率展示：把倍率编码进 ID 后缀（如 "glm-5.3-flash (x0.06)"），
+    // 调用端 resolveTargetInner 会剥掉后缀，所以两种写法都能调。
+    if (cfg.pickerMultiplierSuffix !== false) {
+      const suffix = multiplierSuffixText(mult);
+      if (suffix) {
+        item.id = m.id + suffix;
+        item.name = (info.name || m.id) + suffix;
+      }
+    }
     data.push(item);
   }
 

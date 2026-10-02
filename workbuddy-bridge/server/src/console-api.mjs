@@ -29,21 +29,28 @@ const startedAt = Date.now();
 const loginStates = new Map(); // site → { state, authUrl, at }
 
 /**
- * 从 package.json 读版本号。
+ * 读版本号：优先取插件清单（.zcode-plugin/plugin.json）——那是插件市场里
+ * 显示和更新的同一来源；直接跑 server 时退回 server/package.json。
  *
- * 原先这里是硬编码的 '1.1.0'，结果 package.json 升到 1.2.0 后控制台还显示旧版本，
- * 排查问题时对着版本号看会误导。改成单一来源，不再两处维护。
- * 读不到时返回 'unknown' 而不是抛错——控制台不该因为读不到版本号就打不开。
+ * 之前只读 package.json，插件升到 0.3.x 后控制台还显示 v0.1.0，
+ * 排查问题时对着版本号看会误导。读不到时返回 'unknown' 而不是抛错——
+ * 控制台不该因为读不到版本号就打不开。
  */
 let cachedVersion = null;
 function pkgVersion() {
   if (cachedVersion) return cachedVersion;
-  try {
-    const p = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
-    cachedVersion = p.version || 'unknown';
-  } catch {
-    cachedVersion = 'unknown';
+  for (const p of [
+    path.join(ROOT, '..', '.zcode-plugin', 'plugin.json'),
+    path.join(ROOT, 'package.json'),
+  ]) {
+    try {
+      const j = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (j.version) { cachedVersion = j.version; break; }
+    } catch {
+      /* 试下一个来源 */
+    }
   }
+  cachedVersion ||= 'unknown';
   return cachedVersion;
 }
 

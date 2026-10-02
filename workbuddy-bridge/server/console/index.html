@@ -53,8 +53,9 @@ button.btn.mini{padding:3px 9px;font-size:12px;border-radius:6px}
 .badge.bad{background:rgba(224,92,92,.15);color:var(--bad)}
 .badge.acc{background:rgba(79,140,255,.15);color:var(--accent)}
 .accts{grid-template-columns:repeat(auto-fill,minmax(330px,1fr))}
-.acct{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px;display:flex;flex-direction:column;gap:9px}
-.acct.off{opacity:.55}
+.acct{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px;display:flex;flex-direction:column;gap:9px;cursor:pointer}
+.acct.pinned{border-color:var(--accent);background:linear-gradient(180deg,rgba(79,140,255,.10),rgba(79,140,255,.02))}
+.acct.off{opacity:.55;cursor:default}
 .acct .hd{display:flex;align-items:center;gap:8px}
 .acct .hd b{font-size:14.5px;cursor:pointer}
 .acct .hd small{color:var(--muted)}
@@ -273,7 +274,7 @@ async function loadAccounts() {
     if (defSite) for (const row of defSite.plan || []) {
       if (!row.enabled) continue;
       const d = fmtDays(row.earliestExpiry);
-      planItems.push(`<span class="step"><b>${planItems.length + 1}</b>${esc(row.label)} · 余 ${row.remain ?? '?'}${d === null ? '' : ` · <span style="color:${expiryColor(row.earliestExpiry)}">${d <= 0 ? '已到期' : d + '天'}</span>`}</span><span class="arrow">→</span>`);
+      planItems.push(`<span class="step"><b>${planItems.length + 1}</b>${esc(row.label)} · 余 ${row.remain == null ? '?' : fmtCredit(row.remain)}${d === null ? '' : ` · <span style="color:${expiryColor(row.earliestExpiry)}">${d <= 0 ? '已到期' : d + '天'}</span>`}</span><span class="arrow">→</span>`);
     }
 
     let html = `
@@ -294,14 +295,31 @@ async function loadAccounts() {
     <div class="plan">${planItems.length ? planItems.join('') : '<span class="muted">暂无账号，先添加账号</span>'}</div>`;
 
     for (const s of sites) {
+      // 卡片点击选择需要知道当前策略与固定目标：从 policy（对默认站点生效）取
+      const s2 = { ...s, policy: policy.policy, pinned_account_id: policy.pinnedAccountId };
       html += `<h2>${esc(s.label)} <span class="sub">${esc(s.site)} · ${esc(s.accounts.length)} 个账号</span></h2>`;
       if (!s.accounts.length) {
         html += `<div class="empty">该站点还没有账号 —— 点上方「＋ 添加账号」，用微信扫码即可登录</div>`;
         continue;
       }
-      html += `<div class="grid accts">${s.plan.map((row) => acctCard(s, row, acctRows[s.site + '/' + row.id] || {})).join('')}</div>`;
+      html += `<div class="grid accts">${s2.plan.map((row) => acctCard(s2, row, acctRows[s.site + '/' + row.id] || {})).join('')}</div>`;
     }
     el.innerHTML = html;
+
+    // 点卡片 = 固定使用该账号（再点一次取消，恢复自动调度）。
+    // 只拦截点在卡片空白处；改名/启停/删除等按钮和下拉框照常工作。
+    for (const card of el.querySelectorAll('[data-acct-card]')) {
+      card.onclick = async (ev) => {
+        if (ev.target.closest('button,select,[data-act],a,input')) return; // 内部控件不触发
+        const { site: psite, id: pid } = card.dataset;
+        const wasPinned = card.classList.contains('pinned');
+        try {
+          await api('/policy', { method: 'POST', body: { policy: wasPinned ? 'expiry-first' : 'pinned', pinnedAccountId: wasPinned ? null : pid } });
+          toast(wasPinned ? '已取消固定，恢复自动调度' : '已固定使用该账号（再次点击卡片取消）', 'ok');
+          loadAccounts();
+        } catch (e) { toast('切换失败：' + e.message, 'bad'); }
+      };
+    }
 
     $('#btnAdd').onclick = () => openLoginModal(sites);
     $('#btnImport').onclick = async () => {
@@ -351,25 +369,42 @@ function pinnedSelect(sites, current) {
     `<option value="${esc(a.id)}" ${a.id === current ? 'selected' : ''}>${esc(a.label || a.id)}</option>`).join('')}</select>`;
 }
 
+/**
+ * 积分显示：最多两位小数，但整数不带 .00（上游余额本身是整数，
+ * 硬补两位只会永远是 .00；小数只出现在消耗统计里，如 3.4）。
+ */
+function fmtCredit(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return esc(String(v));
+  return String(parseFloat(n.toFixed(2)));
+}
+
 function acctCard(site, row, raw) {
   const a = { ...row, ...(raw.id ? raw : {}) };
   const status = !a.enabled ? '<span class="badge">已禁用</span>'
     : a.exhausted ? '<span class="badge bad">额度耗尽</span>'
     : a.cooldown_until && new Date(a.cooldown_until) > new Date() ? '<span class="badge warn">冷却中</span>'
     : '<span class="badge ok">可用</span>';
+  // 「使用中」：后端用与真实调度相同的 pickAccount 算出的当前选中账号
+  const inUse = site.active_account_id && a.id === site.active_account_id && a.enabled !== false
+    ? '<span class="badge acc" title="当前调度策略选中的账号，下一次调用将消耗它的积分">使用中</span>' : '';
   const total = (a.creditDetail || []).reduce((s, b) => s + (b.remain || 0), 0);
-  const bal = a.creditDetail && a.creditDetail.length ? total : (a.remain ?? a.credit ?? a.creditRemain ?? null);
+  const rawBal = a.creditDetail && a.creditDetail.length ? total : (a.remain ?? a.credit ?? a.creditRemain);
+  const bal = rawBal === null || rawBal === undefined ? null : fmtCredit(rawBal);
   const batches = (a.creditDetail || []).map((b) => {
     const full = (b.remain || 0) + (b.used || 0);
     const w = full > 0 ? Math.round((b.remain || 0) / full * 100) : 0;
     return `<div class="batch">
       <div class="l"><span class="muted">${esc(b.package || '积分包')}</span>
-      <span>余 <b>${b.remain}</b> · <span style="color:${expiryColor(b.expireAt)}">${esc(expiryText(b.expireAt))}</span></span></div>
+      <span>余 <b>${fmtCredit(b.remain)}</b> · <span style="color:${expiryColor(b.expireAt)}">${esc(expiryText(b.expireAt))}</span></span></div>
       <div class="bar"><i style="width:${w}%;background:${expiryColor(b.expireAt)}"></i></div>
     </div>`;
   }).join('');
-  return `<div class="acct ${a.enabled ? '' : 'off'}">
-    <div class="hd"><b data-act="rename" data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="点击改名">${esc(a.label || a.id)}</b>${a.is_default ? '<span class="badge acc">默认</span>' : ''}${status}<span class="spacer"></span><small class="muted">${esc(String(a.uid || '').slice(0, 8))}…</small></div>
+  // 固定使用状态：策略为 pinned 且指向本账号（卡片点击选择的就是这个）
+  const isPinned = site.policy === 'pinned' && site.pinned_account_id === a.id;
+  const pinnedBadge = isPinned ? '<span class="badge acc" title="已固定使用：点击卡片可取消">📌 已固定</span>' : '';
+  return `<div class="acct ${a.enabled ? '' : 'off'} ${isPinned ? 'pinned' : ''}" data-acct-card data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="点击固定使用该账号，再点一次恢复自动调度">
+    <div class="hd"><b data-act="rename" data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="点击改名">${esc(a.label || a.id)}</b>${pinnedBadge}${inUse}${a.is_default ? '<span class="badge acc">默认</span>' : ''}${status}<span class="spacer"></span><small class="muted">${esc(String(a.uid || '').slice(0, 8))}…</small></div>
     <div class="bal">${bal === null ? '<span class="muted" style="font-size:14px">余额未知</span>' : bal}<small>积分${a.creditCheckedAt ? ' · 刷新于 ' + new Date(a.creditCheckedAt).toLocaleTimeString() : ''}</small></div>
     <div class="batches">${batches || '<span class="muted" style="font-size:12px">暂无批次明细 —— 点「刷新全部积分」获取</span>'}</div>
     ${a.manualExpireAt ? `<div style="font-size:12px" class="muted">手动到期兜底：<span class="warn">${esc(a.manualExpireAt)}</span></div>` : ''}
@@ -599,9 +634,9 @@ async function loadUsage() {
     const u = await api('/usage?days=7');
     const today = u.today || {};
     const max = Math.max(1, ...(u.recent || []).map((d) => d.calls || 0));
-    const bars = (u.recent || []).map((d) => `<div class="col" title="${esc(d.date)}：${d.calls} 次调用，${d.credit} 积分"><span>${d.credit != null ? d.credit + '分' : ''}</span><i style="height:${Math.round((d.calls || 0) / max * 100)}%"></i><span>${esc(d.date.slice(5))}</span></div>`).join('');
+    const bars = (u.recent || []).map((d) => `<div class="col" title="${esc(d.date)}：${d.calls} 次调用，${fmtCredit(d.credit ?? 0)} 积分"><span>${d.credit != null ? fmtCredit(d.credit) + '分' : ''}</span><i style="height:${Math.round((d.calls || 0) / max * 100)}%"></i><span>${esc(d.date.slice(5))}</span></div>`).join('');
     const byModel = (u.byModel || []).slice(0, 10).map((x) => `
-      <tr><td><b>${esc(x.model)}</b> <span class="badge">${esc(x.site)}</span></td><td>${x.calls}</td><td>${x.promptTokens}</td><td>${x.completionTokens}</td><td><b>${x.credit}</b></td></tr>`).join('');
+      <tr><td><b>${esc(x.model)}</b> <span class="badge">${esc(x.site)}</span></td><td>${x.calls}</td><td>${x.promptTokens}</td><td>${x.completionTokens}</td><td><b>${fmtCredit(x.credit ?? 0)}</b></td></tr>`).join('');
     el.innerHTML = `
       <h2>今日 <span class="sub">自 ${esc(u.since || '')} 起累计统计 · 数据在数据目录 usage.json</span></h2>
       <div class="grid kpis">
@@ -609,7 +644,7 @@ async function loadUsage() {
         <div class="kpi"><b class="${(today.errors || 0) > 0 ? 'bad' : ''}">${today.errors ?? 0}</b><span>错误</span></div>
         <div class="kpi"><b>${(today.promptTokens ?? 0).toLocaleString()}</b><span>输入 tokens</span></div>
         <div class="kpi"><b>${(today.completionTokens ?? 0).toLocaleString()}</b><span>输出 tokens</span></div>
-        <div class="kpi"><b class="warn">${today.credit ?? 0}</b><span>消耗积分</span></div>
+        <div class="kpi"><b class="warn">${fmtCredit(today.credit ?? 0)}</b><span>消耗积分</span></div>
       </div>
       <h2>最近 7 天 <span class="sub">柱高 = 调用次数，标注 = 消耗积分</span></h2>
       <div class="card"><div class="bars">${bars || '<span class="muted">暂无数据</span>'}</div></div>

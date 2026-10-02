@@ -21,6 +21,27 @@ export function parseMultiplier(credits) {
 }
 
 /**
+ * 倍率后缀：让 ZCode 模型选择器能直接看到调用倍率。
+ *
+ * 选择器显示的是模型 ID 原文（个人供应商配置里没有按模型的显示名字段），
+ * 所以把倍率编码进 ID：`glm-5.3-flash (x0.06)`。调用时 resolveTargetInner
+ * 会先把后缀剥掉再路由，因此带不带后缀都能调；上游倍率变动 → ID 变动 →
+ * 模型池同步感知 → 选择器自动跟上。
+ * 0 倍率显示「免费」（上游确实有 0 扣费模型，如 flash 档活动）。
+ */
+const 后缀正则 = /\s*\((?:x[\d.]+|免费)\)\s*$/i;
+
+export function multiplierSuffixText(multiplier) {
+  if (!Number.isFinite(multiplier)) return '';
+  return multiplier === 0 ? ' (免费)' : ` (x${multiplier})`;
+}
+
+/** 剥掉请求模型名上的倍率后缀，返回纯模型 ID。 */
+export function stripMultiplierSuffix(raw) {
+  return String(raw || '').replace(后缀正则, '').trim();
+}
+
+/**
  * 模型白/黑名单（都支持 `*` 通配符，站点级 + 全局两处配置）：
  *   - allowModels 非空时，只保留命中的模型（白名单优先）
  *   - excludeModels 命中即剔除
@@ -260,7 +281,8 @@ export async function resolveTarget(cfg, requestedModel) {
 }
 
 async function resolveTargetInner(cfg, requestedModel) {
-  let raw = String(requestedModel || '').trim();
+  // 选择器里的模型 ID 可能带倍率后缀（如 "glm-5.3-flash (x0.06)"），路由前先剥掉
+  let raw = stripMultiplierSuffix(String(requestedModel || '').trim());
   const sites = siteKeys(cfg);
   if (!raw) raw = cfg.defaultModel;
 
