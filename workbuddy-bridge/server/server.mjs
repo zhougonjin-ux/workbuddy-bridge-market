@@ -25,6 +25,7 @@ import { bridgeStatus, setPolicy, refreshCreditsAll, startCreditLoop, stopCredit
 import { runTasks, taskStatus, startTaskLoop, stopTaskLoop } from './src/tasks.mjs';
 import { importLocalAccounts } from './src/localimport.mjs';
 import { startProviderConfigSync, stopProviderConfigSync } from './src/pickersync.mjs';
+import { spawn } from 'node:child_process';
 
 // 配置读不出来时要给出可读提示，而不是抛一串裸栈。
 // 尤其是 JSON 语法错误——用户手改 config.json 很容易漏个逗号。
@@ -154,10 +155,94 @@ function authorized(req) {
   return keys.includes(clientKey(req));
 }
 
+// ---- 不可断线保护（activeRequests / drainWaiters / gracefulExit）----
+// 本服务承载 ZCode 会话自身的模型连接：进程退出 = 会话断线。因此：
+//   1) /admin/shutdown 在有活跃请求时拒绝（除非 force=1）；
+//   2) /admin/restart 用「交棒」重启：先把新实例拉起来排队等端口，本实例等
+//      activeRequests 归零（完全空闲）后才退出交出端口 —— 进行中的请求不受影响。
+let activeRequests = 0;
+let draining = false; // 已决定退出，等活跃请求清零
+let exiting = false;  // 已开始退出流程，防止重复触发
+const pendingExits = [];
+
+/** 请求结束时调用：活跃数归零且处于 draining 状态就执行挂起的退出。 */
+function drainWaiters() {
+  if (!draining || activeRequests > 0) return;
+  const fns = pendingExits.splice(0);
+  for (const fn of fns) fn();
+}
+
+/**
+ * 优雅退出：刷盘 → 停后台循环 → close 服务器。
+ * waitIdle=true 时等 activeRequests 归零再退出（交棒场景）；
+ * 期间新到的 /v1/* 请求照常服务，不会出现「拒绝服务窗口」。
+ */
+function gracefulExit(res, { waitIdle = false, reason = 'stop' } = {}) {
+  const finish = () => {
+    if (exiting) return;
+    exiting = true;
+    log(`正在保存用量统计并关闭服务（${reason}）`);
+    stopCreditLoop();
+    stopTaskLoop();
+    stopProviderConfigSync();
+    flushUsage();
+    flushPool();
+    flushLearned();
+    // 不等 close 回调超时兜底：5 秒后强制退出，防个别连接挂着不放手
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 5000).unref?.();
+  };
+  if (waitIdle && activeRequests > 0) {
+    draining = true;
+    log(`${reason}：${activeRequests} 个请求进行中，等全部完成后退出`);
+    pendingExits.push(finish);
+    return { waiting: true, active: activeRequests };
+  }
+  finish();
+  return { waiting: false };
+}
+
+/** 以分离进程拉起一个新 server 实例（交棒重启用）。新实例带 WB_HOOK_SPAWN=1，
+ *  端口暂被本实例占用时自动进入 2 秒重试绑定循环（复用现成的 EADDRINUSE 逻辑）。
+ *  注意 ROOT 就是 server 目录本身（src/config.mjs），不要再拼一层 server。 */
+function spawnReplacement() {
+  const serverEntry = path.join(ROOT, 'server.mjs');
+  if (!fs.existsSync(serverEntry)) {
+    error(`交棒重启失败：找不到 ${serverEntry}`);
+    return null;
+  }
+  let stdio = 'ignore';
+  try {
+    fs.mkdirSync(paths.root, { recursive: true });
+    stdio = fs.openSync(path.join(paths.root, 'server.log'), 'a');
+    fs.writeSync(stdio, `\n===== 交棒重启 ${new Date().toLocaleString()} =====\n`);
+  } catch { /* 打不开日志就退回 ignore */ }
+  const child = spawn(process.execPath, [serverEntry], {
+    cwd: ROOT,
+    detached: true,
+    stdio: ['ignore', stdio, stdio],
+    env: { ...process.env, WB_HOOK_SPAWN: '1' },
+    windowsHide: true,
+  });
+  child.on('error', () => {});
+  child.unref();
+  return child.pid;
+}
+
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
   const pathname = url.pathname.replace(/\/+$/, '') || '/';
+
+  // ---- 活跃请求计数（不可断线保护）----
+  // 本服务的模型流量承载着 ZCode 会话自身的模型连接：shutdown/restart 若在
+  // 会话请求进行中执行，等于掐断自己的模型通道，会话当场死亡。
+  // 因此凡可能退出进程的路径都必须先看 activeRequests；/health 不计数（hook 探测要用，
+  // 且它不碰模型流量）。
+  if (pathname !== '/health') {
+    activeRequests++;
+    res.on('close', () => { activeRequests--; drainWaiters(); });
+  }
 
   const isConsolePath = pathname === '/console' || pathname.startsWith('/console/');
 
@@ -352,11 +437,35 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true, ...result });
     }
 
-    // 优雅停止（供 stop.cmd / stop.mjs 调用；需要本地 API Key，避免被误触）
+    // 优雅停止（供 stop.cmd / stop.mjs 调用；需要本地 API Key，避免被误触）。
+    // 不可断线保护：本服务的模型流量承载着 ZCode 会话自身的模型连接，
+    // 会话请求进行中停服 = 会话断线。因此有活跃请求时默认拒绝，明确 force=1 才放行。
     if (pathname === '/admin/shutdown' && req.method === 'POST') {
-      log('收到停止指令，服务即将退出');
-      sendJson(res, 200, { ok: true, message: 'shutting down' });
-      setTimeout(() => process.exit(0), 150);
+      const url2 = new URL(req.url, 'http://x');
+      const force = url2.searchParams.get('force') === '1';
+      if (activeRequests > 0 && !force) {
+        warn(`拒绝停服：${activeRequests} 个请求进行中（模型流量断掉会连带断掉 ZCode 会话）。确认要强制停服请加 ?force=1`);
+        return sendJson(res, 409, {
+          ok: false,
+          error: 'busy',
+          message: `${activeRequests} 个请求进行中，拒绝停服。强制请加 ?force=1，或改用 POST /admin/restart（等空闲后交棒重启，不断线）`,
+          activeRequests,
+        });
+      }
+      const r = gracefulExit(res, { reason: '收到停止指令' });
+      sendJson(res, 200, { ok: true, message: r.waiting ? `等 ${r.active} 个请求完成后退出` : 'shutting down' });
+      return;
+    }
+
+    // 交棒重启：先拉起新实例（端口被占时它自动重试绑定），本实例等活跃请求全部
+    // 完成后退出交出端口。整个过程模型连接不断——进行中的请求照常跑完，
+    // 新请求由接管端口的新实例服务。会话内调用安全，这是 /admin/shutdown 的替代品。
+    if (pathname === '/admin/restart' && req.method === 'POST') {
+      if (exiting) return sendJson(res, 409, { ok: false, error: 'already_stopping' });
+      const pid = spawnReplacement();
+      log(`交棒重启：新实例 PID=${pid} 已拉起（排队等端口），本实例等空闲后退出`);
+      const r = gracefulExit(res, { waitIdle: true, reason: '交棒重启' });
+      sendJson(res, 200, { ok: true, message: r.waiting ? `新实例 ${pid} 排队中，本实例等 ${r.active} 个请求完成后交棒` : `新实例 ${pid} 即将接管端口` });
       return;
     }
 
@@ -522,13 +631,8 @@ server.listen(cfg.port, cfg.host, () => {
 });
 
 process.on('SIGINT', () => {
-  log('收到退出信号，正在保存用量统计并关闭服务');
-  stopCreditLoop();
-  stopTaskLoop();
-  stopProviderConfigSync();
-  flushUsage();
-  flushPool();
-  flushLearned();
-  server.close(() => process.exit(0));
+  // 与 /admin/restart 同一条优雅退出路径：活跃请求没跑完就等（不主动断模型流量），
+  // 全部跑完（或 close 超时兜底）才退出。
+  gracefulExit(null, { waitIdle: true, reason: '收到退出信号' });
 });
 process.on('unhandledRejection', (e) => error('未处理的 Promise 异常：', e));

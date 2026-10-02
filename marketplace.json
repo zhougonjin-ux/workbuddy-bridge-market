@@ -4,7 +4,7 @@
     {
       "name": "workbuddy-bridge",
       "source": "./workbuddy-bridge",
-      "version": "0.3.3",
+      "version": "0.3.4",
       "description": "Bridge ZCode to WorkBuddy/CodeBuddy credits and models: local OpenAI/Anthropic-compatible proxy, expiry-first credit scheduling, multi-account switching, local client account auto-import, visual console, daily check-in automation, auto model-provider registration.",
       "displayName": "WorkBuddy Bridge",
       "displayName_i18n": { "zh-CN": "WorkBuddy 积分桥" },
