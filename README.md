@@ -16,10 +16,19 @@
 
 ## 1. 安装（ZCode 桌面端）
 
-1. **设置 → 插件市场（Plugin Marketplace）→ 添加 → 添加插件市场**，粘贴目录：
-   `E:\桌面\新建文件夹\plugins`
-2. 在该市场（`dev-workbuddy-bridge-local`）里找到 **WorkBuddy 积分桥** → **安装**
+### 方式 A：插件市场 UI（推荐）
+
+1. 打开 ZCode → 插件市场 → 添加 → 从 GitHub 添加，填入仓库：
+   `zhougonjin-ux/workbuddy-bridge-market`
+2. 在市场里找到 **WorkBuddy 积分桥** → **安装**
 3. 安装后到 **设置 → 插件** 确认处于启用状态
+
+### 方式 B：命令行
+
+```bash
+zcode plugins marketplace add zhougonjin-ux/workbuddy-bridge-market
+zcode plugins install workbuddy-bridge@workbuddy-bridge-market
+```
 
 ## 2. 启动代理
 

@@ -15,6 +15,65 @@
 /** 上游报「太长」时的真实上限缓存：`site/model` → maxInputTokens。 */
 const learnedLimits = new Map();
 
+// ---------- 学习数据落盘 ----------
+// learnedLimits / estimateCalibration 曾是纯内存 Map：每次重启服务就失光，
+// 重启后第一波长上下文请求全部再撞一次 400、白等 20~30 秒才重新学会。
+// 这里照 usage.mjs 的「惰性加载 + 节流落盘」模式存到数据目录 learned.json。
+import fs from 'node:fs';
+import path from 'node:path';
+import { paths } from './config.mjs';
+
+const LEARNED_FILE = () => path.join(paths.root, 'learned.json');
+const LEARNED_SAVE_DELAY_MS = 3000;
+let learnedLoadedFrom = null;
+let learnedSaveTimer = null;
+
+function loadLearned() {
+  const f = LEARNED_FILE();
+  if (learnedLoadedFrom === f) return;
+  learnedLoadedFrom = f;
+  try {
+    if (!fs.existsSync(f)) return;
+    const data = JSON.parse(fs.readFileSync(f, 'utf8'));
+    for (const [k, v] of Object.entries(data.limits || {})) {
+      if (Number.isFinite(v?.value)) learnedLimits.set(k, { value: v.value, authoritative: Boolean(v.authoritative) });
+    }
+    for (const [k, v] of Object.entries(data.calibration || {})) {
+      if (Number.isFinite(v) && v >= 1 && v <= 4) estimateCalibration.set(k, v);
+    }
+  } catch {
+    // 坏了就当没学过：重新学只是慢，不影响正确性
+  }
+}
+
+function scheduleLearnedSave() {
+  if (learnedSaveTimer) return;
+  learnedSaveTimer = setTimeout(() => {
+    learnedSaveTimer = null;
+    saveLearnedNow();
+  }, LEARNED_SAVE_DELAY_MS);
+  learnedSaveTimer.unref?.();
+}
+
+function saveLearnedNow() {
+  try {
+    const data = {
+      limits: Object.fromEntries(learnedLimits),
+      calibration: Object.fromEntries(estimateCalibration),
+    };
+    fs.writeFileSync(LEARNED_FILE(), JSON.stringify(data, null, 2) + '\n', 'utf8');
+  } catch {
+    // 写不进去（磁盘满等）就留在内存，下次再试
+  }
+}
+
+/** 进程退出前把学习数据刷盘（server.mjs 优雅退出时调用）。 */
+export function flushLearned() {
+  if (learnedSaveTimer) clearTimeout(learnedSaveTimer);
+  learnedSaveTimer = null;
+  saveLearnedNow();
+}
+
 /**
  * 中文字符判定（CJK 统一表意文字 + 扩展 A + 兼容表意 + 中文标点）。
  *
@@ -102,13 +161,16 @@ export function isTooLongError(status, text) {
  */
 export function learnLimit(site, model, maxInputTokens, { authoritative = false } = {}) {
   if (!Number.isFinite(maxInputTokens) || maxInputTokens <= 0) return;
+  loadLearned();
   const key = `${site}/${model}`;
   const prev = learnedLimits.get(key);
   if (prev?.authoritative && !authoritative) return; // 别用弱证据覆盖强证据
   learnedLimits.set(key, { value: maxInputTokens, authoritative: authoritative || Boolean(prev?.authoritative) });
+  scheduleLearnedSave();
 }
 
 export function learnedLimit(site, model) {
+  loadLearned();
   return learnedLimits.get(`${site}/${model}`)?.value ?? null;
 }
 
@@ -140,17 +202,20 @@ export function parseActualTokens(text) {
  */
 export function calibrateEstimate(site, model, 真实, 本地估算) {
   if (!Number.isFinite(真实) || !Number.isFinite(本地估算) || 真实 <= 0 || 本地估算 <= 0) return null;
+  loadLearned();
   const 样本 = Math.min(4, Math.max(1, 真实 / 本地估算));
   const key = `${site}/${model}`;
   const prev = estimateCalibration.get(key);
   // 指数滑动平均：单次样本不带偏整体，又能较快收敛
   const 新 = prev ? prev * 0.5 + 样本 * 0.5 : 样本;
   estimateCalibration.set(key, 新);
+  scheduleLearnedSave();
   return 新;
 }
 
 /** 取该模型的估算修正倍率；没校准过就是 1（不改动原有行为）。 */
 export function calibrationFactor(site, model) {
+  loadLearned();
   return (site && estimateCalibration.get(`${site}/${model}`)) || 1;
 }
 
@@ -165,10 +230,16 @@ export function isProviderParamRejection(text) {
   return /"code"\s*:\s*11133\b/.test(s) && /model_param_invalid/.test(s);
 }
 
-/** 清空学习到的上限与估算校准（测试用）。 */
+/** 清空学习到的上限与估算校准（测试用），同时删掉落盘文件避免下次启动又加载回来。 */
 export function resetLearnedLimits() {
   learnedLimits.clear();
   estimateCalibration.clear();
+  learnedLoadedFrom = null; // 让下次 loadLearned 重新从（可能已变化的）配置目录读
+  try {
+    if (fs.existsSync(LEARNED_FILE())) fs.unlinkSync(LEARNED_FILE());
+  } catch {
+    // 删不掉也无妨：内存里已经空了
+  }
 }
 
 /**

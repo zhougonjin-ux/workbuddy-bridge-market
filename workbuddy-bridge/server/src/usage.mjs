@@ -1,9 +1,31 @@
-// 用量统计：按天 / 按站点 / 按模型累计调用次数、token 与 credit 消耗，落盘到 usage.json。
+// 用量统计：按天 / 站点 / 模型累计调用次数、token 与 credit 消耗，落盘到 usage.json。
 // 只在本项目目录内读写；写入做了节流，避免每次请求都打盘。
 import fs from 'node:fs';
 import path from 'node:path';
 import { paths } from './config.mjs';
 import { warn } from './log.mjs';
+import { getCatalog, parseMultiplier } from './router.mjs';
+
+/**
+ * credit 统计：上游流式帧的 usage 里通常没有 credit 字段（只有非流式聚合偶尔带），
+ * 直接 `?? 0` 会让「积分消耗」曲线恒为 0。这里在上游没报时用
+ * 模型倍率（parseMultiplier）× tokens 估算一个近似值。
+ *
+ * 口径：倍率 x0.06 表示每 token 扣 0.06 credit，所以 credit ≈ (prompt+completion) × mult。
+ * 估算值只进用量统计，不代表上游真实扣费；目录拉不到（Infinity）时不估，如实记 0。
+ */
+export async function estimateCredit(cfg, site, model, upstreamCredit, promptTokens, completionTokens) {
+  if (Number.isFinite(upstreamCredit) && upstreamCredit > 0) return upstreamCredit;
+  try {
+    const cat = await getCatalog(cfg, site);
+    const info = cat.models.get(model);
+    const mult = parseMultiplier(info?.credits);
+    if (!Number.isFinite(mult)) return 0;
+    return (promptTokens + completionTokens) * mult;
+  } catch {
+    return 0;
+  }
+}
 
 // 与 config.json 同目录（跟随 setConfigDir / WB_CONFIG_DIR 变化，不冻结路径）
 const file = () => path.join(paths.root, 'usage.json');

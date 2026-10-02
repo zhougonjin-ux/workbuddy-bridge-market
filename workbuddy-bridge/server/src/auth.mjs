@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import { paths, authPathFor } from './config.mjs';
 import { refreshHeaders } from './headers.mjs';
 import { log, warn, stamp } from './log.mjs';
+import { writeJsonFileAtomic } from './util.mjs';
 import {
   DEFAULT_ACCOUNT_ID,
   listAccounts,
@@ -116,7 +117,8 @@ export function getAuth(site = 'cn-cli') {
 
 export function saveAuth(site, next) {
   const file = authPathFor(site);
-  fs.writeFileSync(file, JSON.stringify(next, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  // 原子写：这是全部登录凭证所在，写一半被杀不该留半截 JSON
+  writeJsonFileAtomic(file, next, { mode: 0o600 });
   stores.set(storeKey(site, file), { auth: next, mtime: fs.statSync(file).mtimeMs, path: file });
   return next;
 }
@@ -151,17 +153,7 @@ export function hydrateFromToken(site, auth) {
   return auth;
 }
 
-function tokenExpiringWithin(site, minMs) {
-  const a = getAuth(site);
-  if (!a.accessToken) return true;
-  if (a.expiresAt) return Date.now() > a.expiresAt - minMs;
-  const claims = jwtClaims(a.accessToken);
-  if (claims?.exp) {
-    a.expiresAt = claims.exp * 1000;
-    return Date.now() > a.expiresAt - minMs;
-  }
-  return false; // 无法判断有效期时先直接用，401 再触发刷新
-}/**
+/**
  * 判断刷新失败是否属于「凭证已彻底失效」（需要重新登录），
  * 而不是网络抖动/上游临时故障（保留凭证下次再试）。
  */

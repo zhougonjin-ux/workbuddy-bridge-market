@@ -2,8 +2,8 @@
 // Trae 的「Claude 型自定义模型」走 Anthropic Messages 协议，这里做双向转换。
 import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId } from './upstream.mjs';
 import { resolveTarget } from './router.mjs';
-import { isModelNotFound, isTransportFailure, isGatewayError } from './openai.mjs';
-import { recordUsage } from './usage.mjs';
+import { openWithSiteFallback } from './openai.mjs';
+import { recordUsage, estimateCredit } from './usage.mjs';
 import { startSSE, writeSSEEvent, sendJson, sendError, writeAsync, estimateTokens } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
 
@@ -129,40 +129,19 @@ export async function handleMessages(ctx) {
   const openaiBody = toOpenAIBody({ ...body, model });
   if (openaiBody.max_tokens === undefined) openaiBody.max_tokens = cfg.defaultMaxTokens;
 
-  // 请求上游（openChatRotating 内部处理 401 刷 token 与换号）；连接级失败时降级到备用站点
-  const 打开一次 = async () => openChatRotating(cfg, site, openaiBody, { signal }).then((r) => r.up);
-
-  let up;
-  try {
-    up = await 打开一次();
-  } catch (e) {
-    if (target.fallback && isTransportFailure(e) && !signal?.aborted) {
-      warn(`[${site}] 连接失败（${e?.cause?.code || e?.message}），自动降级到备用站点 ${target.fallback.site} 重试`);
-      site = target.fallback.site;
-      model = target.fallback.model;
-      openaiBody.model = target.fallback.model;
-      up = await 打开一次();
-    } else {
-      throw e;
-    }
-  }
-
-  // 钉死的站点上没有这个模型 → 同样降级重试
-  if (!up.ok && target.fallback && isModelNotFound(up.status, up.text)) {
-    warn(`[${site}] 没有模型 ${model}，自动降级到备用站点 ${target.fallback.site} 重试`);
-    site = target.fallback.site;
-    model = target.fallback.model;
-    openaiBody.model = target.fallback.model;
-    up = await 打开一次();
-  }
-  // 站点降级：上游网关故障（502/503/504）→ 换备用站点重试一次
-  if (!up.ok && target.fallback && site !== target.fallback.site && isGatewayError(up.status)) {
-    warn(`[${site}] 上游网关 ${up.status}，自动降级到备用站点 ${target.fallback.site} 重试`);
-    site = target.fallback.site;
-    model = target.fallback.model;
-    openaiBody.model = target.fallback.model;
-    up = await 打开一次();
-  }
+  // 与 openai/responses 入口共用同一条降级编排（openWithSiteFallback）：
+  // 连接失败 / 模型不存在 / 网关 5xx / 额度 429·402 四条路径在这里统一处理，
+  // 补齐了原实现缺的「额度层换站」——429/402 是 return 不是 throw，原来根本进不了降级。
+  const r = await openWithSiteFallback(
+    cfg,
+    target,
+    openaiBody,
+    signal,
+    (s, b) => openChatRotating(cfg, s, b, { signal }).then((x) => x.up)
+  );
+  const up = r.up;
+  site = r.site;
+  model = r.model;
   if (!up.ok) {
     requestLog({ site, model, mode: wantsStream ? 'anthropic-stream' : 'anthropic-json', status: up.status, ms: Date.now() - started, note: 'upstream_reject' });
     return sendError(res, up.status, upstreamErrorMessage(up.status, up.text, site), 'api_error');
@@ -207,7 +186,8 @@ export async function handleMessages(ctx) {
       status: 200,
       promptTokens: agg.usage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
       completionTokens: agg.usage?.completion_tokens ?? estimateTokens(agg.content),
-      credit: agg.usage?.credit ?? 0,
+      credit: await estimateCredit(cfg, site, model, agg.usage?.credit,
+        agg.usage?.prompt_tokens ?? 0, agg.usage?.completion_tokens ?? 0),
       ms: Date.now() - started,
       tools: agg.toolCallList.length,
     });
@@ -337,7 +317,8 @@ export async function handleMessages(ctx) {
       status: closed ? 502 : 200,
       promptTokens: usage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
       completionTokens: usage?.completion_tokens ?? Math.max(1, Math.ceil(textLen / 3)),
-      credit: usage?.credit ?? 0,
+      credit: await estimateCredit(cfg, site, model, usage?.credit,
+        usage?.prompt_tokens ?? 0, usage?.completion_tokens ?? 0),
       ms: Date.now() - started,
       tools: toolBlocks.size,
     });

@@ -1,5 +1,52 @@
 // HTTP 小工具：请求体读取、响应写出（含背压）、SSE 帧写出。
+import fs from 'node:fs';
+import path from 'node:path';
+
 export const MAX_BODY = 16 * 1024 * 1024;
+
+/**
+ * 原子写文件：先写 `<name>.tmp` 再 rename。
+ *
+ * 为什么：writeFileSync 写到一半进程被杀（断电/强杀）会留下半截 JSON，
+ * 而账号池/配置文件解析失败时的默认行为是「视作空池/重置」——
+ * 相当于一个崩溃就把用户全部登录凭证清掉了。rename 在同一目录内是原子的。
+ */
+export function writeJsonFileAtomic(file, data, { mode } = {}) {
+  const tmp = file + '.tmp';
+  const opts = mode ? { encoding: 'utf8', mode } : 'utf8';
+  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', opts);
+  fs.renameSync(tmp, file);
+}
+
+/**
+ * 读取 JSON 文件；解析失败时把坏文件改名备份（`<name>.corrupt-<时间戳>`）再返回 null。
+ *
+ * 为什么备份而不是直接当空文件覆盖：坏文件里往往还有能手工抢救的数据
+ * （半截 JSON 的前半段是完整的），直接覆盖 = 数据彻底没了。
+ * 返回 null 表示「文件不存在或已损坏（已备份）」，由调用方决定默认值。
+ */
+export function readJsonFileWithBackup(file) {
+  if (!fs.existsSync(file)) return null;
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    const backup = `${file}.corrupt-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    try {
+      fs.renameSync(file, backup);
+      console.warn(`[workbuddy-bridge] ${path.basename(file)} 解析失败，已备份为 ${path.basename(backup)} 后按默认值继续`);
+    } catch {
+      console.warn(`[workbuddy-bridge] ${path.basename(file)} 解析失败，且备份也失败，按默认值继续`);
+    }
+    return null;
+  }
+}
+
 
 export async function readJsonBody(req) {
   const chunks = [];

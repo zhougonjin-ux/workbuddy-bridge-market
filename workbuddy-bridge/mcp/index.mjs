@@ -6,8 +6,16 @@
 //
 // 协议：MCP stdio（换行分隔的 JSON-RPC 2.0）。日志一律走 stderr，stdout 只发协议帧。
 import { loadConfig, primaryKey } from '../server/src/config.mjs';
+import { readFileSync } from 'node:fs';
 
-const VERSION = '0.1.0';
+// 版本号以 server/package.json 为唯一事实源（serverInfo 版本号会报告给客户端）。
+// 曾硬编码 '0.1.0' 而 server 已是 0.3.2，两端版本号对不上。
+let VERSION = '0.0.0';
+try {
+  VERSION = JSON.parse(readFileSync(new URL('../server/package.json', import.meta.url), 'utf8')).version || VERSION;
+} catch {
+  // 读不到就保持兜底值，不影响协议运行
+}
 
 /* ---------------- 本地代理 HTTP 客户端 ---------------- */
 

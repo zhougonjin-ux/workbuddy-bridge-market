@@ -28,6 +28,7 @@ import crypto from 'node:crypto';
 import { getConfigDir, authPathFor, loadConfig } from './config.mjs';
 import { orderAccounts } from './expiry.mjs';
 import { warn } from './log.mjs';
+import { writeJsonFileAtomic, readJsonFileWithBackup } from './util.mjs';
 
 /** 池文件里代表「旧版单账号凭证」的固定 id。 */
 export const DEFAULT_ACCOUNT_ID = 'default';
@@ -137,13 +138,11 @@ function readPoolFile(site) {
   }
   const hit = cache.get(key);
   if (hit && hit.mtime === mtime) return hit.pool;
-  let pool;
-  try {
-    pool = JSON.parse(fs.readFileSync(file, 'utf8'));
-  } catch (e) {
-    warn(`[${site}] 账号池文件解析失败，视作空池：`, e.message);
-    pool = emptyPool();
-  }
+  // 解析失败时 readJsonFileWithBackup 会把坏文件改名备份（用户还能手工抢救），
+  // 返回 null —— 这里按「空池」继续，但数据没被静默覆盖掉。
+  const parsed = readJsonFileWithBackup(file);
+  let pool = parsed ?? emptyPool();
+  if (parsed === null) warn(`[${site}] 账号池文件解析失败（已备份），视作空池`);
   if (!Array.isArray(pool.accounts)) pool.accounts = [];
   if (!Number.isFinite(pool.nextLabel)) pool.nextLabel = pool.accounts.length + 1;
   cache.set(key, { mtime, pool });
@@ -152,7 +151,8 @@ function readPoolFile(site) {
 
 function writePool(site, pool) {
   const file = poolPathFor(site);
-  fs.writeFileSync(file, JSON.stringify(pool, null, 2) + '\n', { encoding: 'utf8', mode: 0o600 });
+  // 原子写：写一半被杀只损失 .tmp，不再把整池凭证截成半截 JSON
+  writeJsonFileAtomic(file, pool, { mode: 0o600 });
   cache.set(cacheKey(site), { mtime: fs.statSync(file).mtimeMs, pool });
   // 状态已经落到池文件，内存态覆盖不再需要。
   // 这里不会丢状态：调用方的 pool 来自 loadPool，而 loadPool 已经把覆盖合并进账户了。

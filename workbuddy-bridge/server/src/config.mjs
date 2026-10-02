@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { writeJsonFileAtomic } from './util.mjs';
 
 // 用 fileURLToPath + dirname 而不是 import.meta.dirname：
 // 后者要 Node ≥ 20.11，会让 README 声明的「≥ 18」变成假的
@@ -653,7 +654,8 @@ function loadConfigFrom(dir) {
 }
 
 export function saveConfig(cfg) {
-  fs.writeFileSync(paths.config, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+  // 原子写：config.json 存着 apiKey/站点开关等运行配置，写一半被杀不该留半截文件
+  writeJsonFileAtomic(paths.config, cfg);
 }
 
 /** 已启用且在册的站点键列表。 */

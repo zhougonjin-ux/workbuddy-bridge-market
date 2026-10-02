@@ -16,6 +16,7 @@ import { handleMessages, handleCountTokens } from './src/anthropic.mjs';
 import { queryCredit, supportsCreditQuery } from './src/upstream.mjs';
 import { handleConsoleApi } from './src/console-api.mjs';
 import { flushUsage } from './src/usage.mjs';
+import { flushLearned } from './src/compress.mjs';
 import { flushPool } from './src/pool.mjs';
 import { createRateLimiter } from './src/ratelimit.mjs';
 import { readJsonBody, sendJson, sendError } from './src/util.mjs';
@@ -527,6 +528,7 @@ process.on('SIGINT', () => {
   stopProviderConfigSync();
   flushUsage();
   flushPool();
+  flushLearned();
   server.close(() => process.exit(0));
 });
 process.on('unhandledRejection', (e) => error('未处理的 Promise 异常：', e));

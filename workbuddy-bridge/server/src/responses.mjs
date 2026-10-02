@@ -7,9 +7,9 @@
 //
 // 设计原则：只新增，不改动 /v1/chat/completions 的任何既有行为。
 import { resolveTarget } from './router.mjs';
-import { isGatewayError } from './openai.mjs';
+import { openWithSiteFallback } from './openai.mjs';
 import { openChat, openChatRotating, classifyFrame, upstreamErrorMessage } from './upstream.mjs';
-import { recordUsage } from './usage.mjs';
+import { recordUsage, estimateCredit } from './usage.mjs';
 import { startSSE, writeSSEEvent, sendJson, sendError, estimateTokens } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
 
@@ -267,15 +267,12 @@ export async function handleResponses(ctx) {
   const chatReq = toChatRequest({ ...body, model });
   const requestModel = target.requested;
 
-  let up = (await openChatRotating(cfg, site, chatReq, { signal })).up;
-  // 站点降级：上游网关故障（openresty/APISIX 返回 502/503/504）→ 换备用站点重试一次
-  if (!up.ok && target.fallback && site !== target.fallback.site && isGatewayError(up.status)) {
-    warn(`[${site}] 上游网关 ${up.status}，自动降级到备用站点 ${target.fallback.site} 重试`);
-    site = target.fallback.site;
-    model = target.fallback.model;
-    chatReq.model = target.fallback.model;
-    up = (await openChatRotating(cfg, site, chatReq, { signal })).up;
-  }
+  // 与 openai/anthropic 入口共用同一条降级编排（openWithSiteFallback）。
+  // 原来只有网关 502/503/504 一条降级路径，连接失败/模型不存在/额度受限都直接报死给客户端。
+  const r = await openWithSiteFallback(cfg, target, chatReq, signal, (s, b) => openChatRotating(cfg, s, b, { signal }).then((x) => x.up));
+  const up = r.up;
+  site = r.site;
+  model = r.model;
   if (!up.ok) {
     requestLog({ site, model, mode: 'responses', status: up.status, ms: Date.now() - started, note: 'upstream_reject' });
     return sendError(res, up.status, upstreamErrorMessage(up.status, up.text, site));
@@ -304,7 +301,7 @@ export async function handleResponses(ctx) {
       status: 200,
       promptTokens: usage.input_tokens,
       completionTokens: usage.output_tokens,
-      credit: agg.usage?.credit ?? 0,
+      credit: await estimateCredit(cfg, site, model, agg.usage?.credit, usage.input_tokens, usage.output_tokens),
       ms: Date.now() - started,
       tools: agg.toolCallList.length,
     });
@@ -602,7 +599,8 @@ export async function handleResponses(ctx) {
       status: finished ? 200 : 499,
       promptTokens: upstreamUsage?.prompt_tokens ?? estimateTokens(JSON.stringify(chatReq.messages || [])),
       completionTokens: upstreamUsage?.completion_tokens ?? estimateTokens('x'.repeat(contentChars)),
-      credit: upstreamUsage?.credit ?? 0,
+      credit: await estimateCredit(cfg, site, model, upstreamUsage?.credit,
+        upstreamUsage?.prompt_tokens ?? 0, upstreamUsage?.completion_tokens ?? 0),
       ms: Date.now() - started,
       tools: toolItems.size,
     });

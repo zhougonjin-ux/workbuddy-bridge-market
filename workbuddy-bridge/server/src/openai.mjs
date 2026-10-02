@@ -4,7 +4,7 @@ import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErr
 import { ensureToken } from './auth.mjs';
 import { isQuotaError } from './pool.mjs';
 import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText } from './router.mjs';
-import { recordUsage } from './usage.mjs';
+import { recordUsage, estimateCredit } from './usage.mjs';
 import { startSSE, writeSSE, sendJson, sendError, estimateTokens } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
 
@@ -62,6 +62,72 @@ export function isGatewayError(status) {
   return status === 502 || status === 503 || status === 504;
 }
 
+/**
+ * 三协议（OpenAI / Anthropic / Responses）共用的站点降级编排。
+ *
+ * 为什么抽出来：这四条降级路径原本在 openai / anthropic / responses 三个入口各复制一份，
+ * 已经出过一次微妙的 bug（openWithFallback 曾返回 { up } 包装而 anthropic 的复制版直接
+ * 用裸 up，两边语义悄悄分叉），抽成一处后新增降级路径（比如额度层换站）只改这里。
+ *
+ * 首次打开用调用方给的 opener；四条路径按固定顺序检查，命中即换备用站点重试一次：
+ *   1. 连接级失败（异常抛出）—— opener 抛错时判定
+ *   2. 钉站点没有该模型（400 model not found）
+ *   3. 网关 502/503/504
+ *   4. 额度层 429/402/quota 文案（受 pool.switchSiteOnExhausted 开关控制）
+ *
+ * 返回 { up, site, model }；up.ok=false 时错误文案里同时带原站点与备用站点的原因。
+ * 每条路径只重试一次：已降到备用站点后（site === fallback.site）不再重复触发。
+ */
+export async function openWithSiteFallback(cfg, target, upstreamBody, signal, opener, { logMode = 'stream' } = {}) {
+  let { site, model } = target;
+  let up;
+  try {
+    up = await opener(site, upstreamBody);
+  } catch (e) {
+    if (target.fallback && isTransportFailure(e) && !signal?.aborted) {
+      const r = await openWithFallback(cfg, target, upstreamBody, signal, `连接失败（${e?.cause?.code || e?.message}）`);
+      up = r.up;
+      site = r.site;
+      model = r.model;
+    } else if (cfg.pool?.switchSiteOnExhausted && target.fallback && !signal?.aborted) {
+      // 连接级失败且整站账号已耗尽 → 也换站点试一次
+      const r = await openWithFallback(cfg, target, upstreamBody, signal, '本站点账号额度不足');
+      up = r.up;
+      site = r.site;
+      model = r.model;
+    } else {
+      throw e;
+    }
+  }
+
+  // 路由表把模型钉到了某站点，但那个站点其实没有这个模型 → 换到真正拥有该模型的站点
+  if (!up.ok && target.fallback && isModelNotFound(up.status, up.text)) {
+    const r = await openWithFallback(cfg, target, upstreamBody, signal, `没有模型 ${model}`);
+    up = r.up;
+    site = r.site;
+    model = r.model;
+  }
+  // 上游网关故障（openresty/APISIX 回源失败返回 502/503/504）→ 换备用站点。
+  // site !== fallback 判断避免降级后对同一站点重复重试。
+  if (!up.ok && target.fallback && site !== target.fallback.site && isGatewayError(up.status)) {
+    const r = await openWithFallback(cfg, target, upstreamBody, signal, `上游网关 ${up.status}`);
+    up = r.up;
+    site = r.site;
+    model = r.model;
+  }
+  // 额度层被挡（429 限流 / 402 积分不足 / quota 文案）→ 换还有额度的备用站点。
+  // 注意 openChatRotating 对 HTTP 错误是 return 而不是 throw，这类情况进不了上面的 catch。
+  if (!up.ok && target.fallback && site !== target.fallback.site && !signal?.aborted && isQuotaError(up.status, up.text)) {
+    if (cfg.pool?.switchSiteOnExhausted !== false) {
+      const r = await openWithFallback(cfg, target, upstreamBody, signal, `本站点额度受限（HTTP ${up.status}）`);
+      up = r.up;
+      site = r.site;
+      model = r.model;
+    }
+  }
+  return { up, site, model };
+}
+
 /** 换个站点重试同一请求（用于降级）。换站点后账号池也换了一套，因此 exclude 重置。 */
 async function openWithFallback(cfg, target, upstreamBody, signal, 原因) {
   const 目标站点 = target.fallback.site;
@@ -111,57 +177,10 @@ export async function handleChatCompletions(ctx) {
     upstreamBody.max_tokens = cfg.defaultMaxTokens;
   }
 
-  let up;
-  try {
-    up = await openWithRetry(cfg, site, upstreamBody, signal);
-  } catch (e) {
-    // 连接级失败（国际版网络抖动）→ 换站点重试一次
-    if (target.fallback && isTransportFailure(e) && !signal?.aborted) {
-      const r = await openWithFallback(cfg, target, upstreamBody, signal, `连接失败（${e?.cause?.code || e?.message}）`);
-      up = r.up;
-      site = r.site;
-      model = r.model;
-    } else if (cfg.pool?.switchSiteOnExhausted && target.fallback && !signal?.aborted) {
-      // 本站点所有账号都被判额度耗尽 → 换到还有额度的备用站点
-      const r = await openWithFallback(cfg, target, upstreamBody, signal, '本站点账号额度不足');
-      up = r.up;
-      site = r.site;
-      model = r.model;
-    } else {
-      throw e;
-    }
-  }
-
-  // 站点降级：路由表把模型钉到了某站点，但那个站点其实没有这个模型时，
-  // 自动换到真正拥有该模型的站点重试一次（配置里想强制走国际版，这里兜住例外情况）
-  if (!up.ok && target.fallback && isModelNotFound(up.status, up.text)) {
-    const r = await openWithFallback(cfg, target, upstreamBody, signal, `没有模型 ${model}`);
-    up = r.up;
-    site = r.site;
-    model = r.model;
-  }
-  // 站点降级：上游网关故障（openresty/APISIX 回源失败返回 502/503/504）→ 换备用站点重试一次。
-  // 加 site !== fallback 的判断，避免上一段降级后再次对同一站点重试。
-  if (!up.ok && target.fallback && site !== target.fallback.site && isGatewayError(up.status)) {
-    const r = await openWithFallback(cfg, target, upstreamBody, signal, `上游网关 ${up.status}`);
-    up = r.up;
-    site = r.site;
-    model = r.model;
-  }
-  // 站点降级：本站在额度层被挡住（429 限流 / 402 积分不足 / quota 文案）→ 换还有额度的备用站点。
-  //
-  // 为什么必须放在这里、而不是上面 catch 里的 switchSiteOnExhausted 分支：
-  //   openChatRotating 对 HTTP 错误是 **return** 而不是 throw（只有连接级故障才抛），
-  //   所以 429 这类「账号被打上耗尽标记」的情况根本进不了 catch，
-  //   那条 switchSiteOnExhausted 分支实际上只能覆盖连接异常，覆盖不到它真正想覆盖的场景。
-  if (!up.ok && target.fallback && site !== target.fallback.site && !signal?.aborted && isQuotaError(up.status, up.text)) {
-    if (cfg.pool?.switchSiteOnExhausted !== false) {
-      const r = await openWithFallback(cfg, target, upstreamBody, signal, `本站点额度受限（HTTP ${up.status}）`);
-      up = r.up;
-      site = r.site;
-      model = r.model;
-    }
-  }
+  const r = await openWithSiteFallback(cfg, target, upstreamBody, signal, (s, b) => openWithRetry(cfg, s, b, signal));
+  let up = r.up;
+  site = r.site;
+  model = r.model;
   if (!up.ok) {
     requestLog({ site, model, mode: wantsStream ? 'stream' : 'json', status: up.status, ms: Date.now() - started, note: 'upstream_reject' });
     return sendError(res, up.status, upstreamErrorMessage(up.status, up.text, site));
@@ -211,7 +230,8 @@ export async function handleChatCompletions(ctx) {
         status: finished ? 200 : 499,
         promptTokens: upstreamUsage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
         completionTokens: upstreamUsage?.completion_tokens ?? estimateTokens('x'.repeat(contentChars)),
-        credit: upstreamUsage?.credit ?? 0,
+        credit: await estimateCredit(cfg, site, model, upstreamUsage?.credit,
+          upstreamUsage?.prompt_tokens ?? 0, upstreamUsage?.completion_tokens ?? 0),
         ms: Date.now() - started,
         tools,
       });
@@ -294,7 +314,7 @@ export async function handleChatCompletions(ctx) {
     status: 200,
     promptTokens: usage.prompt_tokens,
     completionTokens: usage.completion_tokens,
-    credit: usage.credit ?? 0,
+    credit: await estimateCredit(cfg, site, model, usage.credit, usage.prompt_tokens, usage.completion_tokens),
     ms: Date.now() - started,
     tools: agg.toolCallList.length,
   });
