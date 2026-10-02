@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%234f8cff'/%3E%3Ctext x='16' y='21' font-size='13' font-weight='700' font-family='sans-serif' fill='white' text-anchor='middle'%3EWB%3C/text%3E%3C/svg%3E">
+<title>WorkBuddy 积分桥 · 控制台</title>
+<style>
+:root{
+  --bg:#0e1014; --panel:#161a22; --panel2:#1c2130; --line:#262d3d;
+  --text:#e7eaf2; --muted:#8b93a7; --accent:#4f8cff; --ok:#3fb96f;
+  --warn:#e0a83c; --bad:#e05c5c; --chip:#232a3a;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 "Segoe UI",system-ui,"Microsoft YaHei",sans-serif}
+header{display:flex;align-items:center;gap:14px;padding:14px 22px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+.logo{display:inline-flex;width:30px;height:30px;border-radius:8px;background:linear-gradient(135deg,#4f8cff,#7a5cff);align-items:center;justify-content:center;font-weight:700;font-size:12px}
+.brand{display:flex;align-items:center;gap:10px;font-size:16px;font-weight:600}
+.ver{color:var(--muted);font-size:12px;font-weight:400}
+#srvMeta{margin-left:auto;display:flex;gap:8px;flex-wrap:wrap;align-items:center;color:var(--muted);font-size:12px}
+#srvMeta .pill{background:var(--chip);border-radius:20px;padding:3px 10px;cursor:pointer}
+#srvMeta .pill:hover{color:var(--text)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-right:5px}
+.dot.ok{background:var(--ok)}
+nav{display:flex;gap:4px;padding:10px 22px 0;border-bottom:1px solid var(--line)}
+nav button{background:none;border:none;color:var(--muted);padding:9px 16px;font-size:14px;cursor:pointer;border-bottom:2px solid transparent}
+nav button.on{color:var(--text);border-bottom-color:var(--accent)}
+main{padding:18px 22px 60px;max-width:1180px;margin:0 auto}
+section[hidden]{display:none}
+h2{font-size:15px;margin:22px 0 10px;display:flex;align-items:center;gap:10px}
+h2 .sub{color:var(--muted);font-size:12px;font-weight:400}
+h2:first-child{margin-top:0}
+button.btn{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:7px 14px;cursor:pointer;font-size:13px}
+button.btn:hover{border-color:var(--accent)}
+button.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+button.btn.danger{color:var(--bad)}
+button.btn.mini{padding:3px 9px;font-size:12px;border-radius:6px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+.grid{display:grid;gap:12px}
+.policies{grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+.policy{background:var(--panel);border:1.5px solid var(--line);border-radius:12px;padding:13px 15px;cursor:pointer}
+.policy:hover{border-color:#3a4560}
+.policy.on{border-color:var(--accent);background:linear-gradient(180deg,rgba(79,140,255,.10),rgba(79,140,255,.02))}
+.policy b{display:block;font-size:14px;margin-bottom:3px}
+.policy span{color:var(--muted);font-size:12px}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.spacer{flex:1}
+.muted{color:var(--muted)}
+.ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+.badge{display:inline-block;border-radius:5px;padding:1px 8px;font-size:11.5px;background:var(--chip);color:var(--muted)}
+.badge.ok{background:rgba(63,185,111,.15);color:var(--ok)}
+.badge.warn{background:rgba(224,168,60,.15);color:var(--warn)}
+.badge.bad{background:rgba(224,92,92,.15);color:var(--bad)}
+.badge.acc{background:rgba(79,140,255,.15);color:var(--accent)}
+.accts{grid-template-columns:repeat(auto-fill,minmax(330px,1fr))}
+.acct{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:15px;display:flex;flex-direction:column;gap:9px}
+.acct.off{opacity:.55}
+.acct .hd{display:flex;align-items:center;gap:8px}
+.acct .hd b{font-size:14.5px;cursor:pointer}
+.acct .hd small{color:var(--muted)}
+.acct .bal{font-size:26px;font-weight:700;letter-spacing:.5px}
+.acct .bal small{font-size:12px;color:var(--muted);font-weight:400;margin-left:5px}
+.batches{display:flex;flex-direction:column;gap:6px}
+.batch{font-size:12px}
+.batch .l{display:flex;justify-content:space-between;gap:8px;margin-bottom:2px}
+.batch .bar{height:5px;border-radius:3px;background:var(--chip);overflow:hidden}
+.batch .bar i{display:block;height:100%;border-radius:3px}
+.acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
+.plan{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.plan .step{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:6px 11px;font-size:12.5px}
+.plan .step b{color:var(--accent);margin-right:5px}
+.plan .arrow{color:var(--muted)}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{color:var(--muted);text-align:left;font-weight:500;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:8px 10px;border-bottom:1px solid var(--line);vertical-align:middle}
+tr:hover td{background:rgba(79,140,255,.04)}
+.cap{display:inline-block;width:20px;text-align:center}
+select,input[type=text],input[type=date]{background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:7px 10px;font-size:13px}
+input[type=date]{color-scheme:dark}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:50}
+.modal .box{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:22px;width:440px;max-width:94vw;max-height:90vh;overflow:auto}
+.modal h3{margin:0 0 14px;font-size:16px}
+.modal .fld{margin-bottom:12px}
+.modal label{display:block;color:var(--muted);font-size:12.5px;margin-bottom:5px}
+.modal select,.modal input{width:100%}
+#qrBox{background:#fff;border-radius:10px;padding:12px;width:196px;height:196px;margin:8px auto}
+#qrBox svg{display:block}
+.qrhint{font-size:12.5px;color:var(--muted);background:var(--panel2);border-radius:8px;padding:9px 12px;margin:10px 0;line-height:1.7}
+#toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:99}
+.toast{background:var(--panel2);border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:8px;padding:10px 14px;font-size:13px;max-width:420px;animation:in .18s}
+.toast.ok{border-left-color:var(--ok)} .toast.bad{border-left-color:var(--bad)}
+@keyframes in{from{transform:translateY(8px);opacity:0}}
+#logBox{background:#0a0c10;border:1px solid var(--line);border-radius:10px;padding:12px;font:12px/1.6 Consolas,monospace;height:60vh;overflow:auto;white-space:pre-wrap;word-break:break-all}
+.lv-warn{color:var(--warn)} .lv-error{color:var(--bad)} .lv-req{color:#7f88a0} .lv-info{color:#9fd0ff}
+.bars{display:flex;gap:8px;align-items:flex-end;height:110px;margin-top:10px}
+.bars .col{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;gap:4px;height:100%}
+.bars .col i{width:70%;background:linear-gradient(180deg,#4f8cff,#3a63c4);border-radius:4px 4px 0 0;min-height:2px}
+.bars .col span{font-size:10.5px;color:var(--muted);white-space:nowrap}
+.kpis{grid-template-columns:repeat(auto-fit,minmax(130px,1fr))}
+.kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 14px}
+.kpi b{font-size:20px;display:block}
+.kpi span{color:var(--muted);font-size:12px}
+.empty{color:var(--muted);text-align:center;padding:26px;border:1px dashed var(--line);border-radius:10px}
+.spin{display:inline-block;width:13px;height:13px;border:2px solid var(--muted);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:6px}
+@keyframes sp{to{transform:rotate(360deg)}}
+</style>
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">WB</span>WorkBuddy 积分桥 <span class="ver" id="ver"></span></div>
+  <div id="srvMeta"></div>
+</header>
+<nav id="tabs">
+  <button data-tab="accounts" class="on">账号与积分</button>
+  <button data-tab="models">模型</button>
+  <button data-tab="tasks">自动任务</button>
+  <button data-tab="usage">用量</button>
+  <button data-tab="logs">日志</button>
+</nav>
+<main>
+  <section id="tab-accounts"></section>
+  <section id="tab-models" hidden></section>
+  <section id="tab-tasks" hidden></section>
+  <section id="tab-usage" hidden></section>
+  <section id="tab-logs" hidden>
+    <div class="row" style="margin-bottom:10px">
+      <button class="btn mini" id="logPause">暂停滚动</button>
+      <button class="btn mini" id="logClear">清屏</button>
+      <span class="muted" style="font-size:12px">实时日志（长轮询，仅本机内存最近 500 条）</span>
+    </div>
+    <div id="logBox"></div>
+  </section>
+</main>
+<div id="modalRoot"></div>
+<div id="toast"></div>
+<script src="/console/qrcode.min.js"></script>
+<script>
+'use strict';
+const TOKEN = window.__WB_TOKEN__ || '';
+const $ = (s, el = document) => (el || document).querySelector(s);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+async function api(path, opts = {}) {
+  const res = await fetch('/console/api' + path, {
+    ...opts,
+    headers: { 'X-Console-Token': TOKEN, 'Content-Type': 'application/json', ...(opts.headers || {}) },
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+  });
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (!res.ok) {
+    const info = json.error;
+    const msg = typeof info === 'string' ? info : (info && info.message) || ('HTTP ' + res.status);
+    throw new Error(msg);
+  }
+  return json;
+}
+
+function toast(msg, cls = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + cls;
+  el.textContent = msg;
+  $('#toast').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+const copy = (text, tip) => navigator.clipboard?.writeText(text).then(() => toast((tip || '已复制') + '：' + text, 'ok')).catch(() => {});
+
+/* ---------- 时间/格式化 ---------- */
+const fmtDays = (t) => {
+  if (!t) return null;
+  const d = Math.round((t - Date.now()) / 86400000);
+  return d;
+};
+const expiryColor = (t) => {
+  const d = fmtDays(t);
+  if (d === null) return '#5a6377';
+  if (d <= 0) return 'var(--bad)';
+  if (d <= 7) return 'var(--bad)';
+  if (d <= 30) return 'var(--warn)';
+  return 'var(--ok)';
+};
+const expiryText = (t) => {
+  if (!t) return '无到期信息';
+  const d = fmtDays(t);
+  const date = new Date(t).toLocaleDateString();
+  if (d <= 0) return `${date}（已到期）`;
+  return `${date}（${d} 天后）`;
+};
+const fmtK = (n) => (n == null ? '—' : n >= 1000 ? Math.round(n / 1000) + 'K' : String(n));
+const dur = (ms) => {
+  const h = Math.floor(ms / 3600000), m = Math.floor(ms % 3600000 / 60000);
+  return h ? `${h} 时 ${m} 分` : `${m} 分`;
+};
+
+/* ---------- 全局状态与 Tab ---------- */
+const TABS = ['accounts', 'models', 'tasks', 'usage', 'logs'];
+let active = 'accounts';
+let refreshTimer = null, logTimer = null, logSeq = 0, logPaused = false, STATE = null;
+
+function switchTab(name) {
+  active = name;
+  for (const t of TABS) $('#tab-' + t).hidden = t !== name;
+  for (const b of $('#tabs').children) b.classList.toggle('on', b.dataset.tab === name);
+  clearInterval(refreshTimer); clearInterval(logTimer); logTimer = null;
+  if (name === 'accounts') { loadAccounts(); refreshTimer = setInterval(loadAccounts, 30000); }
+  if (name === 'models') { loadModels(); refreshTimer = setInterval(loadModels, 60000); }
+  if (name === 'tasks') { loadTasks(); refreshTimer = setInterval(loadTasks, 30000); }
+  if (name === 'usage') { loadUsage(); refreshTimer = setInterval(loadUsage, 60000); }
+  if (name === 'logs') startLogs();
+}
+for (const b of $('#tabs').children) b.onclick = () => switchTab(b.dataset.tab);
+$('#logPause').onclick = () => { logPaused = !logPaused; $('#logPause').textContent = logPaused ? '继续滚动' : '暂停滚动'; };
+$('#logClear').onclick = () => { $('#logBox').textContent = ''; logSeq = 0; };
+
+/* ---------- 顶栏 ---------- */
+async function loadHeader() {
+  STATE = await api('/state');
+  const anyLogin = (STATE.sites || []).some((s) => s.logged_in);
+  $('#ver').textContent = 'v' + (STATE.version || '?');
+  $('#srvMeta').innerHTML =
+    `<span class="pill"><span class="dot ${anyLogin ? 'ok' : ''}"></span>${anyLogin ? '运行中' : '未登录账号'}</span>` +
+    `<span class="pill" title="点击复制 Base URL" onclick='copy(${JSON.stringify(STATE.base_url)},"Base URL")'>${esc(STATE.base_url)}</span>` +
+    `<span class="pill" style="color:#9fc4ff" title="复制 ZCode 模型供应商接入配置" id="copyCfg">⧉ 复制 ZCode 配置</span>` +
+    `<span class="pill" title="默认模型（点击到模型页修改）">默认：${esc(STATE.default_model)}</span>` +
+    `<span class="pill" title="本次服务运行时长">已运行 ${dur(STATE.uptime_ms || 0)}</span>`;
+  $('#copyCfg').onclick = async () => {
+    try {
+      const c = await api('/zcode-config');
+      const text = [
+        'ZCode 模型供应商配置（OpenAI 兼容）：',
+        'Base URL: ' + c.base_url,
+        'API Key: ' + c.api_key,
+        '模型 ID: ' + c.model,
+        '',
+        '提示：模型 ID 填 default，以后切模型在管理台「设为默认」或会话里说一声即可，不用再进 ZCode 设置。',
+      ].join('\n');
+      copy(text, '已复制 ZCode 接入配置');
+    } catch (e) { toast('获取配置失败：' + e.message, 'bad'); }
+  };
+}
+
+/* ---------- Tab 1：账号与积分 ---------- */
+const POLICIES = [
+  { id: 'expiry-first', name: '积分到期优先', desc: '最早到期且有余额的账号先用（推荐）' },
+  { id: 'balance-first', name: '余额优先', desc: '余额多的账号先用' },
+  { id: 'round-robin', name: '轮询均摊', desc: '最久未用的先用，均匀消耗' },
+  { id: 'pinned', name: '固定账号', desc: '始终使用指定的账号' },
+];
+
+async function loadAccounts() {
+  const el = $('#tab-accounts');
+  try {
+    const [policy, bridge0] = await Promise.all([api('/policy'), api('/bridge')]);
+    // 有账号但一个批次明细都没有（还没刷过）→ 自动刷一轮，让到期排序直接可用
+    const hasAccount = (bridge0.sites || []).some((s) => (s.accounts || []).length);
+    const anyDetail = (bridge0.sites || []).some((s) => (s.accounts || []).some((a) => Array.isArray(a.creditDetail) && a.creditDetail.length));
+    let bridge = bridge0;
+    if (hasAccount && !anyDetail) {
+      try { await api('/credit/refresh', { method: 'POST' }); bridge = await api('/bridge'); } catch { /* 刷新失败先用缓存渲染 */ }
+    }
+    const sites = bridge.sites || [];
+    const acctRows = {};
+    for (const s of sites) {
+      if (s.accounts.length) {
+        const r = await api('/pool?site=' + encodeURIComponent(s.site) + '&credit=0');
+        for (const a of r.accounts) acctRows[s.site + '/' + a.id] = a;
+      }
+    }
+
+    const planItems = [];
+    const defSite = sites.find((s) => s.policy_applies) || sites[0];
+    if (defSite) for (const row of defSite.plan || []) {
+      if (!row.enabled) continue;
+      const d = fmtDays(row.earliestExpiry);
+      planItems.push(`<span class="step"><b>${planItems.length + 1}</b>${esc(row.label)} · 余 ${row.remain ?? '?'}${d === null ? '' : ` · <span style="color:${expiryColor(row.earliestExpiry)}">${d <= 0 ? '已到期' : d + '天'}</span>`}</span><span class="arrow">→</span>`);
+    }
+
+    let html = `
+    <h2>调度策略 <span class="sub">决定多账号之间先用哪个积分 · 每 ${policy.creditRefreshMinutes} 分钟自动刷新明细</span></h2>
+    <div class="grid policies">${POLICIES.map((p) => `
+      <div class="policy ${policy.policy === p.id ? 'on' : ''}" data-p="${p.id}">
+        <b>${p.name}${policy.policy === p.id ? ' ✓' : ''}</b><span>${p.desc}</span>
+        ${p.id === 'pinned' && policy.policy === 'pinned' ? pinnedSelect(sites, policy.pinnedAccountId) : ''}
+      </div>`).join('')}
+    </div>
+    <div class="row" style="margin:16px 0 4px">
+      <button class="btn primary" id="btnAdd">＋ 添加账号</button>
+      <button class="btn" id="btnImport">⬇ 导入本机账号</button>
+      <button class="btn" id="btnRefresh">↻ 刷新全部积分</button>
+      <span class="spacer"></span>
+      <span class="muted" style="font-size:12px">消耗顺序（当前策略）：</span>
+    </div>
+    <div class="plan">${planItems.length ? planItems.join('') : '<span class="muted">暂无账号，先添加账号</span>'}</div>`;
+
+    for (const s of sites) {
+      html += `<h2>${esc(s.label)} <span class="sub">${esc(s.site)} · ${esc(s.accounts.length)} 个账号</span></h2>`;
+      if (!s.accounts.length) {
+        html += `<div class="empty">该站点还没有账号 —— 点上方「＋ 添加账号」，用微信扫码即可登录</div>`;
+        continue;
+      }
+      html += `<div class="grid accts">${s.plan.map((row) => acctCard(s, row, acctRows[s.site + '/' + row.id] || {})).join('')}</div>`;
+    }
+    el.innerHTML = html;
+
+    $('#btnAdd').onclick = () => openLoginModal(sites);
+    $('#btnImport').onclick = async () => {
+      const b = $('#btnImport');
+      b.textContent = '扫描本机中…';
+      try {
+        const r = await api('/local/import', { method: 'POST' });
+        showImportModal(r);
+        loadAccounts();
+      } catch (e) { toast('导入失败：' + e.message, 'bad'); }
+      b.textContent = '⬇ 导入本机账号';
+    };
+    $('#btnRefresh').onclick = async () => {
+      $('#btnRefresh').textContent = '刷新中…';
+      try { await api('/credit/refresh', { method: 'POST' }); toast('积分明细已刷新', 'ok'); } catch (e) { toast('刷新失败：' + e.message, 'bad'); }
+      loadAccounts();
+    };
+    for (const p of el.querySelectorAll('.policy')) {
+      p.onclick = async (ev) => {
+        if (ev.target.closest('select')) return;
+        let pinnedAccountId = policy.pinnedAccountId;
+        if (p.dataset.p === 'pinned') {
+          const sel = p.querySelector('select');
+          pinnedAccountId = sel ? sel.value : null;
+          if (!pinnedAccountId) { toast('还没有账号可固定，先添加账号', 'bad'); return; }
+        }
+        try { await api('/policy', { method: 'POST', body: { policy: p.dataset.p, pinnedAccountId } }); toast('策略已切换：' + (POLICIES.find((x) => x.id === p.dataset.p) || {}).name, 'ok'); } catch (e) { toast('切换失败：' + e.message, 'bad'); }
+        loadAccounts();
+      };
+    }
+    for (const sel of el.querySelectorAll('select[data-pinsite]')) {
+      sel.onchange = async () => {
+        try { await api('/policy', { method: 'POST', body: { policy: 'pinned', pinnedAccountId: sel.value || null } }); toast('固定账号已更新', 'ok'); } catch (e) { toast('失败：' + e.message, 'bad'); }
+      };
+      sel.onclick = (ev) => ev.stopPropagation();
+    }
+    for (const b of el.querySelectorAll('[data-act]')) bindAcctAction(b, loadAccounts);
+  } catch (e) {
+    el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function pinnedSelect(sites, current) {
+  const def = sites.find((s) => s.policy_applies) || sites[0];
+  if (!def || !def.accounts.length) return `<div class="muted" style="font-size:12px;margin-top:6px">（先添加账号）</div>`;
+  return `<select data-pinsite="${esc(def.site)}" style="margin-top:8px;width:100%">${def.accounts.map((a) =>
+    `<option value="${esc(a.id)}" ${a.id === current ? 'selected' : ''}>${esc(a.label || a.id)}</option>`).join('')}</select>`;
+}
+
+function acctCard(site, row, raw) {
+  const a = { ...row, ...(raw.id ? raw : {}) };
+  const status = !a.enabled ? '<span class="badge">已禁用</span>'
+    : a.exhausted ? '<span class="badge bad">额度耗尽</span>'
+    : a.cooldown_until && new Date(a.cooldown_until) > new Date() ? '<span class="badge warn">冷却中</span>'
+    : '<span class="badge ok">可用</span>';
+  const total = (a.creditDetail || []).reduce((s, b) => s + (b.remain || 0), 0);
+  const bal = a.creditDetail && a.creditDetail.length ? total : (a.remain ?? a.credit ?? a.creditRemain ?? null);
+  const batches = (a.creditDetail || []).map((b) => {
+    const full = (b.remain || 0) + (b.used || 0);
+    const w = full > 0 ? Math.round((b.remain || 0) / full * 100) : 0;
+    return `<div class="batch">
+      <div class="l"><span class="muted">${esc(b.package || '积分包')}</span>
+      <span>余 <b>${b.remain}</b> · <span style="color:${expiryColor(b.expireAt)}">${esc(expiryText(b.expireAt))}</span></span></div>
+      <div class="bar"><i style="width:${w}%;background:${expiryColor(b.expireAt)}"></i></div>
+    </div>`;
+  }).join('');
+  return `<div class="acct ${a.enabled ? '' : 'off'}">
+    <div class="hd"><b data-act="rename" data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="点击改名">${esc(a.label || a.id)}</b>${a.is_default ? '<span class="badge acc">默认</span>' : ''}${status}<span class="spacer"></span><small class="muted">${esc(String(a.uid || '').slice(0, 8))}…</small></div>
+    <div class="bal">${bal === null ? '<span class="muted" style="font-size:14px">余额未知</span>' : bal}<small>积分${a.creditCheckedAt ? ' · 刷新于 ' + new Date(a.creditCheckedAt).toLocaleTimeString() : ''}</small></div>
+    <div class="batches">${batches || '<span class="muted" style="font-size:12px">暂无批次明细 —— 点「刷新全部积分」获取</span>'}</div>
+    ${a.manualExpireAt ? `<div style="font-size:12px" class="muted">手动到期兜底：<span class="warn">${esc(a.manualExpireAt)}</span></div>` : ''}
+    ${a.last_error ? `<div style="font-size:12px" class="bad">最近错误：${esc(a.last_error)}</div>` : ''}
+    <div class="acts">
+      <button class="btn mini" data-act="pin" data-site="${esc(site.site)}" data-id="${esc(a.id)}">📌 固定使用</button>
+      <button class="btn mini" data-act="enable" data-site="${esc(site.site)}" data-id="${esc(a.id)}" data-v="${a.enabled ? '0' : '1'}">${a.enabled ? '禁用' : '启用'}</button>
+      <button class="btn mini" data-act="manual" data-site="${esc(site.site)}" data-id="${esc(a.id)}">到期兜底</button>
+      <button class="btn mini" data-act="reset" data-site="${esc(site.site)}" data-id="${esc(a.id)}">重置状态</button>
+      <span class="spacer"></span>
+      <button class="btn mini danger" data-act="remove" data-site="${esc(site.site)}" data-id="${esc(a.id)}">删除</button>
+    </div>
+  </div>`;
+}
+
+function bindAcctAction(btn, done) {
+  btn.onclick = async () => {
+    const { act, site, id } = btn.dataset;
+    try {
+      if (act === 'rename') {
+        const name = prompt('修改账号显示名：', '');
+        if (name && name.trim()) await api('/pool/account', { method: 'POST', body: { site, id, label: name.trim() } });
+      } else if (act === 'pin') {
+        await api('/policy', { method: 'POST', body: { policy: 'pinned', pinnedAccountId: id } });
+        toast('已固定使用该账号（策略 → pinned）', 'ok');
+      } else if (act === 'enable') {
+        await api('/pool/account', { method: 'POST', body: { site, id, enabled: btn.dataset.v === '1' } });
+      } else if (act === 'reset') {
+        await api('/pool/account', { method: 'POST', body: { site, id, reset: true } });
+        toast('已清除耗尽/冷却标记', 'ok');
+      } else if (act === 'manual') {
+        const cur = btn.closest('.acct')?.querySelector('[data-manual]')?.textContent || '';
+        const v = prompt('手动到期兜底（接口拿不到到期时间时生效；格式 YYYY-MM-DD，留空清除）：', cur);
+        if (v !== null) await api('/pool/account', { method: 'POST', body: { site, id, manualExpireAt: v.trim() } });
+      } else if (act === 'remove') {
+        if (!confirm('确定删除该账号？（token 会从本机移除，账号本身不受影响）')) return;
+        await api('/pool/account/remove', { method: 'POST', body: { site, id } });
+      }
+      done();
+    } catch (e) { toast('操作失败：' + e.message, 'bad'); }
+  };
+}
+
+/* ---------- 登录弹窗（微信扫码） ---------- */
+function closeModal() { $('#modalRoot').innerHTML = ''; }
+function openLoginModal(sites) {
+  const siteOpts = (sites || []).map((s) => `<option value="${esc(s.site)}">${esc(s.label)}</option>`).join('');
+  $('#modalRoot').innerHTML = `<div class="modal" id="mWrap"><div class="box">
+    <h3>添加 WorkBuddy 账号</h3>
+    <div class="fld"><label>站点</label><select id="lgSite">${siteOpts}</select></div>
+    <div class="fld"><label>备注名（可选，方便区分多个账号）</label><input type="text" id="lgLabel" placeholder="如：小号A"></div>
+    <div class="row"><button class="btn primary" id="lgGo">生成登录二维码</button><span class="spacer"></span><button class="btn" id="lgCancel">取消</button></div>
+    <div id="lgArea" style="margin-top:14px"></div>
+  </div></div>`;
+  $('#mWrap').onclick = (e) => { if (e.target.id === 'mWrap') stopLogin(); };
+  $('#lgCancel').onclick = stopLogin;
+  let pollT = null;
+
+  function stopLogin() { clearInterval(pollT); closeModal(); }
+
+  $('#lgGo').onclick = async () => {
+    const site = $('#lgSite').value, label = $('#lgLabel').value.trim();
+    const area = $('#lgArea');
+    area.innerHTML = `<div class="muted"><span class="spin"></span>正在向上游申请授权…</div>`;
+    try {
+      const r = await api('/login/start', { method: 'POST', body: { site, label } });
+      const qr = makeQR(r.authUrl);
+      area.innerHTML = `
+        <div id="qrBox">${qr}</div>
+        <div class="qrhint">
+          <b style="color:var(--text)">微信扫码登录：</b><br>
+          ① 打开微信「扫一扫」，扫描上方二维码 → 在手机上打开授权页并登录确认；<br>
+          ② 或点 <a href="${esc(r.authUrl)}" target="_blank" style="color:var(--accent)">在电脑浏览器打开授权页</a>，按页面提示用微信扫码登录。<br>
+          登录完成后本窗口会自动检测到（最长等 10 分钟）。
+        </div>
+        <div id="lgStatus" class="muted"><span class="spin"></span>等待你在手机/浏览器上确认…</div>`;
+      const t0 = Date.now();
+      pollT = setInterval(async () => {
+        try {
+          const p = await api('/login/poll?site=' + encodeURIComponent(site));
+          if (p.done) {
+            clearInterval(pollT);
+            $('#lgStatus').innerHTML = `<span class="ok">✅ 登录成功：${esc(p.label || p.nickname || p.account_id)}（该站点现有 ${p.account_count} 个账号）</span>`;
+            toast('账号已添加，正在刷新积分明细…', 'ok');
+            setTimeout(async () => { closeModal(); try { await api('/credit/refresh', { method: 'POST' }); } catch {} loadAccounts(); }, 1400);
+            return;
+          }
+          const wait = Math.round((Date.now() - t0) / 1000);
+          $('#lgStatus').innerHTML = `<span class="spin"></span>等待确认中（${wait}s）… 上游：${esc(p.msg || '待扫码').slice(0, 60)}`;
+          if (Date.now() - t0 > 600000) { clearInterval(pollT); $('#lgStatus').innerHTML = '<span class="bad">等待超时，请重新生成二维码</span>'; }
+        } catch (e) { /* 轮询报错继续等 */ }
+      }, 3000);
+    } catch (e) {
+      area.innerHTML = `<div class="bad">发起登录失败：${esc(e.message)}</div>`;
+    }
+  };
+}
+
+function makeQR(text) {
+  try {
+    const qr = qrcode(0, 'M');
+    qr.addData(text);
+    qr.make();
+    const n = qr.getModuleCount();
+    let s = `<svg xmlns="http://www.w3.org/2000/svg" width="170" height="170" viewBox="0 0 ${n} ${n}" shape-rendering="crispEdges">`;
+    s += `<rect width="${n}" height="${n}" fill="#fff"/>`;
+    for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) if (qr.isDark(r, c)) s += `<rect x="${c}" y="${r}" width="1" height="1" fill="#111"/>`;
+    return s + '</svg>';
+  } catch {
+    return `<div class="muted" style="color:#333;padding:60px 10px;text-align:center">二维码生成失败，请直接点击下方链接</div>`;
+  }
+}
+
+/* ---------- 本机账号导入结果弹窗 ---------- */
+function showImportModal(r) {
+  const badge = (s) => s === 'imported' ? '<span class="badge ok">新增</span>'
+    : s === 'updated' ? '<span class="badge acc">已更新</span>'
+    : '<span class="badge">跳过</span>';
+  $('#modalRoot').innerHTML = `<div class="modal" id="mWrap2"><div class="box">
+    <h3>本机账号导入结果</h3>
+    <p class="muted" style="font-size:12.5px;margin-top:0">扫描了 ${r.scannedFiles} 个客户端配置文件：新增 ${r.imported} · 更新 ${r.updated} · 跳过 ${r.skipped}</p>
+    ${(r.found || []).map((f) => `<div class="card" style="padding:9px 13px;margin-bottom:8px">
+      <div class="row"><b style="font-size:13px">${esc(f.nickname || f.uid)}</b>${badge(f.status)}<span class="spacer"></span><span class="badge">${esc(f.site)}</span></div>
+      <div class="muted" style="font-size:12px;margin-top:3px">${esc(f.reason || '')}${f.exp ? ' · token 有效期至 ' + new Date(f.exp).toLocaleDateString() : ''}</div>
+    </div>`).join('') || '<div class="empty" style="padding:14px">没有发现可导入的登录态 —— 需要本机装有已登录的 WorkBuddy / CodeBuddy 客户端</div>'}
+    <div class="qrhint">本机导入的账号没有 refreshToken：token 到期后（客户端会自动续期）再点一次「导入本机账号」即可拿到新 token；服务每次启动也会自动重扫一次。若同账号已用扫码登录（支持自动续期），则不会被覆盖。</div>
+    <div class="row"><span class="spacer"></span><button class="btn" id="imClose">关闭</button></div>
+  </div></div>`;
+  $('#imClose').onclick = () => $('#mWrap2').remove();
+  $('#mWrap2').onclick = (e) => { if (e.target.id === 'mWrap2') $('#mWrap2').remove(); };
+}
+
+/* ---------- Tab 2：模型 ---------- */
+async function loadModels() {
+  const el = $('#tab-models');
+  try {
+    const m = await api('/models');
+    const rows = (m.data || []).map((x) => {
+      const mult = x.multiplier;
+      const cap = [];
+      if (x.free) cap.push('<span class="badge ok">0 扣费</span>');
+      return `<tr>
+        <td><b>${esc(x.id)}</b>${x.id === m.default_model ? ' <span class="badge acc">默认</span>' : ''}</td>
+        <td>${esc(x.name)}</td><td><span class="badge">${esc(x.site)}</span></td>
+        <td>${mult == null ? '—' : `<b>${mult === 0 ? '免费' : 'x' + mult}</b>`}</td>
+        <td>${fmtK(x.context)}</td><td>${fmtK(x.max_output)}</td>
+        <td class="cap" title="图片输入">${capBadge(x, 'image')}</td>
+        <td class="cap" title="工具调用">${capBadge(x, 'tool')}</td>
+        <td class="cap" title="推理模式">${capBadge(x, 'reason')}</td>
+        <td>${x.pending_login ? '<span class="badge warn">站点未登录</span>' : `<button class="btn mini" data-m="${esc(x.id)}" data-s="${esc(x.site)}">设为默认</button>`}</td>
+      </tr>`;
+    }).join('');
+    el.innerHTML = `
+      <h2>模型清单 <span class="sub">来自上游目录 · 倍率越低越省积分 · 修改默认模型即时生效</span></h2>
+      <div class="card" style="padding:0;overflow:auto">
+      <table><thead><tr><th>模型 ID</th><th>名称</th><th>站点</th><th>积分倍率</th><th>上下文容量</th><th>最大输出</th><th title="支持图片输入">🖼️</th><th title="支持工具调用">🔧</th><th title="支持推理模式">🧠</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">还没有可用模型 —— 先添加账号</td></tr>'}</tbody></table></div>
+      <p class="muted" style="font-size:12px">ZCode 模型供应商里填任意模型 ID；这里的「设为默认」影响走 <code>default</code>/裸名自动路由的客户端。</p>`;
+    for (const b of el.querySelectorAll('[data-m]')) {
+      b.onclick = async () => {
+        try { await api('/default-model', { method: 'POST', body: { model: b.dataset.m, site: b.dataset.s } }); toast('默认模型 → ' + b.dataset.m, 'ok'); loadHeader(); loadModels(); }
+        catch (e) { toast('失败：' + e.message, 'bad'); }
+      };
+    }
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+function capBadge(x, kind) {
+  const v = kind === 'image' ? x.supportsImages : kind === 'tool' ? x.supportsToolCall : x.supportsReasoning;
+  return v ? '<span class="ok">✓</span>' : '<span class="muted">—</span>';
+}
+
+/* ---------- Tab 3：自动任务 ---------- */
+async function loadTasks() {
+  const el = $('#tab-tasks');
+  try {
+    const [t, bridge] = await Promise.all([api('/tasks'), api('/bridge')]);
+    const cfg = bridge.tasks || {};
+    const labelOf = {};
+    for (const s of bridge.sites || []) for (const a of s.accounts || []) labelOf[a.uid || a.id] = a.label || a.id;
+    const one = (label, map) => {
+      const entries = Object.entries(map || {});
+      if (!entries.length) return `<div class="empty" style="padding:14px">${label}：今天还没有记录</div>`;
+      return `<div class="grid" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">${entries.map(([uid, e]) => `
+        <div class="card" style="padding:11px 14px">
+          <div class="row"><span class="badge ${e.ok ? 'ok' : 'bad'}">${e.ok ? '✓' : '✗'} ${esc(e.date || '')}</span><b style="font-size:13px">${esc(labelOf[uid] || uid.slice(0, 10) + '…')}</b></div>
+          <div class="muted" style="font-size:12px;margin-top:4px">${esc(e.msg || (e.claimed != null ? `报名 ${e.accepted} · 领奖 ${e.claimed} · +${e.creditGained} 积分` : ''))}</div>
+        </div>`).join('')}</div>`;
+    };
+    el.innerHTML = `
+      <h2>自动任务 <span class="sub">config.json → tasks 可配置开关与时点</span></h2>
+      <div class="row" style="margin-bottom:14px">
+        <span class="badge ${cfg.enabled === false ? '' : 'ok'}">总开关：${cfg.enabled === false ? '关' : '开'}</span>
+        <span class="badge">签到：${cfg.checkin === false ? '关' : '开'}（${(cfg.checkinHours || []).join(':00, ')}:00）</span>
+        <span class="badge">成长任务：${cfg.growth === false ? '关' : '开'}（${(cfg.growthHours || []).join(':00, ')}:00）</span>
+        <span class="badge">抖动：±${cfg.jitterMinutes ?? 0} 分钟</span>
+        <span class="spacer"></span>
+        <button class="btn" id="tkCheckin">立即签到</button>
+        <button class="btn" id="tkGrowth">扫描成长任务</button>
+      </div>
+      <h2>今日签到 <span class="sub">${esc(t.today)}</span></h2>${one('签到', t.checkin)}
+      <h2>今日成长任务 <span class="sub">自动报名 + 达标领奖</span></h2>${one('成长任务', t.growth)}
+      <h2>最近记录</h2>
+      <div class="card" style="padding:0">${(t.history || []).length ? `<table><tbody>${t.history.slice(0, 15).map((h) => `
+        <tr><td style="width:120px" class="muted">${esc(new Date(h.at).toLocaleString())}</td>
+        <td style="width:70px"><span class="badge ${h.kind === 'checkin' ? 'acc' : 'ok'}">${h.kind === 'checkin' ? '签到' : '成长'}</span></td>
+        <td><span class="${h.ok ? 'ok' : 'bad'}">${h.ok ? '✓' : '✗'}</span> ${esc(h.msg || `报名${h.accepted ?? 0} 领奖${h.claimed ?? 0} +${h.creditGained ?? 0}分`)}</td></tr>`).join('')}</tbody></table>`
+        : '<div class="muted" style="padding:18px;text-align:center">还没有运行记录</div>'}</div>`;
+    $('#tkCheckin').onclick = () => runTask('checkin');
+    $('#tkGrowth').onclick = () => runTask('growth');
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+async function runTask(kind) {
+  toast('正在执行：' + (kind === 'checkin' ? '签到' : '成长任务扫描') + ' …');
+  try {
+    const r = await api('/tasks/run', { method: 'POST', body: { kind } });
+    const parts = [];
+    for (const [k, list] of Object.entries(r.results || {})) parts.push(`${k}: 成功${list.filter((x) => x.ok && !x.skipped).length} 跳过${list.filter((x) => x.skipped).length} 失败${list.filter((x) => x.ok === false).length}`);
+    toast('执行完成 —— ' + parts.join('；'), 'ok');
+    loadTasks();
+  } catch (e) { toast('执行失败：' + e.message, 'bad'); }
+}
+
+/* ---------- Tab 4：用量 ---------- */
+async function loadUsage() {
+  const el = $('#tab-usage');
+  try {
+    const u = await api('/usage?days=7');
+    const today = u.today || {};
+    const max = Math.max(1, ...(u.recent || []).map((d) => d.calls || 0));
+    const bars = (u.recent || []).map((d) => `<div class="col" title="${esc(d.date)}：${d.calls} 次调用，${d.credit} 积分"><span>${d.credit != null ? d.credit + '分' : ''}</span><i style="height:${Math.round((d.calls || 0) / max * 100)}%"></i><span>${esc(d.date.slice(5))}</span></div>`).join('');
+    const byModel = (u.byModel || []).slice(0, 10).map((x) => `
+      <tr><td><b>${esc(x.model)}</b> <span class="badge">${esc(x.site)}</span></td><td>${x.calls}</td><td>${x.promptTokens}</td><td>${x.completionTokens}</td><td><b>${x.credit}</b></td></tr>`).join('');
+    el.innerHTML = `
+      <h2>今日 <span class="sub">自 ${esc(u.since || '')} 起累计统计 · 数据在数据目录 usage.json</span></h2>
+      <div class="grid kpis">
+        <div class="kpi"><b>${today.calls ?? 0}</b><span>调用次数</span></div>
+        <div class="kpi"><b class="${(today.errors || 0) > 0 ? 'bad' : ''}">${today.errors ?? 0}</b><span>错误</span></div>
+        <div class="kpi"><b>${(today.promptTokens ?? 0).toLocaleString()}</b><span>输入 tokens</span></div>
+        <div class="kpi"><b>${(today.completionTokens ?? 0).toLocaleString()}</b><span>输出 tokens</span></div>
+        <div class="kpi"><b class="warn">${today.credit ?? 0}</b><span>消耗积分</span></div>
+      </div>
+      <h2>最近 7 天 <span class="sub">柱高 = 调用次数，标注 = 消耗积分</span></h2>
+      <div class="card"><div class="bars">${bars || '<span class="muted">暂无数据</span>'}</div></div>
+      <h2>按模型排行 <span class="sub">累计 Top 10</span></h2>
+      <div class="card" style="padding:0">${byModel ? `<table><thead><tr><th>模型</th><th>调用</th><th>输入 tok</th><th>输出 tok</th><th>积分</th></tr></thead><tbody>${byModel}</tbody></table>` : '<div class="muted" style="padding:18px;text-align:center">暂无数据</div>'}</div>
+      <div class="row" style="margin-top:14px"><span class="spacer"></span><button class="btn danger" id="uReset">重置统计</button></div>`;
+    $('#uReset').onclick = async () => {
+      if (!confirm('清空全部用量统计？')) return;
+      await api('/usage/reset', { method: 'POST' });
+      toast('已重置', 'ok'); loadUsage();
+    };
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+}
+
+/* ---------- Tab 5：日志 ---------- */
+function startLogs() {
+  const box = $('#logBox');
+  box.textContent = '';
+  logSeq = 0;
+  const tick = async () => {
+    try {
+      const r = await api('/logs?after=' + logSeq);
+      logSeq = r.lastSeq ?? logSeq;
+      if (r.list?.length && !logPaused) {
+        for (const l of r.list) {
+          const div = document.createElement('div');
+          div.className = 'lv-' + (l.level || 'info');
+          div.textContent = `[${l.time}] ${l.text}`;
+          box.appendChild(div);
+        }
+        while (box.childNodes.length > 500) box.removeChild(box.firstChild);
+        box.scrollTop = box.scrollHeight;
+      }
+    } catch { /* 服务重启中 */ }
+  };
+  tick();
+  logTimer = setInterval(tick, 2000);
+}
+
+/* ---------- 启动 ---------- */
+loadHeader().catch(() => {});
+switchTab('accounts');
+</script>
+</body>
+</html>
