@@ -19,7 +19,7 @@ import { getCatalog, mergedModels, parseMultiplier } from './router.mjs';
 import { openChat, queryCredit, classifyFrame, upstreamErrorMessage, supportsCreditQuery } from './upstream.mjs';
 import { startLogin, pollLogin } from './device-login.mjs';
 import { usageSnapshot, resetUsage, flushUsage, recordBalance } from './usage.mjs';
-import { recentLogs, log } from './log.mjs';
+import { recentLogs, recentRequests, log } from './log.mjs';
 import { sendJson } from './util.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
 import { runTasks, taskStatus } from './tasks.mjs';
@@ -345,6 +345,11 @@ export async function handleConsoleApi(ctx) {
     const r = await triggerProviderConfigSyncNow();
     if (r.result === 'busy') return sendJson(res, 409, { ok: false, message: '上一次同步还在进行中，稍后再试' });
     return sendJson(res, 200, { ok: true, result: r.result, models: r.models });
+  }
+
+  // 最近请求的结构化记录（/wbp 面板显示 tok/s 用；agent 带 apiKey 即可调）
+  if (p === '/recent-requests' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, requests: recentRequests(20) });
   }
 
   // ---- 号池：启用/禁用、重置状态、删除、改标签 ----

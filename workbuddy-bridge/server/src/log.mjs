@@ -56,6 +56,8 @@ export function error(...args) {
 }
 
 // 单行请求日志：模型 / 模式 / 状态 / 耗时 / 首字节
+const reqRing = []; // 最近请求的结构化记录（/console/api/recent-requests、/wbp 面板显示 tok/s 用）
+
 export function requestLog(fields) {
   const parts = Object.entries(fields)
     .filter(([, v]) => v !== undefined && v !== null && v !== '')
@@ -63,6 +65,13 @@ export function requestLog(fields) {
   const text = parts.join(' ');
   console.log(`[${ts()}] ${text}`);
   push(fields.status && fields.status >= 400 ? 'warn' : 'req', text);
+  reqRing.push({ at: new Date().toISOString(), ...fields });
+  if (reqRing.length > 50) reqRing.shift();
+}
+
+/** 最近 N 条请求的结构化记录（新→旧）。 */
+export function recentRequests(n = 20) {
+  return reqRing.slice(-n).reverse();
 }
 
 /** 取最近的日志（seq 之后的），供 /console/logs 长轮询。 */
