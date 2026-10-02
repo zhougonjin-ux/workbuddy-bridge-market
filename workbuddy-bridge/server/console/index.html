@@ -644,6 +644,13 @@ async function loadTasks() {
           <label style="display:flex;align-items:center;gap:6px;font-size:13px">成长任务时点
             <input id="tkGrowthTimes" value="${esc((cfg.growthTimes || []).join(', '))}" placeholder="01:00, 13:20" style="width:170px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
           </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="派猫猫旅行巡逻时点：到站自动领奖、空闲自动派出（每日 1 次上限由上游控制）、旅行中跳过；状态机幂等，一天可巡逻多次">
+            旅行巡逻时点
+            <input id="tkTravelTimes" value="${esc((cfg.travelTimes || []).join(', '))}" placeholder="09:00, 15:00, 21:00" style="width:190px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px">旅行地点 ID
+            <input id="tkTravelLoc" type="number" min="1" max="99" value="${cfg.travelLocationId ?? 4}" style="width:64px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
           <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="成长任务里的「体验指定模型 / 聊天N次」类任务，由桥接代打极小请求点亮进度（单任务每次最多代打次数见下方数字）；公众号关注等人工任务无法代打">
             <input type="checkbox" id="tkAuto" ${cfg.autoComplete === false ? '' : 'checked'}> 自动完成对话体验类任务
           </label>
@@ -661,32 +668,37 @@ async function loadTasks() {
         <span class="spacer"></span>
         <button class="btn" id="tkCheckin">立即签到</button>
         <button class="btn" id="tkGrowth">扫描成长任务</button>
+        <button class="btn" id="tkTravel">🐾 猫猫旅行巡逻</button>
       </div>
       <h2>今日签到 <span class="sub">${esc(t.today)}</span></h2>${one('签到', t.checkin)}
-      <h2>今日成长任务 <span class="sub">自动报名 + 达标领奖</span></h2>${one('成长任务', t.growth)}
+      <h2>今日成长任务 <span class="sub">自动报名 + 对话类代打 + 达标领奖</span></h2>${one('成长任务', t.growth)}
+      <h2>今日猫猫旅行 <span class="sub">到站领奖 / 空闲派出 / 旅行中跳过</span></h2>${one('猫猫旅行', t.travel)}
       <h2>最近记录</h2>
       <div class="card" style="padding:0">${(t.history || []).length ? `<table><tbody>${t.history.slice(0, 15).map((h) => `
         <tr><td style="width:120px" class="muted">${esc(new Date(h.at).toLocaleString())}</td>
-        <td style="width:70px"><span class="badge ${h.kind === 'checkin' ? 'acc' : 'ok'}">${h.kind === 'checkin' ? '签到' : '成长'}</span></td>
+        <td style="width:70px"><span class="badge ${h.kind === 'checkin' ? 'acc' : h.kind === 'travel' ? 'warn' : 'ok'}">${{ checkin: '签到', growth: '成长', travel: '旅行' }[h.kind] || h.kind}</span></td>
         <td><span class="${h.ok ? 'ok' : 'bad'}">${h.ok ? '✓' : '✗'}</span> ${esc(h.msg || `报名${h.accepted ?? 0} 代打${h.autoChats ?? 0} 领奖${h.claimed ?? 0} +${h.creditGained ?? 0}分`)}</td></tr>`).join('')}</tbody></table>`
         : '<div class="muted" style="padding:18px;text-align:center">还没有运行记录</div>'}</div>`;
     $('#tkCheckin').onclick = () => runTask('checkin');
     $('#tkGrowth').onclick = () => runTask('growth');
+    $('#tkTravel').onclick = () => runTask('travel');
     $('#tkSaveCfg').onclick = async () => {
       try {
         const r = await api('/tasks/config', { method: 'POST', body: {
           checkinTimes: $('#tkCheckinTimes').value,
           growthTimes: $('#tkGrowthTimes').value,
+          travelTimes: $('#tkTravelTimes').value,
+          travelLocationId: Number($('#tkTravelLoc').value) || 4,
           autoComplete: $('#tkAuto').checked,
           maxChatsPerTask: Number($('#tkMaxChats').value) || 5,
         } });
-        toast('任务设置已保存：签到 ' + (r.saved.checkinTimes.join(', ') || '(整点回退)') + ' · 成长 ' + (r.saved.growthTimes.join(', ') || '(整点回退)'), 'ok');
+        toast('任务设置已保存：签到 ' + (r.saved.checkinTimes.join(', ') || '(整点回退)') + ' · 旅行巡逻 ' + (r.saved.travelTimes.join(', ') || '(关)'), 'ok');
       } catch (e) { toast('保存失败：' + e.message, 'bad'); }
     };
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 async function runTask(kind) {
-  toast('正在执行：' + (kind === 'checkin' ? '签到' : '成长任务扫描') + ' …');
+  toast('正在执行：' + ({ checkin: '签到', growth: '成长任务扫描', travel: '猫猫旅行巡逻' }[kind] || kind) + ' …');
   try {
     const r = await api('/tasks/run', { method: 'POST', body: { kind } });
     const parts = [];

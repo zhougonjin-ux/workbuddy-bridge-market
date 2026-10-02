@@ -221,6 +221,8 @@ export function defaultConfig() {
       growthHours: [1, 13],   // 成长任务扫描时点
       checkinTimes: [],       // 精确时点 ["HH:MM"]；非空时优先于 checkinHours
       growthTimes: [],        // 同上，精确到分钟
+      travelTimes: ['09:00', '15:00', '21:00'], // 猫猫旅行巡逻时点（状态机幂等，一天可多次）
+      travelLocationId: 4,    // 派出地点（参考实现实测 4 个地点收益/时长区间相同）
       jitterMinutes: 30,      // 时点上的随机延迟（分钟），避开整点高峰
       autoComplete: true,     // 成长任务里的「对话体验类」由桥接代打极小请求点亮进度
       maxChatsPerTask: 5,     // 单任务单次扫描最多代打次数（控制成本）
@@ -489,18 +491,21 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
       }
     }
     // 精确时点 ["HH:MM"]：非空时优先于 *Hours
-    for (const k of ['checkinTimes', 'growthTimes']) {
+    for (const k of ['checkinTimes', 'growthTimes', 'travelTimes']) {
       if (cfg.tasks[k] === undefined) { cfg.tasks[k] = defaults.tasks[k]; continue; }
-      if (!Array.isArray(cfg.tasks[k])) cfg.tasks[k] = defaults.tasks[k];
+      if (!Array.isArray(cfg.tasks[k])) cfg.tasks[k] = structuredClone(defaults.tasks[k]);
       else {
         const ok = cfg.tasks[k].every((s) => /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(s).trim()));
         if (!ok) {
-          fix(`tasks.${k} 必须是 "HH:MM" 字符串数组（如 ["09:00","21:30"]），已回退为空`);
-          cfg.tasks[k] = [];
+          fix(`tasks.${k} 必须是 "HH:MM" 字符串数组（如 ["09:00","21:30"]），已回退为默认值`);
+          cfg.tasks[k] = structuredClone(defaults.tasks[k]);
         } else {
           cfg.tasks[k] = cfg.tasks[k].map((s) => String(s).trim().padStart(5, '0'));
         }
       }
+    }
+    if (!Number.isInteger(cfg.tasks.travelLocationId) || cfg.tasks.travelLocationId < 1 || cfg.tasks.travelLocationId > 99) {
+      cfg.tasks.travelLocationId = defaults.tasks.travelLocationId;
     }
     if (typeof cfg.tasks.autoComplete !== 'boolean') cfg.tasks.autoComplete = defaults.tasks.autoComplete;
     if (!Number.isInteger(cfg.tasks.maxChatsPerTask) || cfg.tasks.maxChatsPerTask < 1 || cfg.tasks.maxChatsPerTask > 20) {

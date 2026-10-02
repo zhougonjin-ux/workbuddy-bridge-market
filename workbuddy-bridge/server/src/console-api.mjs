@@ -286,7 +286,7 @@ export async function handleConsoleApi(ctx) {
   }
   if (p === '/tasks/run' && method === 'POST') {
     const body = ctx.body || {};
-    const kind = ['checkin', 'growth', 'all'].includes(body.kind) ? body.kind : 'all';
+    const kind = ['checkin', 'growth', 'travel', 'all'].includes(body.kind) ? body.kind : 'all';
     const site = body.site ? String(body.site) : null;
     const results = await runTasks(cfg, kind, site);
     return sendJson(res, 200, { ok: true, kind, results });
@@ -301,7 +301,7 @@ export async function handleConsoleApi(ctx) {
       .map((s) => s.trim())
       .filter(Boolean)
       .map((s) => s.padStart(5, '0'));
-    const norm = { checkinTimes: parseTimes(body.checkinTimes), growthTimes: parseTimes(body.growthTimes) };
+    const norm = { checkinTimes: parseTimes(body.checkinTimes), growthTimes: parseTimes(body.growthTimes), travelTimes: parseTimes(body.travelTimes) };
     for (const [k, arr] of Object.entries(norm)) {
       if (arr.some((s) => !/^([01]?\d|2[0-3]):[0-5]\d$/.test(s))) {
         return sendJson(res, 400, { ok: false, error: `${k} 里有非法时点（应为 HH:MM，如 09:30）：${arr.join(',')}` });
@@ -309,6 +309,12 @@ export async function handleConsoleApi(ctx) {
     }
     cfg.tasks.checkinTimes = norm.checkinTimes;
     cfg.tasks.growthTimes = norm.growthTimes;
+    if (norm.travelTimes) cfg.tasks.travelTimes = norm.travelTimes;
+    if (body.travelLocationId !== undefined) {
+      const loc = Number(body.travelLocationId);
+      if (!Number.isInteger(loc) || loc < 1 || loc > 99) return sendJson(res, 400, { ok: false, error: 'travelLocationId 须为 1-99 整数' });
+      cfg.tasks.travelLocationId = loc;
+    }
     if (typeof body.autoComplete === 'boolean') cfg.tasks.autoComplete = body.autoComplete;
     if (body.maxChatsPerTask !== undefined) {
       const n = Number(body.maxChatsPerTask);

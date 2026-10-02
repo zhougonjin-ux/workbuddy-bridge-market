@@ -38,6 +38,7 @@ function loadState() {
   }
   if (!state.checkin) state.checkin = {}; // uid → { date, ok, msg }
   if (!state.growth) state.growth = {};   // uid → { date, ok, accepted, claimed, msg }
+  if (!state.travel) state.travel = {};   // uid → { date, ok, action, msg }
   if (!state.history) state.history = []; // 最近 200 条运行记录
   return state;
 }
@@ -316,14 +317,64 @@ async function refreshAfterGain(cfg, site, accountId) {
   }
 }
 
+/* ---------------- 派猫猫旅行 ---------------- */
+//
+// 端点（协议同 workbuddy2api-panel 的 travel.go；chatBase = apiBase，BillingHeaders 鉴权）：
+//   GET  {apiBase}/activity/growth/buddy/info            → data.buddy（null = 还没有猫）
+//   GET  {apiBase}/activity/growth/buddy/travel/status   → data { state: idle|traveling|arrived,
+//          daily_limit_reached, record_id, reward_credit }
+//   POST {apiBase}/activity/growth/buddy/travel/depart   {location_id}   （每日 1 次，自然日重置）
+//   POST {apiBase}/activity/growth/buddy/travel/claim    {record_id}     → data.reward_credit
+//
+// 巡逻状态机幂等：每次巡逻最多一个动作（领奖 / 派出 / 跳过），所以一天可以巡逻多次。
+// 无猫时的领养链路（上报对话 → agreement → buddy/first）依赖客户端行为，这里只提示不代养。
+
+async function growthJSON(cfg, site, auth, siteCfg, method, path, body) {
+  const headers = billingHeaders(siteCfg, auth);
+  const { json } = await callJSON(cfg, siteCfg.apiBase + path, { method, body, headers, what: '猫猫旅行' });
+  return unwrap(json, '猫猫旅行');
+}
+
+export async function travelScanAccount(cfg, site, accountId) {
+  await ensureToken(cfg, site, { accountId });
+  const auth = getAuth(site);
+  const siteCfg = cfg.sites[site];
+
+  const info = await growthJSON(cfg, site, auth, siteCfg, 'GET', '/activity/growth/buddy/info', null);
+  if (!info?.buddy) {
+    return { ok: true, action: 'no_buddy', msg: '还没有猫猫，先在客户端成长中心领养一只' };
+  }
+
+  const st = await growthJSON(cfg, site, auth, siteCfg, 'GET', '/activity/growth/buddy/travel/status', null);
+  const state = String(st?.state || '');
+
+  if (state === 'arrived') {
+    const rid = Number(st?.record_id) || 0;
+    if (!rid) return { ok: true, action: 'arrived_no_record', msg: '猫猫已到站但缺少 record_id，本轮跳过' };
+    const r = await growthJSON(cfg, site, auth, siteCfg, 'POST', '/activity/growth/buddy/travel/claim', { record_id: rid });
+    const credit = Number(r?.reward_credit) || Number(st?.reward_credit) || 0;
+    return { ok: true, action: 'claimed', msg: `旅行归来，领到 ${credit} 积分`, credit };
+  }
+  if (state === 'idle') {
+    if (st?.daily_limit_reached) return { ok: true, action: 'daily_limit', msg: '今天已派出过，明天再来' };
+    const loc = Number(cfg.tasks?.travelLocationId) || 4;
+    await growthJSON(cfg, site, auth, siteCfg, 'POST', '/activity/growth/buddy/travel/depart', { location_id: loc });
+    return { ok: true, action: 'departed', msg: `猫猫已派出旅行（地点 ${loc}）` };
+  }
+  if (state === 'traveling') {
+    return { ok: true, action: 'traveling', msg: '旅行进行中，到站后再巡逻领奖' };
+  }
+  return { ok: true, action: 'unknown', msg: `未知旅行状态：${state || '(空)'}` };
+}
+
 /* ---------------- 批量执行 ---------------- */
 
-/** 对一个站点的所有账号跑一类任务。 */
+/** 对一个站点的所有账号跑一类任务。travel 是巡逻（幂等，一天可多次），其余每天一次。 */
 async function runForSite(cfg, site, kind) {
   const out = [];
   for (const a of listAccounts(site)) {
     if (a.enabled === false || !a.accessToken) continue;
-    if (doneToday(kind, a.uid || a.id)) {
+    if (kind !== 'travel' && doneToday(kind, a.uid || a.id)) {
       out.push({ id: a.id, label: a.label || a.id, skipped: true, ok: true });
       continue;
     }
@@ -333,6 +384,9 @@ async function runForSite(cfg, site, kind) {
       if (kind === 'checkin') {
         result = await checkinAccount(cfg, site, a.id);
         record('checkin', uid, { ok: true, site, msg: result.msg });
+      } else if (kind === 'travel') {
+        result = await travelScanAccount(cfg, site, a.id);
+        record('travel', uid, { ok: true, site, action: result.action, msg: result.msg, credit: result.credit });
       } else {
         result = await growthScanAccount(cfg, site, a.id);
         const { tasks, ...rest } = result;
@@ -349,7 +403,7 @@ async function runForSite(cfg, site, kind) {
   return out;
 }
 
-/** 手动/调度共用的任务入口。kind: 'checkin' | 'growth' | 'all' */
+/** 手动/调度共用的任务入口。kind: 'checkin' | 'growth' | 'travel' | 'all' */
 export async function runTasks(cfg, kind = 'all', site = null) {
   const sites = site ? [site] : siteKeys(cfg);
   const result = {};
@@ -360,6 +414,9 @@ export async function runTasks(cfg, kind = 'all', site = null) {
     }
     if ((kind === 'growth' || kind === 'all') && cfg.tasks?.growth !== false) {
       result[`growth:${s}`] = await runForSite(cfg, s, 'growth');
+    }
+    if ((kind === 'travel' || kind === 'all') && cfg.tasks?.travel !== false) {
+      result[`travel:${s}`] = await runForSite(cfg, s, 'travel');
     }
   }
   return result;
@@ -372,6 +429,7 @@ export function taskStatus() {
     today: todayKey(),
     checkin: s.checkin,
     growth: s.growth,
+    travel: s.travel,
     history: s.history.slice(0, 30),
     stateFile: statePath(),
   };
@@ -412,23 +470,29 @@ function summarize(result) {
   return out;
 }
 
-/** 启动任务调度循环（每分钟检查到点；支持 ["HH:MM"] 精确时点与旧的小时数组；每天每类最多一次）。 */
+/** 启动任务调度循环（每分钟检查到点；支持 ["HH:MM"] 精确时点与旧的小时数组；
+ *  签到/成长每天每类最多一次，猫猫旅行是巡逻状态机（幂等），同一时点只跑一次但一天可多次）。 */
 export function startTaskLoop(cfg) {
   if (timers.tasks) return;
   if (cfg.tasks?.enabled === false) {
     log('自动签到/成长任务已关闭（tasks.enabled=false）');
     return;
   }
+  let lastTravelMs = 0;
   timers.tasks = setInterval(async () => {
     try {
       const today = todayKey();
-      const kind = scheduledNow(cfg, 'checkin') && firedDay.checkin !== today
+      let kind = scheduledNow(cfg, 'checkin') && firedDay.checkin !== today
         ? 'checkin'
         : scheduledNow(cfg, 'growth') && firedDay.growth !== today
           ? 'growth'
           : null;
+      if (!kind && cfg.tasks?.travel !== false && scheduledNow(cfg, 'travel') && Date.now() - lastTravelMs > 10 * 60_000) {
+        kind = 'travel';
+        lastTravelMs = Date.now();
+      }
       if (!kind) return;
-      firedDay[kind] = today;
+      if (kind !== 'travel') firedDay[kind] = today;
       // 首次触发带随机延迟，避开整点高峰；延迟期间再来 tick 也不会重复触发（firedDay 已记）
       const jitterMs = Math.round(Math.random() * Math.max(0, Number(cfg.tasks?.jitterMinutes) || 0) * 60_000);
       if (jitterMs) setTimeout(() => void runAndLog(cfg, kind), jitterMs).unref?.();
@@ -438,13 +502,14 @@ export function startTaskLoop(cfg) {
     }
   }, 60_000);
   timers.tasks.unref?.();
-  log('自动任务调度已启动（签到/成长任务，支持 HH:MM 精确时点）');
+  log('自动任务调度已启动（签到/成长/猫猫旅行巡逻，支持 HH:MM 精确时点）');
 }
 
 async function runAndLog(cfg, kind) {
-  log(`执行${kind === 'checkin' ? '每日签到' : '成长任务扫描'}…`);
+  const label = { checkin: '每日签到', growth: '成长任务扫描', travel: '猫猫旅行巡逻' }[kind] || kind;
+  log(`执行${label}…`);
   const r = await runTasks(cfg, kind);
-  log(`${kind === 'checkin' ? '签到' : '成长任务'}完成：`, JSON.stringify(summarize(r)));
+  log(`${label}完成：`, JSON.stringify(summarize(r)));
 }
 
 export function stopTaskLoop() {
