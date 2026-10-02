@@ -293,6 +293,9 @@ async function loadAccounts() {
       <button class="btn primary" id="btnAdd">＋ 添加账号</button>
       <button class="btn" id="btnImport">⬇ 导入本机账号</button>
       <button class="btn" id="btnRefresh">↻ 刷新全部积分</button>
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer" title="已用完的批次不参与调度，默认隐藏；明细来自上游，刷新后仍会回来，所以只能隐藏不能删除">
+        <input type="checkbox" id="chkShowSpent" ${localStorage.getItem('wbShowSpentBatches') === '1' ? 'checked' : ''}> 显示已耗尽批次
+      </label>
       <span class="spacer"></span>
       <span class="muted" style="font-size:12px">消耗顺序（当前策略）：</span>
     </div>
@@ -325,17 +328,11 @@ async function loadAccounts() {
       };
     }
 
-    // 已耗尽批次的折叠开关（渲染时 hidden，点击展开/收起并翻转箭头）
-    for (const t of el.querySelectorAll('[data-spent-toggle]')) {
-      t.onclick = () => {
-        const box = document.getElementById(t.dataset.spentToggle);
-        if (!box) return;
-        const open = box.hidden;
-        box.hidden = !open;
-        t.textContent = t.textContent.replace(open ? '▸' : '▾', open ? '▾' : '▸')
-          .replace(open ? '点击展开' : '点击收起', open ? '点击收起' : '点击展开');
-      };
-    }
+    // 「显示已耗尽批次」偏好（localStorage 持久化，跨刷新/跨轮询保留）
+    $('#chkShowSpent').onchange = (e) => {
+      localStorage.setItem('wbShowSpentBatches', e.target.checked ? '1' : '0');
+      loadAccounts();
+    };
 
     $('#btnAdd').onclick = () => openLoginModal(sites);
     $('#btnImport').onclick = async () => {
@@ -407,8 +404,10 @@ function acctCard(site, row, raw) {
   const total = (a.creditDetail || []).reduce((s, b) => s + (b.remain || 0), 0);
   const rawBal = a.creditDetail && a.creditDetail.length ? total : (a.remain ?? a.credit ?? a.creditRemain);
   const bal = rawBal === null || rawBal === undefined ? null : fmtCredit(rawBal);
-  // 批次渲染：有余额的批次始终显示；耗尽（余 0 且已用完）的默认折叠，
-  // 折在「N 个已耗尽批次」开关后面——它们不再参与调度，平铺出来只会把有效信息挤下屏。
+  // 批次渲染：有余额的批次始终显示；耗尽（余 0）批次默认完全隐藏——它们不参与调度，
+  // 且明细每次刷新积分都从上游重建，本地删除无法持久，所以只提供显示开关（页头勾选框）。
+  // 注意：耗尽批次的展示区不能放在卡片的可点击空白里触发固定策略，一律加 data-act 排除。
+  const showSpent = localStorage.getItem('wbShowSpentBatches') === '1';
   const live = [], spent = [];
   for (const b of a.creditDetail || []) {
     ((b.remain || 0) > 0 ? live : spent).push(b);
@@ -422,12 +421,10 @@ function acctCard(site, row, raw) {
       <div class="bar"><i style="width:${w}%;background:${expiryColor(b.expireAt)}"></i></div>
     </div>`;
   };
-  const spentId = `spent-${esc(a.id)}`;
-  const spentToggle = spent.length
-    ? `<div class="spent-toggle" data-spent-toggle="${spentId}" title="已用完的批次不参与调度，默认收起">▸ ${spent.length} 个已耗尽批次（点击展开）</div>
-       <div class="batches spent" id="${spentId}" hidden>${spent.map(renderBatch).join('')}</div>`
+  const batches = (showSpent ? [...spent, ...live] : live).map(renderBatch).join('');
+  const spentNote = (!showSpent && spent.length)
+    ? `<div class="spent-toggle" data-act="spent-note" title="已用完的批次不参与调度、不扣积分；明细来自上游，刷新后仍在，故只提供隐藏">已隐藏 ${spent.length} 个已耗尽批次（页头勾选「显示已耗尽批次」可查看）</div>`
     : '';
-  const batches = live.map(renderBatch).join('');
   // 固定使用状态：策略为 pinned 且指向本账号（卡片点击选择的就是这个）
   const isPinned = site.policy === 'pinned' && site.pinned_account_id === a.id;
   const pinnedBadge = isPinned ? '<span class="badge acc" title="已固定使用：点击卡片可取消">📌 已固定</span>' : '';
@@ -435,7 +432,7 @@ function acctCard(site, row, raw) {
     <div class="hd"><b data-act="rename" data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="点击改名">${esc(a.label || a.id)}</b>${pinnedBadge}${inUse}${a.is_default ? '<span class="badge acc">默认</span>' : ''}${status}<span class="spacer"></span><small class="muted">${esc(String(a.uid || '').slice(0, 8))}…</small></div>
     <div class="bal">${bal === null ? '<span class="muted" style="font-size:14px">余额未知</span>' : bal}<small>积分${a.creditCheckedAt ? ' · 刷新于 ' + new Date(a.creditCheckedAt).toLocaleTimeString() : ''}</small></div>
     <div class="batches">${batches || (a.creditDetail && a.creditDetail.length ? '' : '<span class="muted" style="font-size:12px">暂无批次明细 —— 点「刷新全部积分」获取</span>')}</div>
-    ${spentToggle}
+    ${spentNote}
     ${a.manualExpireAt ? `<div style="font-size:12px" class="muted">手动到期兜底：<span class="warn">${esc(a.manualExpireAt)}</span></div>` : ''}
     ${a.last_error ? `<div style="font-size:12px" class="bad">最近错误：${esc(a.last_error)}</div>` : ''}
     <div class="acts">
@@ -588,11 +585,14 @@ async function loadModels() {
     }).join('');
     el.innerHTML = `
       <h2>模型清单 <span class="sub">来自上游目录 · 倍率越低越省积分 · 修改默认模型即时生效</span></h2>
+      <div style="display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap">
+        <button class="btn" id="btnPoolSync">⟳ 手动同步到选择器</button>
+        <span class="muted" style="font-size:12px">自动每 30 分钟同步一次；上游刚加模型/改倍率时点这里立即写入 ZCode 模型选择器</span>
+      </div>
       <div class="card" style="padding:0;overflow:auto">
       <table><thead><tr><th>模型 ID</th><th>名称</th><th>站点</th><th>积分倍率</th><th>上下文容量</th><th>最大输出</th><th title="支持图片输入">🖼️</th><th title="支持工具调用">🔧</th><th title="支持推理模式">🧠</th><th></th></tr></thead>
       <tbody>${rows || '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">还没有可用模型 —— 先添加账号</td></tr>'}</tbody></table></div>
-      <p class="muted" style="font-size:12px">ZCode 模型供应商里填任意模型 ID；这里的「设为默认」影响走 <code>default</code>/裸名自动路由的客户端。
-      自动同步每 30 分钟一次；上游刚加了模型或改了倍率时点 <button class="btn mini" id="btnPoolSync">⟳ 手动同步到选择器</button>。</p>`;
+      <p class="muted" style="font-size:12px">ZCode 模型供应商里填任意模型 ID；这里的「设为默认」影响走 <code>default</code>/裸名自动路由的客户端。</p>`;
     $('#btnPoolSync').onclick = async () => {
       const b = $('#btnPoolSync');
       b.disabled = true; b.textContent = '同步中…';
