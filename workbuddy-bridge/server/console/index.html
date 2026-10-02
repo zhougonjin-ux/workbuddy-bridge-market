@@ -62,6 +62,8 @@ button.btn.mini{padding:3px 9px;font-size:12px;border-radius:6px}
 .acct .bal{font-size:26px;font-weight:700;letter-spacing:.5px}
 .acct .bal small{font-size:12px;color:var(--muted);font-weight:400;margin-left:5px}
 .batches{display:flex;flex-direction:column;gap:6px}
+/* hidden 属性会被上面的 display:flex 覆盖（作者样式 > UA 样式），必须显式压回来 */
+.batches[hidden]{display:none!important}
 .batch{font-size:12px}
 .batch .l{display:flex;justify-content:space-between;gap:8px;margin-bottom:2px}
 .batch .bar{height:5px;border-radius:3px;background:var(--chip);overflow:hidden}
