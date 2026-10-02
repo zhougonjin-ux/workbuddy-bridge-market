@@ -715,7 +715,10 @@ async function loadUsage() {
     const u = await api('/usage?days=7');
     const today = u.today || {};
     const max = Math.max(1, ...(u.recent || []).map((d) => d.calls || 0));
-    const bars = (u.recent || []).map((d) => `<div class="col" title="${esc(d.date)}：${d.calls} 次调用，${fmtCredit(d.credit ?? 0)} 积分"><span>${d.credit != null ? fmtCredit(d.credit) + '分' : ''}</span><i style="height:${Math.round((d.calls || 0) / max * 100)}%"></i><span>${esc(d.date.slice(5))}</span></div>`).join('');
+    const bars = (u.recent || []).map((d) => {
+      const daySpeed = d.ms > 0 ? (d.completionTokens / (d.ms / 1000)).toFixed(1) + ' tok/s' : '';
+      return `<div class="col" title="${esc(d.date)}：${d.calls} 次调用，${fmtCredit(d.credit ?? 0)} 积分${daySpeed ? '，平均 ' + daySpeed : ''}"><span>${d.credit != null ? fmtCredit(d.credit) + '分' : ''}</span><i style="height:${Math.round((d.calls || 0) / max * 100)}%"></i><span>${esc(d.date.slice(5))}</span></div>`;
+    }).join('');
     const byModel = (u.byModel || []).slice(0, 10).map((x) => {
       const speed = x.ms > 0 ? (x.completionTokens / (x.ms / 1000)).toFixed(1) + ' tok/s' : '—';
       return `<tr><td><b>${esc(x.model)}</b> <span class="badge">${esc(x.site)}</span></td><td>${x.calls}</td><td>${x.promptTokens}</td><td>${x.completionTokens}</td><td>${speed}</td><td><b>${fmtCredit(x.credit ?? 0)}</b></td></tr>`;
