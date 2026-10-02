@@ -211,7 +211,7 @@ export function defaultConfig() {
     pickerMultiplierSuffix: true,
     // 模型池自动同步间隔（分钟）：定期把上游模型清单写进 ZCode 的个人供应商配置，
     // 上游加/删模型或倍率变动时，选择器无需重启会话即可跟上。
-    providerSyncMinutes: 5,
+    providerSyncMinutes: 30,
     // 自动签到与成长任务（任务中心自动报名 + 达标领奖）
     tasks: {
       enabled: true,

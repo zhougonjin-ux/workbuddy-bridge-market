@@ -60,7 +60,7 @@ const main = async () => {
       env: { ...process.env, WB_CONFIG_DIR: dataDir, WB_HOOK_SPAWN: '1' },
       windowsHide: true,
     });
-    child.on('error', () => {}); // 拉起失败也不报错——用户可手动 /wb-start
+    child.on('error', () => {}); // 拉起失败也不报错——用户可手动 /wbp-start
     __dbg('spawned pid=',child.pid);child.unref();
   } catch {
     /* 吞掉一切，hook 失败不该影响会话 */

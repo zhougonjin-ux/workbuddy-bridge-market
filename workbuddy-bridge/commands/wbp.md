@@ -1,5 +1,5 @@
 ---
-description: WorkBuddy 面板：在会话里直接渲染总览（策略/账号/积分到期/任务/用量，无需浏览器；不与 /wb-* 命令冲突）
+description: WorkBuddy 面板：在会话里直接渲染总览（策略/账号/积分到期/任务/用量，无需浏览器；统一 wbp- 前缀）
 ---
 
 在当前会话里渲染 WorkBuddy 桥接的完整总览面板（不打开浏览器）。
@@ -13,7 +13,7 @@ description: WorkBuddy 面板：在会话里直接渲染总览（策略/账号/�
 
 **⚠️ 提醒区（放在面板最顶部，仅在有命中项时显示，没有则整段省略）：**
 - 🔴 **7 天内到期的积分批次**还有大量余量 → 建议立刻用 `expiry-first` 策略消耗（列出：账号/批次/余量/到期日）
-- 🟠 账号额度耗尽或登录态失效（exhausted / last_error 含 401）→ 提示重置、重新 /wb-import 或 /wb-login
+- 🟠 账号额度耗尽或登录态失效（exhausted / last_error 含 401）→ 提示重置、重新 /wbp-import 或 /wbp-login
 - 🟡 今日签到还没做的账号 → 提示可 `wb_tasks_run`
 
 **输出格式要求**（用 markdown 表格，不要贴原始 JSON）：
@@ -37,9 +37,9 @@ description: WorkBuddy 面板：在会话里直接渲染总览（策略/账号/�
 **今日任务**：签到 ✓/✗/未执行 × N 个账号 ｜ 成长任务 领奖 N 个 +M 积分
 **今日用量**：调用 N 次 ｜ 输入/输出 tokens ｜ 消耗积分 N
 
-提示：改策略/切账号/加账号直接说，或 /wb-console 打开图形面板。
+提示：改策略/切账号/加账号直接说，或 /wbp-console 打开图形面板。
 ```
 
-若代理未运行：先按 /wb-start 启动再渲染。
+若代理未运行：先按 /wbp-start 启动再渲染。
 
 $ARGUMENTS

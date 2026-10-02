@@ -171,9 +171,34 @@ export async function runProviderConfigSync({ port, apiKey, fallbackModels = [] 
 
 const timers = { sync: null };
 let syncing = false;
+let currentCfg = null;
+
+/**
+ * 立即执行一次模型池同步（控制台「手动同步」按钮用）。
+ * 返回 { result, models? }；正在同步中则跳过（result: 'busy'）。
+ */
+export async function triggerProviderConfigSyncNow() {
+  if (!currentCfg || syncing) return { result: 'busy' };
+  syncing = true;
+  try {
+    const r = await runProviderConfigSync({
+      port: currentCfg.port,
+      apiKey: currentCfg.apiKey,
+      fallbackModels: (currentCfg.models || []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
+    });
+    if (r.result === 'written') {
+      const { log } = await import('./log.mjs');
+      log(`手动同步：模型池已写入 ZCode 选择器（${r.models} 个模型）`);
+    }
+    return r;
+  } finally {
+    syncing = false;
+  }
+}
 
 /** 启动模型池自动同步循环（启动后 20 秒先跑一次，之后按 providerSyncMinutes 间隔）。 */
 export function startProviderConfigSync(cfg, onError) {
+  currentCfg = cfg;
   if (timers.sync) return;
   const tick = async () => {
     if (syncing) return;
@@ -196,7 +221,7 @@ export function startProviderConfigSync(cfg, onError) {
   };
   const boot = setTimeout(tick, 20_000);
   boot.unref?.();
-  const ms = Math.max(2, Number(cfg.providerSyncMinutes) || 5) * 60_000;
+  const ms = Math.max(5, Number(cfg.providerSyncMinutes) || 30) * 60_000;
   timers.sync = setInterval(tick, ms);
   timers.sync.unref?.();
 }
@@ -204,4 +229,5 @@ export function startProviderConfigSync(cfg, onError) {
 export function stopProviderConfigSync() {
   if (timers.sync) clearInterval(timers.sync);
   timers.sync = null;
+  currentCfg = null;
 }

@@ -298,6 +298,14 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, 200, { ok: true, ...result });
   }
 
+  // 手动同步模型池进 ZCode 选择器（模型页「手动同步」按钮；自动循环 30 分钟一次，这里立即触发）
+  if (p === '/pool-sync' && method === 'POST') {
+    const { triggerProviderConfigSyncNow } = await import('./pickersync.mjs');
+    const r = await triggerProviderConfigSyncNow();
+    if (r.result === 'busy') return sendJson(res, 409, { ok: false, message: '上一次同步还在进行中，稍后再试' });
+    return sendJson(res, 200, { ok: true, result: r.result, models: r.models });
+  }
+
   // ---- 号池：启用/禁用、重置状态、删除、改标签 ----
   if (p === '/pool/account' && method === 'POST') {
     const body = ctx.body || {};

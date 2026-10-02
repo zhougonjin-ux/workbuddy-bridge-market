@@ -66,6 +66,8 @@ button.btn.mini{padding:3px 9px;font-size:12px;border-radius:6px}
 .batch .l{display:flex;justify-content:space-between;gap:8px;margin-bottom:2px}
 .batch .bar{height:5px;border-radius:3px;background:var(--chip);overflow:hidden}
 .batch .bar i{display:block;height:100%;border-radius:3px}
+.spent-toggle{font-size:12px;color:var(--muted);cursor:pointer;user-select:none;padding:2px 0}
+.spent-toggle:hover{color:var(--text)}
 .acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:2px}
 .plan{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
 .plan .step{background:var(--panel2);border:1px solid var(--line);border-radius:9px;padding:6px 11px;font-size:12.5px}
@@ -321,6 +323,18 @@ async function loadAccounts() {
       };
     }
 
+    // 已耗尽批次的折叠开关（渲染时 hidden，点击展开/收起并翻转箭头）
+    for (const t of el.querySelectorAll('[data-spent-toggle]')) {
+      t.onclick = () => {
+        const box = document.getElementById(t.dataset.spentToggle);
+        if (!box) return;
+        const open = box.hidden;
+        box.hidden = !open;
+        t.textContent = t.textContent.replace(open ? '▸' : '▾', open ? '▾' : '▸')
+          .replace(open ? '点击展开' : '点击收起', open ? '点击收起' : '点击展开');
+      };
+    }
+
     $('#btnAdd').onclick = () => openLoginModal(sites);
     $('#btnImport').onclick = async () => {
       const b = $('#btnImport');
@@ -391,7 +405,13 @@ function acctCard(site, row, raw) {
   const total = (a.creditDetail || []).reduce((s, b) => s + (b.remain || 0), 0);
   const rawBal = a.creditDetail && a.creditDetail.length ? total : (a.remain ?? a.credit ?? a.creditRemain);
   const bal = rawBal === null || rawBal === undefined ? null : fmtCredit(rawBal);
-  const batches = (a.creditDetail || []).map((b) => {
+  // 批次渲染：有余额的批次始终显示；耗尽（余 0 且已用完）的默认折叠，
+  // 折在「N 个已耗尽批次」开关后面——它们不再参与调度，平铺出来只会把有效信息挤下屏。
+  const live = [], spent = [];
+  for (const b of a.creditDetail || []) {
+    ((b.remain || 0) > 0 ? live : spent).push(b);
+  }
+  const renderBatch = (b) => {
     const full = (b.remain || 0) + (b.used || 0);
     const w = full > 0 ? Math.round((b.remain || 0) / full * 100) : 0;
     return `<div class="batch">
@@ -399,14 +419,21 @@ function acctCard(site, row, raw) {
       <span>余 <b>${fmtCredit(b.remain)}</b> · <span style="color:${expiryColor(b.expireAt)}">${esc(expiryText(b.expireAt))}</span></span></div>
       <div class="bar"><i style="width:${w}%;background:${expiryColor(b.expireAt)}"></i></div>
     </div>`;
-  }).join('');
+  };
+  const spentId = `spent-${esc(a.id)}`;
+  const spentToggle = spent.length
+    ? `<div class="spent-toggle" data-spent-toggle="${spentId}" title="已用完的批次不参与调度，默认收起">▸ ${spent.length} 个已耗尽批次（点击展开）</div>
+       <div class="batches spent" id="${spentId}" hidden>${spent.map(renderBatch).join('')}</div>`
+    : '';
+  const batches = live.map(renderBatch).join('');
   // 固定使用状态：策略为 pinned 且指向本账号（卡片点击选择的就是这个）
   const isPinned = site.policy === 'pinned' && site.pinned_account_id === a.id;
   const pinnedBadge = isPinned ? '<span class="badge acc" title="已固定使用：点击卡片可取消">📌 已固定</span>' : '';
   return `<div class="acct ${a.enabled ? '' : 'off'} ${isPinned ? 'pinned' : ''}" data-acct-card data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="点击固定使用该账号，再点一次恢复自动调度">
     <div class="hd"><b data-act="rename" data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="点击改名">${esc(a.label || a.id)}</b>${pinnedBadge}${inUse}${a.is_default ? '<span class="badge acc">默认</span>' : ''}${status}<span class="spacer"></span><small class="muted">${esc(String(a.uid || '').slice(0, 8))}…</small></div>
     <div class="bal">${bal === null ? '<span class="muted" style="font-size:14px">余额未知</span>' : bal}<small>积分${a.creditCheckedAt ? ' · 刷新于 ' + new Date(a.creditCheckedAt).toLocaleTimeString() : ''}</small></div>
-    <div class="batches">${batches || '<span class="muted" style="font-size:12px">暂无批次明细 —— 点「刷新全部积分」获取</span>'}</div>
+    <div class="batches">${batches || (a.creditDetail && a.creditDetail.length ? '' : '<span class="muted" style="font-size:12px">暂无批次明细 —— 点「刷新全部积分」获取</span>')}</div>
+    ${spentToggle}
     ${a.manualExpireAt ? `<div style="font-size:12px" class="muted">手动到期兜底：<span class="warn">${esc(a.manualExpireAt)}</span></div>` : ''}
     ${a.last_error ? `<div style="font-size:12px" class="bad">最近错误：${esc(a.last_error)}</div>` : ''}
     <div class="acts">
@@ -562,7 +589,19 @@ async function loadModels() {
       <div class="card" style="padding:0;overflow:auto">
       <table><thead><tr><th>模型 ID</th><th>名称</th><th>站点</th><th>积分倍率</th><th>上下文容量</th><th>最大输出</th><th title="支持图片输入">🖼️</th><th title="支持工具调用">🔧</th><th title="支持推理模式">🧠</th><th></th></tr></thead>
       <tbody>${rows || '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">还没有可用模型 —— 先添加账号</td></tr>'}</tbody></table></div>
-      <p class="muted" style="font-size:12px">ZCode 模型供应商里填任意模型 ID；这里的「设为默认」影响走 <code>default</code>/裸名自动路由的客户端。</p>`;
+      <p class="muted" style="font-size:12px">ZCode 模型供应商里填任意模型 ID；这里的「设为默认」影响走 <code>default</code>/裸名自动路由的客户端。
+      自动同步每 30 分钟一次；上游刚加了模型或改了倍率时点 <button class="btn mini" id="btnPoolSync">⟳ 手动同步到选择器</button>。</p>`;
+    $('#btnPoolSync').onclick = async () => {
+      const b = $('#btnPoolSync');
+      b.disabled = true; b.textContent = '同步中…';
+      try {
+        // /admin/* 走 apiKey 鉴权；控制台只有会话 TOKEN，所以借道 console-api 转发
+        const r = await api('/pool-sync', { method: 'POST' });
+        if (r.ok) toast(`已同步（${r.models ?? '?'} 个模型，${r.result === 'written' ? '有更新已写入' : '内容无变化'}）`, 'ok');
+        else toast('同步失败：' + (r.message || r.error || '未知错误'), 'bad');
+      } catch (e) { toast('同步失败：' + e.message, 'bad'); }
+      b.disabled = false; b.textContent = '⟳ 手动同步到选择器';
+    };
     for (const b of el.querySelectorAll('[data-m]')) {
       b.onclick = async () => {
         try { await api('/default-model', { method: 'POST', body: { model: b.dataset.m, site: b.dataset.s } }); toast('默认模型 → ' + b.dataset.m, 'ok'); loadHeader(); loadModels(); }

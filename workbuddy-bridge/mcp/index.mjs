@@ -39,7 +39,7 @@ async function callLocal(cfg, path, { method = 'GET', body = null } = {}) {
   } catch (e) {
     const hint = [
       `本地 WorkBuddy 代理没有响应（${e.cause?.code || e.name || e.message}）。`,
-      `请先启动代理：/wb-start 命令，或运行  node "${process.env.WB_BRIDGE_SERVER_DIR || '<插件目录>'}/server/server.mjs"`,
+      `请先启动代理：/wbp-start 命令，或运行  node "${process.env.WB_BRIDGE_SERVER_DIR || '<插件目录>'}/server/server.mjs"`,
     ].join('\n');
     throw new Error(hint);
   }

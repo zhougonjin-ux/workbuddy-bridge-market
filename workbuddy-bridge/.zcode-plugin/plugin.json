@@ -1,15 +1,19 @@
 {
   "name": "workbuddy-bridge",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Bridge ZCode to Tencent WorkBuddy/CodeBuddy credits and models: local OpenAI/Anthropic-compatible proxy, expiry-first credit scheduling across multiple accounts, local client account auto-import, WeChat QR login, visual management console, daily check-in/task automation, and automatic registration of WorkBuddy models into ZCode's model picker.",
-  "author": { "name": "local" },
+  "author": {
+    "name": "local"
+  },
   "commands": "./commands",
   "skills": "./skills",
   "hooks": "./hooks/hooks.json",
   "mcpServers": {
     "workbuddy-bridge": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp/index.mjs"]
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/mcp/index.mjs"
+      ]
     }
   }
 }

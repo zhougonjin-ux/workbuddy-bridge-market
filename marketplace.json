@@ -4,10 +4,12 @@
     {
       "name": "workbuddy-bridge",
       "source": "./workbuddy-bridge",
-      "version": "0.3.4",
+      "version": "0.3.5",
       "description": "Bridge ZCode to WorkBuddy/CodeBuddy credits and models: local OpenAI/Anthropic-compatible proxy, expiry-first credit scheduling, multi-account switching, local client account auto-import, visual console, daily check-in automation, auto model-provider registration.",
       "displayName": "WorkBuddy Bridge",
-      "displayName_i18n": { "zh-CN": "WorkBuddy 积分桥" },
+      "displayName_i18n": {
+        "zh-CN": "WorkBuddy 积分桥"
+      },
       "description_i18n": {
         "zh-CN": "把腾讯 WorkBuddy/CodeBuddy 的积分与模型接入 ZCode：本地 OpenAI/Anthropic 兼容代理、按积分到期时间的多账号调度、本机客户端账号自动导入、微信扫码登录、可视化管理台、每日自动签到与成长任务，并自动把 WorkBuddy 模型注册进 ZCode 模型选择器。"
       },

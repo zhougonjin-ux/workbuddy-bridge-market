@@ -24,7 +24,7 @@ import { log, warn, error } from './src/log.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll, startCreditLoop, stopCreditLoop, scheduleCreditRefreshSoon } from './src/scheduler.mjs';
 import { runTasks, taskStatus, startTaskLoop, stopTaskLoop } from './src/tasks.mjs';
 import { importLocalAccounts } from './src/localimport.mjs';
-import { startProviderConfigSync, stopProviderConfigSync } from './src/pickersync.mjs';
+import { startProviderConfigSync, stopProviderConfigSync, triggerProviderConfigSyncNow } from './src/pickersync.mjs';
 import { spawn } from 'node:child_process';
 
 // 配置读不出来时要给出可读提示，而不是抛一串裸栈。
@@ -435,6 +435,14 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/admin/local/import' && req.method === 'POST') {
       const result = await importLocalAccounts(cfg);
       return sendJson(res, 200, { ok: true, ...result });
+    }
+
+    // 手动同步模型池进 ZCode 选择器（控制台「手动同步」按钮用）。
+    // 自动循环已降到 30 分钟一次，上游加了模型/改了倍率时点这里立即生效。
+    if (pathname === '/admin/pool/sync' && req.method === 'POST') {
+      const r = await triggerProviderConfigSyncNow();
+      const ok = r.result === 'written' || r.result === 'unchanged';
+      return sendJson(res, ok ? 200 : 409, { ok, ...r });
     }
 
     // 优雅停止（供 stop.cmd / stop.mjs 调用；需要本地 API Key，避免被误触）。
