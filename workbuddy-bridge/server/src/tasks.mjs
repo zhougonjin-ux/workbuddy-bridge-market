@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { siteKeys, getConfigDir } from './config.mjs';
 import { listAccounts, updateCreditDetail, markExhausted } from './pool.mjs';
-import { queryCredit, openChat, aggregateFrames } from './upstream.mjs';
+import { queryCredit, openChat, aggregateFrames, upstreamErrorMessage } from './upstream.mjs';
 import { billingHeaders } from './headers.mjs';
 import { getAuth, ensureToken } from './auth.mjs';
 import { log, warn } from './log.mjs';
@@ -350,15 +350,26 @@ async function autoplayChats(cfg, site, accountId, task, attempts, model) {
   let error = null;
   for (let i = 0; i < attempts; i++) {
     try {
+      // openChat 返回的是**扁平**结构 { ok, status, frames, close }，没有 up 这层包装。
+      // 原代码写成 r.up.frames，r.up 恒为 undefined —— 于是「消费帧」这行必抛 TypeError，
+      // 也就是说 T5/T14 的对话代打**从来没有真正成功过一次**，只要执行就炸，
+      // 而且错误信息是「Cannot read properties of undefined (reading 'frames')」，
+      // 把上游真正拒绝的原因（额度不足/401/502）整个盖掉。
+      // 2026-10-03 23:35 夜猫子窗口内首次暴露：控制台两条 growth-manual 记录都是它。
       const r = await openChat(cfg, site, {
         model,
         messages: [{ role: 'user', content: '回复"ok"两个字母即可' }],
         max_tokens: 64,
         stream: false,
       }, { accountId });
-      // 消费完帧再关，保证上游把这次对话计数
-      for await (const _f of r.up.frames) { void _f; }
-      r.up.close();
+      if (!r?.ok) {
+        error = upstreamErrorMessage(r?.status || 502, r?.text || '', site);
+        warn(`[${site}] 任务代打被上游拒绝（${task.title} 第 ${i + 1} 次，HTTP ${r?.status ?? '-'}）：`, error);
+        break;
+      }
+      // 消费完帧再关，保证上游把这次对话计数（这行以前从没真正执行过）
+      for await (const _f of r.frames) { void _f; }
+      r.close();
       chats++;
     } catch (e) {
       error = String(e.message || e).slice(0, 120);
