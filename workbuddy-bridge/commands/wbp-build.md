@@ -1,8 +1,15 @@
 ---
-description: 按 Roadmap 批量实现 workbuddy-bridge 插件功能（参数=功能编号，支持 all/继续；含完整技术约束与发布流程）
+description: 按 Roadmap 批量实现 workbuddy-bridge 插件功能与 bug 修复（参数=编号/批次代号，支持 all/继续；含完整技术约束与发布流程）
 ---
 
-实现 workbuddy-bridge 插件的待办功能。参数 `$ARGUMENTS` 是要做的功能编号（如 `T2 T14`，逗号或空格分隔）；`all` = 从 T1 到 T31 顺序全部做；**为空时默认做 T1 T2 T3 T4 T5（推荐包）**。
+实现 workbuddy-bridge 插件的待办功能。参数 `$ARGUMENTS` 支持三种写法：
+
+- **功能编号**：`T32 T35`，逗号或空格分隔。
+- **批次代号**：`bug1` = 修三个已确诊 bug（优先做）；`feat` = 做 T32–T39 全部新功能。
+- **`all`** = 从 T32 到 T39 顺序全做（**不含** bug 修复，bug 要用 `bug1` 单独触发）。
+- **为空时** = 默认 `bug1`（三个 bug 风险最高、修完 T29 才算真正交付）。
+
+⚠️ **T1–T31 已于 2026-10-03 全部完成并发布 v0.3.14（commit `0cf4a19`），不要再做。** 详见下方「第二批」与项目记忆。
 
 ## 检查点纪律（all/批量模式必读）
 
@@ -19,7 +26,9 @@ description: 按 Roadmap 批量实现 workbuddy-bridge 插件功能（参数=功
 - ⚠️ **交棒重启（含 /admin/restart 与改完 server.mjs 后的任何重启）之前，必须先在临时目录试启**：`WB_CONFIG_DIR=$(mktemp -d) node server/server.mjs` 起一个隔离实例，`curl /health` 返回 200 且日志无异常堆栈后再动生产——单测不覆盖 server.mjs 监听路径，未声明变量这类「启动即崩」只有真启动才暴露（2026-10-03 20:24 T31 批次就是这么把 8788 打挂、全会话断线的；另有 Windows 看门狗计划任务 wb-bridge-watchdog 每分钟兜底拉起，别依赖它替代试启）。
 - 发布：`node C:\Users\87352\.zcode\cli\exec\wb-publish.cjs`（读 `E:/Temp/.wb-pat` 的 PAT；**若文件不存在，停止发布并告知用户**——重建令牌需要 sudo 邮箱验证码，见记忆 github-publishing-workbuddy 的自助流程）。发布后用 `curl -L https://codeload.github.com/zhougonjin-ux/workbuddy-bridge-market/tar.gz/refs/heads/main` 解包覆盖 `~/.zcode/cli/plugins/marketplaces/dev-workbuddy-bridge-local/` 刷新市场快照。
 - 控制台 HTML 是 no-store 头，改完让用户刷新页面即可生效；`/console/api/*` 接受 `X-Console-Token`（页面内 `__WB_TOKEN__="..."`）**或** `Authorization: Bearer <apiKey>` 两套鉴权；`/admin/*` 只认 apiKey。
-- 每完成一个功能：`node --check` 全部改动文件 + `npm test`（在 server/ 下跑，当前 47 条必须全过，纯函数新增要补测试）。
+- ⚠️ **「改源码」与「cp 进缓存」必须成对完成再重启**：交棒重启拉起的是**缓存目录**的 `server.mjs`，不是源码目录。2026-10-03 21:1x 因为只改源码就重启，SSE 修复没生效、白白重启一次才发现（token 计数仍是 1）。正确顺序：改源码 → `npm test` → cp 进缓存 → diff 校验一致 → 试启 → 交棒重启。
+- ⚠️ **别删已安装缓存的旧版本目录**（`cache/dev-workbuddy-bridge-local/workbuddy-bridge/0.3.3/` 等）：运行中的服务仍从那里启动，`rm -rf` 在 Windows 上不是全有全无（会删到一半报 Device busy，留下半个目录 → 控制台 500）。要清理先确认没有进程从该目录运行。
+- 每完成一个功能：`node --check` 全部改动文件 + `npm test`（在 server/ 下跑，当前 47 条必须全过，纯函数新增要补测试）。**只跑 `npm test`，不要裸跑 `node --test`**（后者会把 smoke 测试也执行，2026-10-03 曾污染生产账号池）。
 
 ## 每个功能做完后的统一收尾流程
 
@@ -32,6 +41,15 @@ description: 按 Roadmap 批量实现 workbuddy-bridge 插件功能（参数=功
 7. 全部做完后更新项目记忆（workbuddy-bridge-plugin.md 追加一段）。
 
 ## 功能清单（编号即参数）
+
+### ✅ 第一批 T1–T31 已完成（v0.3.10–v0.3.14，commit `0cf4a19`）
+
+T1 接入页 / T2 free-first 路由 / T3 最近请求表 / T4 积分预警条 / T5 夜猫子代打 / T6 事件时间线 / T7 小时分布图 / T8 模型健康巡检 / T9 credit 异常检测 / T10 压缩统计 / T11 Windows toast / T12 失败重试 / T13 每日预算 / T14 任务中心 / T15 签到日历 / T16 活动扩展框架 / T17 账号健康面板 / T18 多 apiKey / T19 路由规则 UI / T20 按时段路由 / T21 配置导出导入 / T22 自更新检查 / T23 控制台 PIN / T24 /wbp-doctor / T25 /wbp 交互面板 / T26 MCP 工具补齐 / T27 流式心跳 / T28 会话压缩记忆 / T29 SSE 推送 / T30 上游 429 协调 / T31 积分缓存 TTL 自适应。
+
+**下面保留原始描述仅作历史参考，不要重做。**
+
+<details>
+<summary>T1–T31 原始描述（点击展开，已完成）</summary>
 
 ### T1 ⚡ 多客户端接入指南页
 控制台新增「接入」标签页：本代理是 OpenAI(=/v1) 与 Anthropic(=/) 兼容端点，给每个常见客户端一段**现成可复制**的配置（Claude Code env、Cline、Cherry Studio、Dify、openai SDK python/js），Base URL + apiKey（从 config.json 读，按钮一键复制，复用页面已有的 copy() 函数）。验证：切到该页能看到配置且复制可用。
@@ -75,7 +93,68 @@ tasks.mjs 的 autoCompleteChatTasks 扩展：任务 code === 'black_cat'（参�
 ### T30 🔧 上游 429 全局限流协调
 ### T31 🔧 积分明细缓存 TTL 自适应
 
-（T6+ 目前只有一句话描述：实现时先读源码相关区域，按项目现有代码风格设计，拿不准的设计先问用户。）
+</details>
+
+---
+
+## 🐛 第二批 BUG 修复（`/wbp-build bug1`，2026-10-03 21:4x 代码审查确诊）
+
+三个 bug 均已在代码里核实到根因，**不用重新调查**。B1 最优先——它让 T29 整个功能从未真正生效。
+
+### B1 🔴 SSE 推送在浏览器里从未生效（EventSource 鉴权死锁）
+
+**根因（三方核实）**：
+1. 前端 `new EventSource('/console/api/stream')` 是**裸连**（`server/console/index.html:1589`），而 EventSource 这类 API **不支持自定义请求头**。
+2. 服务端 `consoleAuthorized`（`server/server.mjs:134-142`）只认三条路：X-Console-Token 头、wbConsoleToken cookie、`Authorization: Bearer <apiKey>` 头。**EventSource 后两条都做不到**（cookie 那条见下）。
+3. cookie `wbConsoleToken` **只在 PIN 解锁成功时才种**（`server/server.mjs:373-375` 的 `/console/api/unlock`），而 PIN 功能默认关闭（config 无 `consolePin` 时锁屏页压根不出现）→ **浏览器永远拿不到 cookie** → SSE 永远 401。
+   证据：`server.log` 里有 8 条 `WARN 控制台接口鉴权失败：GET /console/api/stream`；curl 带 apiKey 能通是因为走了第三条路，浏览器走不了。
+
+**连带症状**：`CONSOLE_TOKEN = crypto.randomBytes(16)`（server.mjs:52）**每次启动都变** → 每次交棒重启后，所有开着的控制台旧页签以约 30 秒一次频率刷 401 WARN，直到用户手动刷新页面。
+
+**修法（一套治三个症状）**：
+- 服务 `GET /console`（真页面，非锁屏页）时顺带下发 `Set-Cookie: wbConsoleToken=<CONSOLE_TOKEN>; Path=/; SameSite=Strict; HttpOnly`。安全前提已成立：页面是 no-store、token 本来就内联在 HTML 里给前端用，cookie 只是让浏览器**自动携带**同一个值，不新增暴露面。
+- 前端 `startConsoleStream` 的 `es.onerror` 里，若 `es.readyState === EventSource.CLOSED`（即鉴权 401 导致连接被服务端关闭，不是网络抖动）→ 带一个 `/health` 探测守卫（确认服务活着才 reload，防服务真挂时无限刷新）地 `location.reload()`。
+- 验证：`curl -c` 模拟带 cookie 请求 `/console/api/stream` 应能持续收到 `event: bridge` 帧；重启服务后不手动刷新页面，观察 WARN 是否归零、页面数据是否自动继续更新。
+
+### B2 🔴 控制台「停止服务」会掐断在途请求 + 跳过落盘
+
+`/console/api/service/stop`（`server/src/console-api.mjs:762-767`）直接 `process.exit(0)`，而 `/admin/shutdown`（server.mjs:492+）有「活跃请求 >0 时拒绝（除非 force=1）」的保护。后果：① 杀掉正在跑的模型请求（**可能包含用户当前会话自己的流量** → 断线）；② 跳过 `flushUsage()` 之外的 gracefulExit 流程，events.json / learned.json 可能丢最后一次落盘。
+**修法**：改为调用 `lifecycle-impl.mjs` 的 `gracefulExit({ waitIdle: true, reason: '控制台停止' })`（与 `/admin/restart` 同源），并在有活跃请求时返回 409 + 明确提示（让用户看到「有 N 个请求在进行中，完成后再停，或用强制停止」）。前端按钮二次确认文案同步改。
+**验证**：发起一个长请求 → 点停止 → 断言返回 409；无活跃请求时点停止 → 服务在最后请求完成后退出且 usage/events 落盘完整。
+
+### B3 🟡 `/bridge` 接口仍在返回 accessToken/refreshToken 明文
+
+SSE 通道已在 0.3.14 脱敏（`bridgeStatus(cfg, {redact:true})`），但**轮询用的 `/console/api/bridge`（console-api.mjs:259）仍走默认不脱敏**，每 20 秒把两个账号的凭据发给浏览器。
+**核查结论**：前端**没有任何地方**读 `accessToken` 字段（接入页用的是 `apiKey`，不是账号 token）——所以 B3 可以直接脱敏，不影响任何功能。
+**修法**：`/console/api/bridge` 改传 `bridgeStatus(cfg, { redact: true })`；确认 `/console/api/*` 其余返回账号对象的地方（`/pool`、`/task-center` 等）是否也需要同样处理——**逐一 grep 确认前端是否消费 token 字段后再脱敏**。`/backup` 导出含 token 是功能本意，**保留不脱敏**。
+
+## 🚀 第二批新功能（`/wbp-build feat`，T32 起）
+
+按价值排序，建议顺序实现。数据源尽量复用已有接口，别新造轮子。
+
+### T32 ⚡ 积分耗尽预测（最贴合本插件核心使命）
+`expiry-first` 只解决「先烧哪批」，没解决「哪批烧不完」。取近 7 日日均消耗（`usage.json` 的 day.credit）对比各 creditDetail 批次的到期日与余量，算出：「X 批次还剩 N 分、M 天后过期、按当前速率只会用掉 K 分」→ 预警条 + 账号卡上的批次行加「预计用不完」标记与建议（「建议 3 天内集中跑长任务」）。纯计算，零风险。验证：构造 creditDetail 数据调 `predictBurnout()` 纯函数（补单测），真实账号上出一次报告。
+
+### T33 ⚡ 通知通道扩展（Webhook / Bark / Server酱）
+`notify.mjs` 已有事件抽象 + 5 分钟节流，现在只有 Windows toast。config `notify.channels: [{type:'webhook'|'bark'|'serverchan', url, enabled}]`，用 `notifyTask` 的同一批事件分发。用途：人不在电脑前也能收「猫猫归来 / 余额不足 / 登录态失效」。验证：`notify.shouldNotify` 节流纯函数补单测 + 真发一个测试 webhook 看返回 200。
+
+### T34 🔧 T4 预警阈值可配置
+把 200 分 / 7 天 / 500 分三个写死值挪进 `config.alerts { lowBalance:200, expiryDays:7, expiryMinAmount:500 }`，validateConfig 校验，控制台预警条旁加个设置入口。
+
+### T35 🔧 巡检省钱模式
+T8 每轮全量巡检 17 个模型是真实消耗（约 0.1~0.5 积分/天）。config `healthCheck.only: [modelId...]` 白名单（或 `onlyFree: true` 只巡 x0 免费模型），控制台巡检卡加勾选。
+
+### T36 ⚡ 用量报表导出 CSV
+近 7/30 天按 模型/账号/日期 三个维度导出。`/console/api/usage?days=30` 数据已全，控制台加个下载按钮 + 前端 CSV 拼装（或后端返回 text/csv）。
+
+### T37 🔧 预算 pause 模式
+`budget.mode` 现在只有 `warn`（提醒）和 `free`（改道免费）。加 `pause`：超限时直接拒绝新请求（429 + 明确 JSON 错误），防失控烧积分。config 校验枚举 + console-api /budget 支持该值。
+
+### T38 🔧 控制台移动端适配
+配合 T33 的手机推送，用媒体查询让控制台在窄屏可读（卡片单列、表格横向滚动、导航折叠）。
+
+### T39 🔧 协议漂移自检
+长期风险：上游 WorkBuddy 改版。`doctor.mjs` 加一项：比对 `.ref/` 参考仓库的关键端点签名与当前实际响应结构（如 `/v2/chat/completions` 是否仍返回预期字段），改版时提前告警。
 
 ## 成本纪律
 
