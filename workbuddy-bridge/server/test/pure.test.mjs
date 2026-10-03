@@ -118,13 +118,17 @@ test('parseMultiplier：x0.00 解析为 0（free-first 的判定基础）', () =
 
 const { inNightWindow } = await import('../src/tasks.mjs');
 
-test('inNightWindow：22:00–02:00 之内（含跨零点），之外不含边界外分钟', () => {
+test('inNightWindow：23:00–08:00 之内（含跨零点），之外不含边界外分钟', () => {
+  // 口径来自 .ref 参考实现（WorkBuddy-Daily 实测 + 网关验证）：black_cat 的进度
+  // 只在 23:00–08:00 累计。早先实现成 22:00–02:00 是错的 —— 那样 02:00–08:00 白打，
+  // 而 22:00–23:00 会在非计数时段空跑。
   const d = (h, m) => new Date(2026, 9, 3, h, m);
-  assert.equal(inNightWindow(d(22, 0)), true, '22:00 应在窗口内');
+  assert.equal(inNightWindow(d(22, 59)), false, '22:59 还没进窗口（上游 23 点才开始计数）');
+  assert.equal(inNightWindow(d(23, 0)), true, '23:00 应在窗口内');
   assert.equal(inNightWindow(d(23, 59)), true);
   assert.equal(inNightWindow(d(0, 0)), true, '零点应跨进窗口');
-  assert.equal(inNightWindow(d(1, 59)), true);
-  assert.equal(inNightWindow(d(2, 0)), false, '02:00 整点出窗口');
+  assert.equal(inNightWindow(d(7, 59)), true, '07:59 仍在窗口内');
+  assert.equal(inNightWindow(d(8, 0)), false, '08:00 整点出窗口');
   assert.equal(inNightWindow(d(12, 0)), false);
   assert.equal(inNightWindow(d(21, 59)), false);
 });

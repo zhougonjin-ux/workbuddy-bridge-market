@@ -68,3 +68,28 @@ test('openChat 返回的是扁平结构，没有 up 包装层', async () => {
     'openChat 的文档注释必须写明是扁平结构（无 up 包装），这是防止再次误用的契约');
   assert.ok(mod, 'tasks.mjs 可正常导入（upstreamErrorMessage 已正确引入）');
 });
+
+test('black_cat 必须钉死 glm-5.2，不能被 defaultModel 或白名单回落', async () => {
+  // 「代打 chats:3 成功但进度 0/3」的第二个根因：guessChatModel 只在 cfg.models
+  // （用户白名单）里找，找不到就静默回落到 defaultModel。用户的白名单通常不含
+  // glm-5.2，于是实际发出去的是 glm-5.3-flash —— 上游按模型判定，不计数。
+  // 因此规则改用 fixedModel 走字面名，绕开白名单查找。
+  const { growthTasksView } = await import('../src/tasks.mjs');
+  assert.equal(typeof growthTasksView, 'function');
+  // 规则表本身：black_cat 必须有 fixedModel 且不含 suffix（suffix 会走白名单）
+  const src = await import('node:fs').then((fs) =>
+    fs.readFileSync(new URL('../src/tasks.mjs', import.meta.url), 'utf8'));
+  const seg = src.slice(src.indexOf("name: 'black_cat'"), src.indexOf("name: 'black_cat'") + 500);
+  assert.match(seg, /fixedModel:\s*'glm-5\.2'/, 'black_cat 规则必须钉死 glm-5.2');
+  assert.doesNotMatch(seg, /suffix:\s*\(\)\s*=>\s*'glm-5\.2'/, '不应再用 suffix（会走白名单回落）');
+});
+
+test('judgeTask 对 black_cat 返回 glm-5.2，即使白名单里没有它', async () => {
+  // 端到端一点的行为验证：白名单只有 glm-5.3-flash，窗口内（23:30）判定的模型
+  // 仍必须是 glm-5.2。judgeTask 未导出，这里通过 growthTasksView 无法直接测，
+  // 改为断言源码里 fixedModel 优先于 suffix 的分支存在。
+  const src = await import('node:fs').then((fs) =>
+    fs.readFileSync(new URL('../src/tasks.mjs', import.meta.url), 'utf8'));
+  assert.match(src, /rule\.fixedModel\s*\|\|\s*\(suffix\s*\?\s*guessChatModel/,
+    'judgeTask 必须优先用 fixedModel，再退回 suffix 猜模型');
+});

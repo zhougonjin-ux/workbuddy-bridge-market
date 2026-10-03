@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { siteKeys, getConfigDir } from './config.mjs';
 import { listAccounts, updateCreditDetail, markExhausted } from './pool.mjs';
-import { queryCredit, openChat, aggregateFrames, upstreamErrorMessage } from './upstream.mjs';
+import { queryCredit, openChat, aggregateFrames, upstreamErrorMessage, reportChatActivity } from './upstream.mjs';
 import { billingHeaders } from './headers.mjs';
 import { getAuth, ensureToken } from './auth.mjs';
 import { log, warn } from './log.mjs';
@@ -266,9 +266,13 @@ const AUTOPLAY_RULES = [
   {
     name: 'black_cat',
     test: (code) => code === 'black_cat',
-    suffix: () => null,
+    // black_cat 只认 glm-5.2 的对话（上游按模型判定），不能用 defaultModel ——
+    // 2026-10-03 实测：用 glm-5.3-flash 代打 3 次，进度恒为 0/3。
+    // 用 fixedModel 而非 suffix：glm-5.2 一般不在用户的 cfg.models 白名单里，
+    // 走 guessChatModel 会静默回落到 defaultModel。
+    fixedModel: 'glm-5.2',
     window: (d) => inNightWindow(d),
-    note: '夜猫子任务只在 22:00–02:00 窗口内代打',
+    note: '夜猫子任务只在 23:00–08:00 窗口内代打（且必须用 glm-5.2 + 上报对话事件）',
   },
 ];
 
@@ -296,17 +300,25 @@ function judgeTask(t, cfg, site, now = new Date()) {
   const { rule, match } = hit;
   if (rule.window && !rule.window(now)) return { autoplayable: false, why: rule.note || '不在代打时段窗口内' };
   const suffix = rule.suffix ? rule.suffix(match) : null;
-  const model = suffix ? guessChatModel(suffix, cfg, site) : cfg.defaultModel;
+  // fixedModel 供「上游只认特定模型」的任务用：直接用字面名，不走 guessChatModel ——
+  // 后者只在 cfg.models（用户白名单）里找，night-cat 用的 glm-5.2 通常不在白名单里，
+  // 会静默回落到 defaultModel，那正是「代打成功但进度不涨」的第二个原因。
+  const model = rule.fixedModel || (suffix ? guessChatModel(suffix, cfg, site) : cfg.defaultModel);
   return { autoplayable: true, model, why: null };
 }
 
 /**
- * 夜猫子任务（black_cat，夜间折扣活动）的代打窗口：本地时间 22:00–02:00。
- * 窗口跨零点，所以用「小时 ≥22 或 <2」而不是区间比较；抽成纯函数便于单测。
+ * 夜猫子任务（black_cat，夜间折扣活动）的代打窗口：本地时间 23:00–08:00。
+ * 窗口跨零点，所以用「小时 ≥23 或 <8」而不是区间比较；抽成纯函数便于单测。
+ *
+ * 口径来自 .ref 参考实现（WorkBuddy-Daily 实测 + 该网关验证）：black_cat 的进度
+ * **只在 23:00–08:00 窗口内累计**，窗口外的对话不计分。
+ * 早先实现成 22:00–02:00 是错的 —— 那样 02:00–08:00 段的对话白打，
+ * 而 22:00–23:00 反而会在非计数时段里空跑。
  */
 export function inNightWindow(d = new Date()) {
   const h = d.getHours();
-  return h >= 22 || h < 2;
+  return h >= 23 || h < 8;
 }
 
 /**
@@ -333,7 +345,7 @@ async function autoCompleteChatTasks(cfg, site, accountId, tasks, now = new Date
   let chats = 0;
   const touched = [];
   for (const { task: t, attempts, model } of todo) {
-    const r = await autoplayChats(cfg, site, accountId, t, attempts, model);
+    const r = await autoplayChats(cfg, site, accountId, t, attempts, model, notes);
     chats += r.chats;
     if (r.chats) touched.push(`${t.title}×${r.chats}`);
     if (r.error && !touched.includes(t.title)) notes.push(`${t.title} 代打失败：${r.error}`);
@@ -344,8 +356,9 @@ async function autoCompleteChatTasks(cfg, site, accountId, tasks, now = new Date
 /**
  * 给单个任务代打 N 次极小对话（T14 单任务代打与扫描共用）。
  * 返回 { chats, error }——chats 是成功次数，error 是第一次失败的摘要。
+ * notes 传入时会把「事件上报失败」这类非致命问题也记给人看。
  */
-async function autoplayChats(cfg, site, accountId, task, attempts, model) {
+async function autoplayChats(cfg, site, accountId, task, attempts, model, notes = null) {
   let chats = 0;
   let error = null;
   for (let i = 0; i < attempts; i++) {
@@ -371,6 +384,22 @@ async function autoplayChats(cfg, site, accountId, task, attempts, model) {
       for await (const _f of r.frames) { void _f; }
       r.close();
       chats++;
+      // 对话事件上报：black_cat 这类任务**不看你真发了对话，只看事件链**。
+      // 缺这一步，对话返回 200、chats 计数 +1，但任务进度恒为 0
+      // （2026-10-03 实测：代打「成功」3 次，进度仍是 0/3）。
+      // chat_5 等其它对话类任务由上游自行记录，只有 black_cat 需要我们补报。
+      //
+      // 上报包在独立 try 里：它是「计数」这一步而非「对话」本身，失败不该让
+      // 剩下的几次代打一起中止（第一版就因为上报抛错把 3 次打成 1 次）。
+      if (task.code === 'black_cat') {
+        try {
+          const ok = await reportChatActivity(cfg, site, { accountId, modelId: model, modelName: model });
+          if (!ok && notes) notes.push(`${task.title}：对话已发出但事件上报失败，上游可能不计入进度`);
+        } catch (e) {
+          warn(`[${site}] 对话事件上报异常（不影响已完成的对话）：`, e.message || String(e));
+          if (notes) notes.push(`${task.title}：事件上报异常 ${String(e.message || e).slice(0, 60)}`);
+        }
+      }
     } catch (e) {
       error = String(e.message || e).slice(0, 120);
       warn(`[${site}] 任务代打失败（${task.title} 第 ${i + 1} 次）：`, error);

@@ -226,6 +226,101 @@ export class UpstreamError extends Error {
 }
 
 /**
+ * 上报一条「对话活跃」事件（POST {billingBase}/v2/report）。
+ *
+ * 为什么需要它：black_cat（夜猫子夜间折扣）等任务**不看你真发了对话，只看事件链**。
+ * 光调 /v2/chat/completions 拿到的 200 与任务进度无关 —— 必须额外补一条
+ * `chat_request_send` 上报，上游才把这次对话计入任务进度。
+ * 2026-10-03 实测：只发对话不上报，black_cat 进度恒为 0/3（代打「成功」3 次但进度不动）。
+ *
+ * 事件字段与 CodeBuddy 官方 CLI 的上报同构（见 .ref 参考实现 report.go 的 chatRequestEvent）。
+ * conversationId 本地生成即可 —— 服务端不校验它与真实会话的一致性。
+ *
+ * 返回 true = 上游收下了。失败只 warn 不抛：上报失败不该让已经成功的对话变成失败。
+ */
+export async function reportChatActivity(cfg, site, {
+  accountId = null, modelId = 'glm-5.2', modelName = 'GLM-5.2', inputLength = 12,
+} = {}) {
+  const siteCfg = cfg.sites[site];
+  const base = siteCfg.billingBase || siteCfg.apiBase; // 上报走 billingBase，未配则退回 apiBase
+  if (!base) {
+    warn(`[${site}] 缺少 billingBase/apiBase，跳过对话事件上报`);
+    return false;
+  }
+  try {
+    await ensureToken(cfg, site, { accountId });
+    const auth = getAuth(site);
+    const now = Date.now();
+    const stamp = `wb-night-${now}`;
+    const event = {
+      eventCode: 'chat_request_send',
+      timestamp: now,
+      reportDelay: 0,
+      mode: 'craft',
+      conversationId: stamp,
+      requestId: stamp,
+      inputLength,
+      requestModelId: modelId,
+      requestModelName: modelName,
+      isPlan: false,
+      isAutoExecuteTerminal: false,
+      isAutoModify: false,
+      codebaseEnable: false,
+      maxToken: 0,
+      maxSteps: 0,
+      temperature: 0,
+      maxRetries: 0,
+      mentionContexts: [],
+      knowledgeId: [],
+      knowledgeName: [],
+      codebaseId: '',
+      mentionContextCount: 0,
+      command: '',
+      expertId: '',
+      recommendId: '',
+      skillId: '',
+      skillCount: 0,
+      totalCount: 0,
+      fileUri: '',
+      presentAt: now,
+      traceId: '',
+      rootRequestId: stamp,
+      parentConversationId: stamp,
+      agentName: 'default',
+      agentType: 'conversation',
+      userId: auth.uid || '',
+    };
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(new Error('timeout')), 15_000);
+    try {
+      const res = await fetch(base + '/v2/report', {
+        method: 'POST',
+        headers: billingHeaders(siteCfg, auth),
+        body: JSON.stringify([event]),
+        signal: ac.signal,
+      });
+      const text = await res.text().catch(() => '');
+      if (res.status >= 400) {
+        warn(`[${site}] 对话事件上报失败：HTTP ${res.status} ${text.slice(0, 120)}`);
+        return false;
+      }
+      let json = null;
+      try { json = JSON.parse(text); } catch { /* 非 JSON 也算收下了（2xx） */ }
+      if (json && json.code !== 0) {
+        warn(`[${site}] 对话事件上报被拒：code=${json.code} ${String(json.msg || '').slice(0, 100)}`);
+        return false;
+      }
+      return true;
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch (e) {
+    warn(`[${site}] 对话事件上报异常：`, e.message || String(e));
+    return false;
+  }
+}
+
+/**
  * 发起一次站点聊天请求。
  * 返回：{ ok:true, status, frames:AsyncGenerator<string>, close(), payload } 或
  *      { ok:false, status, text }
