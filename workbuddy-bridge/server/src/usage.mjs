@@ -217,3 +217,22 @@ export function todayAvgCreditByModel() {
   }
   return out;
 }
+
+/**
+ * 近 N 天日均积分消耗（积分耗尽预测的速率基准，T32）。
+ *
+ * 只统计**有消耗的天**：把没用过的日子算进分母会把速率压低，
+ * 预测出「按当前速率用得完」的乐观结论——而那正是这个功能要防的误判。
+ * 完全没有消耗记录时返回 0（调用方据此显示「近期无消耗」而不是当成无限速）。
+ */
+export function recentDailyCreditAvg(days = 7) {
+  ensureLoaded();
+  const keys = Object.keys(data.days).sort().slice(-days);
+  let sum = 0;
+  let n = 0;
+  for (const k of keys) {
+    const c = Number(data.days[k]?.credit) || 0;
+    if (c > 0) { sum += c; n += 1; }
+  }
+  return n > 0 ? sum / n : 0;
+}

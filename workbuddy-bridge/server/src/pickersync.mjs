@@ -6,7 +6,7 @@
 //   - 服务端定时循环（startProviderConfigSync）：上游加/删模型或倍率变动时自动跟上
 //   - SessionStart 钩子（hooks/sync-provider.mjs）：会话启动时的快路径触发
 //
-// 本模块刻意保持零依赖（仅 node 内置），钩子引入时不拖起服务端的其它模块。
+// 本模块只依赖 node 内置模块 + 同目录 config.mjs（读数据目录，不拖起服务端其它模块）。
 //
 // schema 要点（从 ZCode 运行内核逆向 + 桌面日志实证，详见项目记忆）：
 //   - 文件每 60 秒被 ZCode 轮询，解析成功即热加载进模型目录，无需重启
@@ -16,11 +16,39 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+import { getConfigDir } from './config.mjs';
+
 export const PROVIDER_ID = 'workbuddy-bridge';
 export const PROVIDER_NAME = 'WorkBuddy';
 
-/** ZCode 个人供应商配置的目标路径（ZCODE_PERSONAL_PROVIDER_CONFIG_FILE 可覆盖，便于测试）。 */
+/** 生产数据目录（未设 WB_CONFIG_DIR 时用的那个）。 */
+function productionConfigDir() {
+  return path.join(os.homedir(), '.zcode', 'workbuddy-bridge');
+}
+
+/**
+ * ZCode 个人供应商配置的目标路径（ZCODE_PERSONAL_PROVIDER_CONFIG_FILE 可覆盖，便于测试）。
+ *
+ * 隔离守卫：显式设了 WB_CONFIG_DIR 的实例（临时目录试启、冒烟测试）**不得**写
+ * 生产配置。这类实例的端口通常是临时的（试启常用 8794 之类），一旦写进全局
+ * provider_config.json，ZCode 就会把 baseUrl 指向那个一次性端口，之后每回合
+ * 全部 ECONNREFUSED，直到生产实例下一次同步刷回来。
+ * 事故记录：2026-10-03 22:08 试启实例（port=8794）把 baseUrl 刷成 8794，
+ * 22:09–22:16 连续 106 次拨号失败、整回合报废。
+ *
+ * 落到隔离目录时写 <数据目录>/provider_config.json —— 试启仍能自检配置形状，
+ * 但绝不外溢。想显式指定别的路径仍然用 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE。
+ */
 export function providerConfigTarget() {
+  const dataDir = getConfigDir();
+  const isolated = path.resolve(dataDir) !== path.resolve(productionConfigDir());
+
+  // 隔离实例（临时目录试启 / 冒烟测试）绝不写生产配置。
+  // 注意 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE 优先级最低：ZCode 桌面端会把这个变量
+  // 注入到插件/hook 子进程（值就是生产全局路径），若照它写，隔离守卫会被整条短路，
+  // 试启实例照样把临时端口刷进生产配置 —— 2026-10-03 的 8794 污染就是这么复现的。
+  if (isolated) return path.join(dataDir, 'provider_config.json');
+
   return process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE
     || path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
 }
@@ -170,7 +198,6 @@ export async function runProviderConfigSync({ port, apiKey, fallbackModels = [] 
   const result = syncProviderConfigFile({ apiKey, baseUrl: `http://127.0.0.1:${port}/v1`, models, target });
   return { result, models: models.length, target };
 }
-
 // ---- 服务端定时循环 ----
 
 const timers = { sync: null };

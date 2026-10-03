@@ -534,3 +534,223 @@ test('B3 bridgeStatus redact：抹掉两个 token 字段且不影响其余字段
   assert.equal(acc1.creditDetail[0].credit, 100);
   assert.ok(safe.sites[0].plan, '建议消耗顺序仍应生成');
 });
+
+/* ---------------- T32 积分耗尽预测：predictBatch / predictAccount / burnoutReport ---------------- */
+
+const DAY = 86_400_000;
+const NOW = Date.parse('2026-10-03T12:00:00');
+
+test('T32 predictBatch：日均速率低 → 判定「预计用不完」并给出建议', async () => {
+  const { predictBatch } = await import('../src/burnout.mjs');
+  // 1000 积分，还有 10 天过期，日均只烧 10 分 → 到期时只能烧掉 100，必然剩 900
+  const r = predictBatch({ remain: 1000, expireAt: NOW + 10 * DAY }, { dailyAvg: 10, now: NOW });
+  assert.equal(r.willExpireUnused, true);
+  assert.equal(r.daysLeft, 10);
+  assert.equal(r.projectedUse, 100);
+  assert.equal(r.projectedRemain, 900);
+  assert.equal(r.wasteCredits, 900);
+  assert.ok(r.advice && r.advice.includes('900'), '建议里应写明预计浪费多少积分');
+});
+
+test('T32 predictBatch：日均速率高 → 判定「能用完」，不算浪费', async () => {
+  const { predictBatch } = await import('../src/burnout.mjs');
+  // 1000 积分 10 天过期，日均烧 200 → 10 天正好烧 2000，用得完
+  const r = predictBatch({ remain: 1000, expireAt: NOW + 10 * DAY }, { dailyAvg: 200, now: NOW });
+  assert.equal(r.willExpireUnused, false);
+  assert.equal(r.wasteCredits, 0);
+  assert.equal(r.advice, null);
+});
+
+test('T32 predictBatch：数据不足时如实返回「无法预测」，绝不误报浪费', async () => {
+  const { predictBatch } = await import('../src/burnout.mjs');
+  const cases = [
+    [{ remain: 1000, expireAt: NOW + 5 * DAY }, { dailyAvg: 0, now: NOW }, 'no-usage', '没有消耗记录'],
+    [{ remain: 1000, expireAt: null }, { dailyAvg: 50, now: NOW }, 'no-expiry', '拿不到到期时间'],
+    [{ remain: 0, expireAt: NOW + 5 * DAY }, { dailyAvg: 50, now: NOW }, 'empty', '批次已耗尽'],
+    [{ remain: 1000, expireAt: NOW - DAY }, { dailyAvg: 50, now: NOW }, 'expired', '批次已过期'],
+  ];
+  for (const [batch, opts, reason, label] of cases) {
+    const r = predictBatch(batch, opts);
+    assert.equal(r.willExpireUnused, false, `${label}：不该判成用不完`);
+    assert.equal(r.wasteCredits, null, `${label}：没算出结论时 wasteCredits 应为 null（展示层显示「—」），不是 0`);
+    assert.equal(r.reason, reason, `${label}：reason 标记不对`);
+  }
+});
+
+test('T32 predictBatch：不足一天到期时按 0.25 天下限算，不误报成「用不完」', async () => {
+  const { predictBatch } = await import('../src/burnout.mjs');
+  // 2 小时后过期、只剩 2 积分、日均 10 → 当天最多烧 10，2 积分当天就用得完
+  const r = predictBatch({ remain: 2, expireAt: NOW + 2 * 3600_000 }, { dailyAvg: 10, now: NOW });
+  // 2/24≈0.083 天，被 0.25 天下限抬上来（保留 0.1 天粒度，round 半进位后是 0.3）
+  assert.ok(r.daysLeft <= 0.3 && r.daysLeft >= 0.25, `不足一天应按下限计，实际 ${r.daysLeft}`);
+  assert.equal(r.willExpireUnused, false, '当天就能用完的批次不该报「预计用不完」');
+  assert.ok(r.projectedUse >= 2, `日均 10×0.25=2.5 ≥ 余量 2，应判为用得完，实际预计消耗 ${r.projectedUse}`);
+});
+
+test('T32 predictAccount / burnoutReport：汇总风险批次数与总浪费额', async () => {
+  const { predictAccount, burnoutReport } = await import('../src/burnout.mjs');
+  const acc = {
+    id: 'acc_1', label: '公瑾',
+    creditDetail: [
+      { package: '大包', remain: 1000, expireAt: NOW + 10 * DAY },  // 烧不完（10 天只用掉 100）
+      { package: '小包', remain: 100, expireAt: NOW + 10 * DAY },   // 正好烧完（10 天刚好用 100）
+      { package: '过期包', remain: 50, expireAt: NOW - DAY },       // 已过期，不计
+    ],
+  };
+  const p = predictAccount(acc, { dailyAvg: 10, now: NOW });
+  assert.equal(p.riskCount, 1, '只有大包是风险批次');
+  assert.equal(p.totalWaste, 900);
+  assert.equal(p.batches.length, 3, '所有批次都要带 burnout 字段返回，供账号卡逐行渲染');
+
+  const rep = burnoutReport([{ site: 'cn-cli', account: acc }], { dailyAvg: 10, now: NOW });
+  assert.equal(rep.riskCount, 1);
+  assert.equal(rep.totalWaste, 900);
+  assert.equal(rep.accounts[0].label, '公瑾');
+  assert.equal(rep.accounts[0].site, 'cn-cli');
+  assert.equal(rep.dailyAvg, 10);
+});
+
+/* ---------------- 交棒重启死锁修复：isModelPath 只把模型调用算作活跃请求 ---------------- */
+// 背景（2026-10-03 22:0x）：原来只要 pathname !== '/health' 就计数，控制台的
+// 20 秒轮询与 SSE 长连接也被计入。老标签页开着时活跃数永久 ≥ 1，交棒重启永远等
+// 不到空闲 → 老实例不退出、新实例 30 秒后放弃 → 改了代码却没生效（health 却正常）。
+// isModelPath 定义在 server.mjs 里（单测不加载它），这里用源码提取的方式验证判定口径。
+
+test('交棒重启：isModelPath 只把模型调用算活跃请求，控制台轮询/SSE 不算', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  // import.meta.url 是 file:///E:/... 形式的 URL，必须过 fileURLToPath 再算路径 ——
+  // 直接 path.dirname 会得到 "E:\E:\..." 双前缀（Windows 上踩过，报 ENOENT）。
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const src = fs.readFileSync(path.join(here, '..', 'server.mjs'), 'utf8');
+  const m = src.match(/function isModelPath\(pathname\) \{[\s\S]*?\n\}/);
+  assert.ok(m, 'server.mjs 里应能提取到 isModelPath 函数');
+  // 用 new Function 显式返回：ESM 是严格模式，eval 里的 function 声明不会泄漏到外层作用域
+  const isModelPath = new Function(`${m[0]}; return isModelPath;`)();
+
+  // 模型调用：掐断它 = 用户会话断线，必须计入
+  for (const p of ['/v1/chat/completions', '/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/v1/messages/chat/completions']) {
+    assert.equal(isModelPath(p), true, `${p} 是模型调用，应计入活跃请求`);
+  }
+  // 后台/长连接：与用户会话生死无关，绝不能计入（否则交棒重启死锁）
+  for (const p of ['/health', '/healthz', '/console/api/stream', '/console/api/bridge', '/console', '/admin/restart', '/status', '/']) {
+    assert.equal(isModelPath(p), false, `${p} 不是模型调用，不该计入活跃请求（计入会导致交棒重启永远等不到空闲）`);
+  }
+});
+
+/* ---------------- B4 provider_config 隔离守卫（2026-10-03 端口污染事故） ---------------- */
+
+// 背景：临时目录试启的实例（port=8794）曾把生产 ~/.zcode/v2/provider_config.json 的
+// baseUrl 刷成 8794，ZCode 之后 106 次拨号全部 ECONNREFUSED，整回合报废。
+// 防线：显式设了 WB_CONFIG_DIR 的实例只写自己的数据目录，绝不碰生产配置。
+
+test('B4 providerConfigTarget：生产数据目录写全局 v2 配置', async () => {
+  const { providerConfigTarget } = await import('../src/pickersync.mjs');
+  const { getConfigDir, setConfigDir } = await import('../src/config.mjs');
+  const restore = setConfigDir(path.join(os.homedir(), '.zcode', 'workbuddy-bridge'));
+  try {
+    delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+    assert.equal(
+      providerConfigTarget(),
+      path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json'),
+      '生产实例必须继续写全局配置（否则 ZCode 选择器里 WorkBuddy 分组会消失）',
+    );
+  } finally {
+    restore();
+  }
+});
+
+test('B4 providerConfigTarget：隔离数据目录只写自己的目录，不返回全局路径', async () => {
+  const { providerConfigTarget } = await import('../src/pickersync.mjs');
+  const { getConfigDir, setConfigDir } = await import('../src/config.mjs');
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-iso-'));
+  const restore = setConfigDir(iso);
+  try {
+    delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+    const target = providerConfigTarget();
+    assert.equal(target, path.join(iso, 'provider_config.json'), '隔离实例应写自己的数据目录');
+    assert.ok(
+      !target.startsWith(path.join(os.homedir(), '.zcode', 'v2')),
+      '隔离实例绝不能写生产 v2 配置（这正是 8794 污染的根因）',
+    );
+  } finally {
+    restore();
+  }
+});
+
+test('B4 providerConfigTarget：生产实例下 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE 仍可覆盖', async () => {
+  const { providerConfigTarget } = await import('../src/pickersync.mjs');
+  const { setConfigDir } = await import('../src/config.mjs');
+  const custom = path.join(os.tmpdir(), 'wb-custom-provider.json');
+  // 覆盖变量只对生产实例生效；隔离实例一律写自己的目录（见后两条测试）
+  const restore = setConfigDir(path.join(os.homedir(), '.zcode', 'workbuddy-bridge'));
+  process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = custom;
+  try {
+    assert.equal(providerConfigTarget(), custom, '生产实例下显式覆盖变量生效');
+  } finally {
+    restore();
+    delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+  }
+});
+
+test('B4 端到端：隔离实例跑完整同步，全局 provider_config.json 一字不动', async () => {
+  const { runProviderConfigSync } = await import('../src/pickersync.mjs');
+  const { setConfigDir } = await import('../src/config.mjs');
+
+  // 造一个「生产配置」哨兵文件，验证隔离实例的同步绝不去碰它
+  const sentinelDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-sentinel-'));
+  const sentinel = path.join(sentinelDir, 'provider_config.json');
+  const sentinelBody = '{"schemaVersion":1,"config":{"providerOrder":["keep-me"],"marker":"untouched"}}';
+  fs.writeFileSync(sentinel, sentinelBody, 'utf8');
+
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-iso-e2e-'));
+  const restore = setConfigDir(iso);
+  try {
+    delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+    // 端口指向一个不存在的服务 → fetchPickerModels 失败 → 走 fallbackModels，
+    // 与试启事故里「试启实例照样写全局配置」的路径完全一致
+    const r = await runProviderConfigSync({
+      port: 8794,
+      apiKey: 'sk-wb-test',
+      fallbackModels: ['space-bunny (x0.03)'],
+    });
+    assert.equal(r.target, path.join(iso, 'provider_config.json'), '同步目标应是隔离目录');
+    assert.ok(fs.existsSync(path.join(iso, 'provider_config.json')), '隔离目录里应生成配置文件');
+    const written = fs.readFileSync(path.join(iso, 'provider_config.json'), 'utf8');
+    assert.match(written, /127\.0\.0\.1:8794/, '隔离实例自己写自己的端口（允许）');
+    assert.equal(
+      fs.readFileSync(sentinel, 'utf8'),
+      sentinelBody,
+      '全局/哨兵配置必须逐字节不变 —— 这是本次修复的核心断言',
+    );
+  } finally {
+    restore();
+    delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+  }
+});
+
+test('B4 隔离实例即使继承了指向生产的覆盖变量，也只写隔离目录', async () => {
+  // 真实事故场景：ZCode 桌面端把 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE 注入插件子进程，
+  // 试启脚本用「覆盖变量优先」的旧逻辑时被整条短路，临时端口照样刷进生产配置。
+  const { runProviderConfigSync } = await import('../src/pickersync.mjs');
+  const { setConfigDir } = await import('../src/config.mjs');
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-iso-override-'));
+  const restore = setConfigDir(iso);
+  try {
+    process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE = path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
+    const r = await runProviderConfigSync({
+      port: 8794,
+      apiKey: 'sk-wb-test',
+      fallbackModels: ['space-bunny (x0.03)'],
+    });
+    assert.equal(r.target, path.join(iso, 'provider_config.json'), '隔离优先于覆盖变量');
+    assert.ok(
+      !r.target.startsWith(path.join(os.homedir(), '.zcode', 'v2')),
+      '绝不能写生产配置（覆盖变量被 ZCode 注入，值恒为生产路径）',
+    );
+  } finally {
+    restore();
+    delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+  }
+});

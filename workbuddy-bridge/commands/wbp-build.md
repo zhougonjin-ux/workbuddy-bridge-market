@@ -5,11 +5,11 @@ description: 按 Roadmap 批量实现 workbuddy-bridge 插件功能与 bug 修�
 实现 workbuddy-bridge 插件的待办功能。参数 `$ARGUMENTS` 支持三种写法：
 
 - **功能编号**：`T32 T35`，逗号或空格分隔。
-- **批次代号**：`bug1` = 修三个已确诊 bug（优先做）；`feat` = 做 T32–T39 全部新功能。
-- **`all`** = 从 T32 到 T39 顺序全做（**不含** bug 修复，bug 要用 `bug1` 单独触发）。
-- **为空时** = 默认 `bug1`（三个 bug 风险最高、修完 T29 才算真正交付）。
+- **批次代号**：`feat` = 做 T32–T39 全部新功能。`bug1` 已于 2026-10-03 完成（v0.3.16，commit `b05dfb8`），再传等同空参数。
+- **`all`** = 从 T32 到 T39 顺序全做（**不含** bug 修复，bug 已全部修完）。
+- **为空时** = 默认 `bug1`；若 bug1 已完成则无待办，直接告知用户改跑 `feat`。
 
-⚠️ **T1–T31 已于 2026-10-03 全部完成并发布 v0.3.14（commit `0cf4a19`），不要再做。** 详见下方「第二批」与项目记忆。
+⚠️ **T1–T31 已完成（v0.3.14，commit `0cf4a19`）；B1–B3 三个 bug 也已完成（v0.3.16，commit `b05dfb8`）。都不要再做。** 当前待办只剩 **T32–T39 新功能**。详见下方「第二批」与项目记忆。
 
 ## 检查点纪律（all/批量模式必读）
 
@@ -23,12 +23,12 @@ description: 按 Roadmap 批量实现 workbuddy-bridge 插件功能与 bug 修�
 - 源码：`E:\桌面\新建文件夹\plugins\workbuddy-bridge\`（server/src/*.mjs、server/console/index.html、commands/）。**改源码，不改缓存。**
 - 数据目录：`%USERPROFILE%\.zcode\workbuddy-bridge\`（config.json 含 apiKey；usage.json/tasks-state.json/learned.json）。
 - ⚠️ **绝不允许 taskkill 监听 8788 的 node 进程**——当前会话的模型流量就走它。重启服务只有一种方式：`POST http://127.0.0.1:8788/admin/restart`（带 `Authorization: Bearer <apiKey>`，交棒重启，零断线）。
-- ⚠️ **交棒重启（含 /admin/restart 与改完 server.mjs 后的任何重启）之前，必须先在临时目录试启**：`WB_CONFIG_DIR=$(mktemp -d) node server/server.mjs` 起一个隔离实例，`curl /health` 返回 200 且日志无异常堆栈后再动生产——单测不覆盖 server.mjs 监听路径，未声明变量这类「启动即崩」只有真启动才暴露（2026-10-03 20:24 T31 批次就是这么把 8788 打挂、全会话断线的；另有 Windows 看门狗计划任务 wb-bridge-watchdog 每分钟兜底拉起，别依赖它替代试启）。
+- ⚠️ **交棒重启（含 /admin/restart 与改完 server.mjs 后的任何重启）之前，必须先在临时目录试启**：`WB_CONFIG_DIR=$(mktemp -d) node server/server.mjs` 起一个隔离实例，`curl /health` 返回 200 且日志无异常堆栈后再动生产——单测不覆盖 server.mjs 监听路径，未声明变量这类「启动即崩」只有真启动才暴露（2026-10-03 20:24 T31 批次就是这么把 8788 打挂、全会话断线的；另有 Windows 看门狗计划任务 wb-bridge-watchdog 每分钟兜底拉起，别依赖它替代试启）。**试启三条硬规矩（0.3.18 血泪换来的）：**(a) `server.mjs` **必须写绝对路径**（`cd X && node server.mjs` 在残留 shell 下会在缓存目录执行、加载旧代码——2026-10-03 22:3x 因此又污染一次生产配置，事后要用 `Get-CimInstance Win32_Process` 核对 cmdline 指向源码还是缓存，别信 cwd）；(b) 端口改在**临时 config.json** 里（`WB_PORT` 环境变量无效）；(c) 起完等 30 秒让 boot+20s 的 provider 同步触发，再核对 `md5sum ~/.zcode/v2/provider_config.json` 与试启前基线一致、临时端口只出现在 `<临时目录>/provider_config.json`（0.3.18 起代码层已强制隔离，变量 `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` 会被 ZCode 桌面端注入子进程且值恒为生产路径，**别再指望设它来隔离**）。
 - 发布：`node C:\Users\87352\.zcode\cli\exec\wb-publish.cjs`（读 `E:/Temp/.wb-pat` 的 PAT；**若文件不存在，停止发布并告知用户**——重建令牌需要 sudo 邮箱验证码，见记忆 github-publishing-workbuddy 的自助流程）。发布后用 `curl -L https://codeload.github.com/zhougonjin-ux/workbuddy-bridge-market/tar.gz/refs/heads/main` 解包覆盖 `~/.zcode/cli/plugins/marketplaces/dev-workbuddy-bridge-local/` 刷新市场快照。
 - 控制台 HTML 是 no-store 头，改完让用户刷新页面即可生效；`/console/api/*` 接受 `X-Console-Token`（页面内 `__WB_TOKEN__="..."`）**或** `Authorization: Bearer <apiKey>` 两套鉴权；`/admin/*` 只认 apiKey。
 - ⚠️ **「改源码」与「cp 进缓存」必须成对完成再重启**：交棒重启拉起的是**缓存目录**的 `server.mjs`，不是源码目录。2026-10-03 21:1x 因为只改源码就重启，SSE 修复没生效、白白重启一次才发现（token 计数仍是 1）。正确顺序：改源码 → `npm test` → cp 进缓存 → diff 校验一致 → 试启 → 交棒重启。
 - ⚠️ **别删已安装缓存的旧版本目录**（`cache/dev-workbuddy-bridge-local/workbuddy-bridge/0.3.3/` 等）：运行中的服务仍从那里启动，`rm -rf` 在 Windows 上不是全有全无（会删到一半报 Device busy，留下半个目录 → 控制台 500）。要清理先确认没有进程从该目录运行。
-- 每完成一个功能：`node --check` 全部改动文件 + `npm test`（在 server/ 下跑，当前 47 条必须全过，纯函数新增要补测试）。**只跑 `npm test`，不要裸跑 `node --test`**（后者会把 smoke 测试也执行，2026-10-03 曾污染生产账号池）。
+- 每完成一个功能：`node --check` 全部改动文件 + `npm test`（在 server/ 下跑，当前 61 条必须全过，纯函数新增要补测试）。**只跑 `npm test`，不要裸跑 `node --test`**（后者会把 smoke 测试也执行，2026-10-03 曾污染生产账号池）。
 
 ## 每个功能做完后的统一收尾流程
 
@@ -97,9 +97,9 @@ tasks.mjs 的 autoCompleteChatTasks 扩展：任务 code === 'black_cat'（参�
 
 ---
 
-## 🐛 第二批 BUG 修复（`/wbp-build bug1`，2026-10-03 21:4x 代码审查确诊）
+## ✅ 第二批 BUG 修复（`/wbp-build bug1`）——**已于 2026-10-03 完成并发布 v0.3.16（commit `b05dfb8`），不要重做**
 
-三个 bug 均已在代码里核实到根因，**不用重新调查**。B1 最优先——它让 T29 整个功能从未真正生效。
+三个 bug 的根因分析保留在下方供追溯，**实现已完成**（B1 GET /console 下发 cookie + 前端 onerror 带 /health 守卫自动 reload；B2 /service/stop 与 /admin/shutdown 统一走 doStop/gracefulExit，活跃请求返回 409；B3 /bridge 改 redact）。单测 50/50，浏览器内实测 EventSource 由直接 CLOSED 变为 OPEN。
 
 ### B1 🔴 SSE 推送在浏览器里从未生效（EventSource 鉴权死锁）
 

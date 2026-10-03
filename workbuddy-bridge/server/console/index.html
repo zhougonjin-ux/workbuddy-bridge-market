@@ -323,6 +323,13 @@ async function loadAlerts() {
       }
     }
     await loadUpdateAlert(items); // T22：更新提示并入同一预警条（无命中不占位）
+    // T32：积分耗尽预测——到期前按当前速率用不完的批次，放最前面（最需要用户决策）
+    const risks = (b.burnout && b.burnout.risks) || [];
+    for (const r of risks.slice(0, 2)) {
+      for (const bt of (r.batches || []).slice(0, 2)) {
+        items.unshift(`<span class="alertbar orange" title="${esc(bt.advice || '')}">📉 预计用不完：${esc(r.label)} 的「${esc(bt.package || '积分包')}」到期时还剩约 ${fmtCredit(bt.wasteCredits)} 积分（剩 ${bt.daysLeft} 天）</span>`);
+      }
+    }
     el.innerHTML = items.slice(0, 6).join('');
   } catch { /* 服务重启中等下一轮 */ }
 }
@@ -498,10 +505,15 @@ function acctCard(site, row, raw) {
   const renderBatch = (b) => {
     const full = (b.remain || 0) + (b.used || 0);
     const w = full > 0 ? Math.round((b.remain || 0) / full * 100) : 0;
+    // T32：耗尽预测——这批到期前按当前速率用不完，给标记 + 建议（点击可复制建议文案）
+    const bo = b.burnout;
+    const riskTag = bo && bo.willExpireUnused
+      ? `<span class="badge warn" style="cursor:pointer" data-act="burnout-copy" data-advice="${esc(bo.advice || '')}" title="${esc(bo.advice || '')}">📉 预计用不完 ${fmtCredit(bo.wasteCredits)}</span>` : '';
     return `<div class="batch">
-      <div class="l"><span class="muted">${esc(b.package || '积分包')}</span>
+      <div class="l"><span class="muted">${esc(b.package || '积分包')}</span> ${riskTag}
       <span>余 <b>${fmtCredit(b.remain)}</b> · <span style="color:${expiryColor(b.expireAt)}">${esc(expiryText(b.expireAt))}</span></span></div>
       <div class="bar"><i style="width:${w}%;background:${expiryColor(b.expireAt)}"></i></div>
+      ${riskTag ? `<div class="muted" style="font-size:12px;margin-top:2px">${esc(bo.advice || '')}</div>` : ''}
     </div>`;
   };
   const batches = (showSpent ? [...spent, ...live] : live).map(renderBatch).join('');
@@ -551,6 +563,10 @@ function bindAcctAction(btn, done) {
       } else if (act === 'remove') {
         if (!confirm('确定删除该账号？（token 会从本机移除，账号本身不受影响）')) return;
         await api('/pool/account/remove', { method: 'POST', body: { site, id } });
+      } else if (act === 'burnout-copy') {
+        // T32：点「预计用不完」标记复制建议文案，方便贴到别处或照着安排任务
+        copy(btn.dataset.advice || '', '已复制建议');
+        return; // 纯前端操作，不触发重渲染
       }
       done();
     } catch (e) { toast('操作失败：' + e.message, 'bad'); }

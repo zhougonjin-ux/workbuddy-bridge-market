@@ -29,6 +29,8 @@ import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
 import { runTasks, taskStatus, growthTasksView, runSingleTask, claimSingleTask } from './tasks.mjs';
 import { importLocalAccounts } from './localimport.mjs';
 import { budgetStatus, budgetCheckAndAnnounce } from './budget.mjs';
+import { burnoutReport, predictAccount } from './burnout.mjs';
+import { recentDailyCreditAvg } from './usage.mjs';
 import { checkForUpdate } from './updatecheck.mjs';
 import { runDiagnostics } from './doctor.mjs';
 import { flushPool } from './pool.mjs';
@@ -97,6 +99,41 @@ async function siteSummary(cfg, site) {
 }
 
 /** 探测单个模型是否可用：实现上移到 health.mjs（/probe 与巡检共用同一套逻辑）。 */
+
+/**
+ * 收集「(站点, 账号)」对，供 T32 耗尽预测遍历。
+ * 只看启用且有批次明细的账号——没刷过积分明细的账号没有批次，预测无意义。
+ */
+function siteAccountPairs(cfg) {
+  const out = [];
+  for (const s of siteKeys(cfg)) {
+    for (const a of accountSnapshot(s)) {
+      if (a.enabled === false) continue;
+      if (!Array.isArray(a.creditDetail) || !a.creditDetail.length) continue;
+      out.push({ site: s, account: a });
+    }
+  }
+  return out;
+}
+
+/**
+ * T32：给 /bridge 用的精简版耗尽预测（只回需要上预警条的风险项）。
+ * 全量数据走 /burnout，这里每 20 秒轮询一次，必须轻。
+ */
+function burnoutBrief(cfg) {
+  const dailyAvg = recentDailyCreditAvg(7);
+  const report = burnoutReport(siteAccountPairs(cfg), { dailyAvg });
+  return { dailyAvg: report.dailyAvg, riskCount: report.riskCount, totalWaste: report.totalWaste, risks: report.accounts.filter((a) => a.riskCount > 0).map((a) => ({ site: a.site, id: a.id, label: a.label, totalWaste: a.totalWaste, batches: a.batches.filter((b) => b.burnout.willExpireUnused).map((b) => ({ package: b.package, remain: b.remain, expireAt: b.expireAt, advice: b.burnout.advice, wasteCredits: b.burnout.wasteCredits, daysLeft: b.burnout.daysLeft })) })) };
+}
+
+/** T32：把预测结果挂到 /pool 返回的账号快照上，账号卡批次行据此显示「预计用不完」。 */
+function attachBurnoutToAccounts(site, accounts, dailyAvg) {
+  for (const a of accounts) {
+    const p = predictAccount(a, { dailyAvg });
+    a.burnout = { dailyAvg: p.dailyAvg, riskCount: p.riskCount, totalWaste: p.totalWaste, batches: p.batches };
+  }
+  return accounts;
+}
 
 export async function handleConsoleApi(ctx) {
   const { cfg, req, res, url } = ctx;
@@ -243,7 +280,7 @@ export async function handleConsoleApi(ctx) {
         }
       }
     }
-    return sendJson(res, 200, { site, accounts, supports_credit: supportsCreditQuery(cfg, site) });
+    return sendJson(res, 200, { site, accounts: attachBurnoutToAccounts(site, accounts, recentDailyCreditAvg(7)), supports_credit: supportsCreditQuery(cfg, site) });
   }
 
   // ---- workbuddy-bridge：调度策略查看/切换 ----
@@ -263,11 +300,21 @@ export async function handleConsoleApi(ctx) {
     // /backup 保留明文：导出的用途本就是把账号整套搬走。
     const b = bridgeStatus(cfg, { redact: true });
     b.budget = budgetCheckAndAnnounce(cfg); // T13：预警条数据源 + 每天一次的预算提醒
+    b.burnout = burnoutBrief(cfg); // T32：预警条的「预计用不完」项
     return sendJson(res, 200, b);
   }
   if (p === '/credit/refresh' && method === 'POST') {
     const results = await refreshCreditsAll(cfg);
     return sendJson(res, 200, { ok: true, results });
+  }
+
+  // ---- T32 积分耗尽预测：全量报告（控制台「积分预测」卡 + /wbp 面板消费）----
+  // ?days=7 换统计窗口；?avg= 直接注入日均消耗（便于对比不同速率下的预测）。
+  if (p === '/burnout' && method === 'GET') {
+    const days = Math.min(90, Math.max(1, Number(url.searchParams.get('days')) || 7));
+    const avgRaw = url.searchParams.get('avg');
+    const avg = avgRaw === null ? null : Math.max(0, Number(avgRaw) || 0);
+    return sendJson(res, 200, burnoutReport(siteAccountPairs(cfg), { dailyAvg: avg, days }));
   }
 
   // ---- workbuddy-bridge：自动任务（签到/成长任务）----

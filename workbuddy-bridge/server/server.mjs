@@ -231,6 +231,41 @@ import { bootLifecycle, drainWaiters, gracefulExit, doRestart, doStop } from './
 import { setRestartHandler, setStopHandler } from './src/lifecycle.mjs';
 let activeRequests = 0;
 
+/**
+ * 判定一个路径是不是「模型调用」——只有这类请求算活跃请求（掐断它 = 用户会话断线）。
+ *
+ * 覆盖：OpenAI 兼容（/v1/*）、根路径的协议端点（Anthropic 与 responses 在根路径）、
+ * 以及 GET /v1/models（客户端启动时拉模型列表，掐断等于会话连不上）。
+ * 其余（/health、/console/**、/admin/**、/status 等后台与发现类接口）都不计入。
+ *
+ * 用「路径分段里出现连续匹配」而不是整串正则，与下方协议分派的 hasSeg 同一套口径 ——
+ * 否则 TraeWork 那种 `/v1/messages/chat/completions` 的拼接写法会被漏判成非模型请求。
+ */
+function isModelPath(pathname) {
+  if (pathname === '/health' || pathname === '/healthz') return false;
+  if (pathname.startsWith('/console') || pathname.startsWith('/admin')) return false;
+  if (pathname === '/status') return false;
+  const segs = pathname.split('/').filter(Boolean);
+  const hasSeg = (...want) => {
+    for (let i = 0; i + want.length <= segs.length; i++) {
+      let ok = true;
+      for (let j = 0; j < want.length; j++) {
+        if (segs[i + j] !== want[j]) { ok = false; break; }
+      }
+      if (ok) return true;
+    }
+    return false;
+  };
+  return (
+    hasSeg('models') ||
+    hasSeg('chat', 'completions') ||
+    hasSeg('completions') ||
+    hasSeg('messages') ||
+    hasSeg('responses') ||
+    hasSeg('embeddings')
+  );
+}
+
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
@@ -241,7 +276,14 @@ const server = http.createServer(async (req, res) => {
   // 会话请求进行中执行，等于掐断自己的模型通道，会话当场死亡。
   // 因此凡可能退出进程的路径都必须先看 activeRequests；/health 不计数（hook 探测要用，
   // 且它不碰模型流量）。
-  if (pathname !== '/health') {
+  //
+  // 只统计「模型调用」（/v1/* 与根路径的协议端点）。控制台与后台接口不算：
+  //   - 控制台每 20 秒轮询一次、还有一条 SSE 长连接，res 的 close 事件可能几十分钟
+  //     都不触发（旧标签页常年开着），一旦计入就会让活跃数永久 ≥ 1，交棒重启永远等
+  //     不到空闲、老实例永不退出、新实例 30 秒后放弃 —— 表现为「改了代码却没生效」
+  //     但 health 一切正常，极难排查；
+  //   - 这些请求本来就与用户会话生死无关（掐断最多让控制台面板闪一下）。
+  if (isModelPath(pathname)) {
     activeRequests++;
     res.on('close', () => { activeRequests--; drainWaiters(); });
   }
