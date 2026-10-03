@@ -446,7 +446,7 @@ async function loadOverview() {
       <div class="kpi2" data-go="usage"><b class="warn">${fmtCredit(today.credit ?? 0)}</b><span>今日消耗积分</span></div>
       <div class="kpi2" data-go="usage"><b>${today.calls ?? 0}</b><span>今日调用 · 错误 ${today.errors ?? 0}</span></div>
       <div class="kpi2" data-go="accounts"><b class="${weekExpiry > 0 ? 'warn' : ''}">${fmtCredit(weekExpiry)}</b><span>7 天内到期积分</span></div>
-      <div class="kpi2" data-go="accounts"><b>${enabled.filter((x) => !String(x.a.lastError || x.a.last_error || '').includes('401')).length}<span style="font-size:14px;color:var(--muted)">/${enabled.length}</span></b><span>健康账号（401 视为失效）</span></div>
+      <div class="kpi2" data-go="accounts"><b>${enabled.filter((x) => !String(x.a.lastError || '').includes('401')).length}<span style="font-size:14px;color:var(--muted)">/${enabled.length}</span></b><span>健康账号（401 视为失效）</span></div>
       <div class="kpi2" data-go="settings"><b class="${anyLogin ? 'ok' : 'bad'}" style="font-size:18px;padding-top:5px">${anyLogin ? '● 运行中' : '○ 未登录'}</b><span>服务 · 已运行 ${dur(state.uptime_ms || 0)}</span></div>`;
 
     // ---- 面板 1：积分与到期（每账号一行：名称 + 余额大字 + 最近到期批次条） ----
@@ -627,7 +627,7 @@ async function loadAlerts() {
       if (remain !== null && remain <= alLow()) {
         items.push(`<span class="alertbar red" title="该账号余额仅剩 ${remain} 积分，继续消耗会触发换号/失败">🔴 余额不足：${accName(a)} 剩 ${remain} 积分</span>`);
       }
-      if (String(a.lastError || '').includes('401') || String(a.last_error || '').includes('401')) {
+      if (String(a.lastError || '').includes('401')) {
         items.push(`<span class="alertbar red" title="token 已失效：重新 /wbp-login 扫码或 /wbp-import 导入本机登录态">🔴 登录态失效：${accName(a)}（${esc(s.label)}）</span>`);
       }
       for (const bt of a.creditDetail || []) {
@@ -798,10 +798,9 @@ function fmtCredit(v) {
 
 function acctCard(site, row, raw) {
   const a = { ...row, ...(raw.id ? raw : {}) };
-  const status = !a.enabled ? '<span class="badge">已禁用</span>'
-    : a.exhausted ? '<span class="badge bad">额度耗尽</span>'
-    : a.cooldown_until && new Date(a.cooldown_until) > new Date() ? '<span class="badge warn">冷却中</span>'
-    : '<span class="badge ok">可用</span>';
+  // 与健康面板同一套状态判定（isUsable 语义）；账号卡习惯说「可用」不说「健康」
+  const hs = healthState(a);
+  const status = `<span class="badge ${hs.cls}">${hs.text === '健康' ? '可用' : hs.text}</span>`;
   // 「使用中」：后端用与真实调度相同的 pickAccount 算出的当前选中账号
   const inUse = site.active_account_id && a.id === site.active_account_id && a.enabled !== false
     ? '<span class="badge acc" title="当前调度策略选中的账号，下一次调用将消耗它的积分">使用中</span>' : '';
@@ -843,7 +842,7 @@ function acctCard(site, row, raw) {
     <div class="batches">${batches || (a.creditDetail && a.creditDetail.length ? '' : '<span class="muted" style="font-size:12px">暂无批次明细 —— 点「刷新全部积分」获取</span>')}</div>
     ${spentNote}
     ${a.manualExpireAt ? `<div style="font-size:12px" class="muted">手动到期兜底：<span class="warn">${esc(a.manualExpireAt)}</span></div>` : ''}
-    ${a.last_error ? `<div style="font-size:12px" class="bad">最近错误：${esc(a.last_error)}</div>` : ''}
+    ${a.lastError ? `<div style="font-size:12px" class="bad">最近错误：${esc(a.lastError)}</div>` : ''}
     <div class="acts">
       <button class="btn mini" data-act="pin" data-site="${esc(site.site)}" data-id="${esc(a.id)}">📌 固定使用</button>
       <button class="btn mini" data-act="enable" data-site="${esc(site.site)}" data-id="${esc(a.id)}" data-v="${a.enabled ? '0' : '1'}">${a.enabled ? '禁用' : '启用'}</button>
@@ -1672,13 +1671,16 @@ async function loadEvents() {
 
 /* ---------- Tab：健康（T17 账号健康 + T18 Key + T19 路由规则 + T20 时段路由 + T21 备份恢复） ---------- */
 const fmtPct = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 's' : n + 'ms');
+/* 账号健康状态 —— 必须与 server/src/pool.mjs 的 isUsable() 同一套语义：
+ * enabled=false 已禁用；lastError 含 401 登录态失效；exhaustedAt 6h TTL 内算额度耗尽；
+ * cooldownUntil（epoch ms）未到算冷却中。字段全是驼峰（0.3.25 修正：此前的
+ * usable/cooldown_until/exhausted_at 是不存在的幽灵字段，导致所有账号恒显示「不可用」）。 */
 function healthState(a) {
   const now = Date.now();
   if (a.enabled === false) return { cls: '', text: '已禁用' };
-  if (String(a.last_error || '').includes('401') || (a.last_error || '').includes('401')) return { cls: 'bad', text: '登录态失效' };
-  if (a.exhausted || (a.exhausted_at && now - new Date(a.exhausted_at).getTime() < 6 * 3600e3)) return { cls: 'bad', text: '额度耗尽' };
-  if (a.cooldown_until && new Date(a.cooldown_until) > new Date()) return { cls: 'warn', text: '冷却中' };
-  if (!a.usable && a.enabled !== false) return { cls: 'warn', text: '不可用' };
+  if (String(a.lastError || '').includes('401')) return { cls: 'bad', text: '登录态失效' };
+  if (a.exhaustedAt && now - a.exhaustedAt < 6 * 3600e3) return { cls: 'bad', text: '额度耗尽' };
+  if (a.cooldownUntil && now < a.cooldownUntil) return { cls: 'warn', text: '冷却中 · 剩 ' + Math.max(1, Math.ceil((a.cooldownUntil - now) / 60000)) + ' 分' };
   return { cls: 'ok', text: '健康' };
 }
 
@@ -1709,10 +1711,10 @@ function healthState(a) {
       const st = healthState(a);
       const remain = accountRemainOf(a);
       const ttl = [];
-      if (a.exhausted_at) ttl.push({ t: '额度耗尽', at: a.exhausted_at, cls: 'bad' });
-      if (a.cooldown_until && new Date(a.cooldown_until) > new Date()) ttl.push({ t: '冷却至 ' + new Date(a.cooldown_until).toLocaleTimeString(), at: a.cooldown_until, cls: 'warn' });
-      if (a.last_error_at && a.last_error) ttl.push({ t: '失败：' + a.last_error, at: a.last_error_at, cls: 'bad' });
-      if (a.last_used_at) ttl.push({ t: '最近使用', at: a.last_used_at, cls: 'acc' });
+      if (a.exhaustedAt) ttl.push({ t: '额度耗尽', at: a.exhaustedAt, cls: 'bad' });
+      if (a.cooldownUntil && a.cooldownUntil > Date.now()) ttl.push({ t: '冷却至 ' + new Date(a.cooldownUntil).toLocaleTimeString(), at: a.cooldownUntil, cls: 'warn' });
+      if (a.lastError) ttl.push({ t: '失败：' + a.lastError, at: a.lastErrorAt || a.lastUsedAt || a.creditCheckedAt || a.addedAt, cls: 'bad' });
+      if (a.lastUsedAt) ttl.push({ t: '最近使用', at: a.lastUsedAt, cls: 'acc' });
       ttl.sort((x, y) => new Date(y.at) - new Date(x.at));
       const timeline = ttl.slice(0, 3).map((e) =>
         `<div style="font-size:12px" class="muted"><span class="${e.cls}" style="margin-right:4px">●</span>${new Date(e.at).toLocaleString()} · ${esc(e.t.length > 60 ? e.t.slice(0, 60) + '…' : e.t)}</div>`).join('');
@@ -1720,7 +1722,7 @@ function healthState(a) {
         <td><b>${esc(a.label || a.id)}</b> <span class="badge">${esc(a.site)}</span></td>
         <td><span class="badge ${st.cls}">${st.text}</span></td>
         <td>${remain == null ? '—' : fmtCredit(remain)}</td>
-        <td>${a.fail_count || 0}</td>
+        <td>${a.failCount || 0}</td>
         <td>${a.enabled === false ? '<span class="badge">禁用</span>' : '<span class="badge ok">启用</span>'}</td>
         <td style="min-width:260px">${timeline || '<span class="muted" style="font-size:12px">暂无事件</span>'}</td>
       </tr>`;
