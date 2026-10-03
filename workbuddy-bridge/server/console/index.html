@@ -29,11 +29,12 @@ header{display:flex;align-items:center;gap:14px;padding:14px 22px;border-bottom:
 .alertbar.red{background:rgba(224,92,92,.12);border-color:rgba(224,92,92,.45);color:#ff9c9c}
 .alertbar.orange{background:rgba(224,168,60,.12);border-color:rgba(224,168,60,.45);color:#ffd48a}
 /* 接入指南页的配置片段 */
-#tab-guide pre{background:#0a0c10;border:1px solid var(--line);border-radius:8px;padding:12px;font:12.5px/1.6 Consolas,monospace;white-space:pre-wrap;word-break:break-all;margin:0}
-#tab-guide code{background:var(--chip);border-radius:5px;padding:1px 7px;font-size:12.5px}
-nav{display:flex;gap:4px;padding:10px 22px 0;border-bottom:1px solid var(--line)}
-nav button{background:none;border:none;color:var(--muted);padding:9px 16px;font-size:14px;cursor:pointer;border-bottom:2px solid transparent}
-nav button.on{color:var(--text);border-bottom-color:var(--accent)}
+#sec-guide pre{background:#0a0c10;border:1px solid var(--line);border-radius:8px;padding:12px;font:12.5px/1.6 Consolas,monospace;white-space:pre-wrap;word-break:break-all;margin:0}
+#sec-guide code{background:var(--chip);border-radius:5px;padding:1px 7px;font-size:12.5px}
+/* 0.3.24 无页签：返回条取代页签导航（sticky，长子页面滚到哪都能回大屏） */
+#backBar{display:flex;align-items:center;gap:10px;margin-bottom:16px;position:sticky;top:0;z-index:6;background:var(--bg);padding:10px 0;border-bottom:1px solid var(--line)}
+#backBar[hidden]{display:none}
+#viewTitle{font-size:14.5px}
 main{padding:18px 22px 60px;max-width:1180px;margin:0 auto}
 section[hidden]{display:none}
 h2{font-size:15px;margin:22px 0 10px;display:flex;align-items:center;gap:10px}
@@ -137,6 +138,10 @@ input[type=date]{color-scheme:dark}
 .evline{display:flex;gap:8px;align-items:flex-start;padding:5px 0;border-bottom:1px solid var(--line)}
 .evline:last-child{border-bottom:none}
 .evline>span:last-child{min-width:0}
+/* 大屏下钻：可点的卡片/行给视觉反馈 */
+.kpi2[data-go],.acctline[data-go],.evline[data-go]{cursor:pointer}
+.kpi2[data-go]:hover,.acctline[data-go]:hover{border-color:var(--accent)}
+.panel-h a{cursor:pointer}
 .empty{color:var(--muted);text-align:center;padding:26px;border:1px dashed var(--line);border-radius:10px}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--muted);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:6px}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -152,10 +157,8 @@ input[type=date]{color-scheme:dark}
   /* 预警条独占一行；顶栏太高会把正文挤出屏幕 */
   #alerts{order:4;flex-direction:column;gap:6px}
   .alertbar{font-size:12px;padding:6px 10px;line-height:1.5}
-  /* 8 个页签在 375px 宽屏放不下，折成一行可横向滑动的条 */
-  nav{padding:8px 12px 0;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
-  nav::-webkit-scrollbar{display:none}
-  nav button{padding:9px 12px;font-size:13px;white-space:nowrap;flex:0 0 auto}
+  /* 无页签：返回条在窄屏保持可点（sticky 占位别太高） */
+  #backBar{padding:8px 0}
   main{padding:14px 12px 48px}
   h2{font-size:14px;flex-wrap:wrap;gap:4px 8px;margin:18px 0 8px}
   h2 .sub{flex-basis:100%;font-size:11.5px}
@@ -200,33 +203,30 @@ input[type=date]{color-scheme:dark}
   <div id="srvMeta"></div>
   <div id="alerts"></div>
 </header>
-<nav id="tabs">
-  <button data-tab="overview" class="on">总览</button>
-  <button data-tab="accounts">账号与积分</button>
-  <button data-tab="models">模型</button>
-  <button data-tab="guide">接入</button>
-  <button data-tab="tasks">自动任务</button>
-  <button data-tab="usage">用量</button>
-  <button data-tab="events">事件</button>
-  <button data-tab="health">健康</button>
-  <button data-tab="logs">日志</button>
-</nav>
 <main>
-  <section id="tab-overview"></section>
-  <section id="tab-accounts" hidden></section>
-  <section id="tab-models" hidden></section>
-  <section id="tab-guide" hidden></section>
-  <section id="tab-tasks" hidden></section>
-  <section id="tab-usage" hidden></section>
-  <section id="tab-events" hidden></section>
-  <section id="tab-health" hidden></section>
-  <section id="tab-logs" hidden>
-    <div class="row" style="margin-bottom:10px">
-      <button class="btn mini" id="logPause">暂停滚动</button>
-      <button class="btn mini" id="logClear">清屏</button>
-      <span class="muted" style="font-size:12px">实时日志（长轮询，仅本机内存最近 500 条）</span>
+  <!-- 0.3.24：无页签架构 —— 大屏是控制台本体，子页面只从大屏面板下钻进入，返回条/浏览器历史负责回退 -->
+  <div id="backBar" hidden>
+    <button class="btn mini" id="btnHome">← 返回大屏</button>
+    <b id="viewTitle"></b>
+    <span class="muted" id="viewHint" style="font-size:12px"></span>
+  </div>
+  <section id="view-home"></section>
+  <section id="view-accounts" hidden></section>
+  <section id="view-models" hidden></section>
+  <section id="view-tasks" hidden></section>
+  <section id="view-usage" hidden></section>
+  <section id="view-events" hidden></section>
+  <section id="view-settings" hidden>
+    <div id="sec-guide"></div>
+    <div id="sec-health" style="margin-top:22px"></div>
+    <div style="margin-top:22px">
+      <div class="row" style="margin-bottom:10px">
+        <button class="btn mini" id="logPause">暂停滚动</button>
+        <button class="btn mini" id="logClear">清屏</button>
+        <span class="muted" style="font-size:12px">实时日志（长轮询，仅本机内存最近 500 条）</span>
+      </div>
+      <div id="logBox"></div>
     </div>
-    <div id="logBox"></div>
   </section>
 </main>
 <div id="modalRoot"></div>
@@ -292,8 +292,6 @@ const dur = (ms) => {
 };
 
 /* ---------- 全局状态与 Tab ---------- */
-const TABS = ['overview', 'accounts', 'models', 'guide', 'tasks', 'usage', 'events', 'health', 'logs'];
-let active = 'overview';
 let refreshTimer = null, logTimer = null, logSeq = 0, logPaused = false, STATE = null;
 
 /* 仅当内容变化时才重建 DOM：页签轮询 / SSE 推送触发的重复渲染不再引发整页闪烁。
@@ -306,22 +304,45 @@ function paint(el, html) {
   return true;
 }
 
-function switchTab(name) {
+/* ---------- 0.3.24 视图路由：无页签，大屏(home)为唯一主页面，其余全部是下钻子页面 ----------
+ * 导航模型：大屏面板/卡片点「详情」进子页面 → 返回条「← 返回大屏」或浏览器后退回大屏；
+ * location.hash 同步（#/accounts 等），刷新/转发链接都能直接落到对应子页面。 */
+const VIEWS = ['home', 'accounts', 'models', 'tasks', 'usage', 'events', 'settings'];
+const VIEW_META = {
+  accounts: ['账号与积分', '账号卡 · 到期批次 · 策略 · 扫码登录'],
+  models: ['模型库', '清单 · 倍率 · 巡检 · 设为默认'],
+  tasks: ['任务中心', '签到 · 成长任务 · 猫猫旅行 · 日历'],
+  usage: ['用量分析', '消耗图表 · 按模型/账号 · CSV 导出'],
+  events: ['事件时间线', '任务 / 账号 / 策略 / 登录 回放'],
+  settings: ['接入与运维', '接入配置 · 通知 · 备份 · 诊断 · 日志'],
+};
+let active = 'home';
+
+function parseHash() {
+  const m = (location.hash || '').match(/^#\/(\w+)/);
+  return m && VIEWS.includes(m[1]) ? m[1] : 'home';
+}
+
+function showView(name) {
   active = name;
-  for (const t of TABS) $('#tab-' + t).hidden = t !== name;
-  for (const b of $('#tabs').children) b.classList.toggle('on', b.dataset.tab === name);
+  for (const v of VIEWS) { const el = $('#view-' + v); if (el) el.hidden = v !== name; }
+  $('#backBar').hidden = name === 'home';
+  const meta = VIEW_META[name];
+  if (meta) { $('#viewTitle').textContent = meta[0]; $('#viewHint').textContent = meta[1]; }
+  const want = name === 'home' ? '' : '#/' + name;
+  if ((location.hash || '') !== want) location.hash = want; // 触发 hashchange（同值时浏览器不触发）
   clearInterval(refreshTimer); clearInterval(logTimer); logTimer = null;
-  if (name === 'overview') { loadOverview(); refreshTimer = setInterval(loadOverview, 30000); }
+  window.scrollTo(0, 0); // 子页面从顶部开始看
+  if (name === 'home') { loadOverview(); void loadTcSummary(); refreshTimer = setInterval(loadOverview, 30000); }
   if (name === 'accounts') { loadAccounts(); refreshTimer = setInterval(loadAccounts, 30000); }
   if (name === 'models') { loadModels(); refreshTimer = setInterval(loadModels, 60000); }
-  if (name === 'guide') loadGuide();
   if (name === 'tasks') { loadTasks(); loadTaskCenter(); refreshTimer = setInterval(loadTasks, 30000); }
   if (name === 'usage') { loadUsage(); refreshTimer = setInterval(loadUsage, 60000); }
   if (name === 'events') { loadEvents(); refreshTimer = setInterval(loadEvents, 30000); }
-  if (name === 'health') { loadHealth(); refreshTimer = setInterval(loadHealth, 30000); }
-  if (name === 'logs') startLogs();
+  if (name === 'settings') { loadGuide(); loadHealth(); startLogs(); refreshTimer = setInterval(loadHealth, 30000); }
 }
-for (const b of $('#tabs').children) b.onclick = () => switchTab(b.dataset.tab);
+window.addEventListener('hashchange', () => { const v = parseHash(); if (v !== active) showView(v); });
+$('#btnHome').onclick = () => showView('home');
 $('#logPause').onclick = () => { logPaused = !logPaused; $('#logPause').textContent = logPaused ? '继续滚动' : '暂停滚动'; };
 $('#logClear').onclick = () => { $('#logBox').textContent = ''; logSeq = 0; };
 
@@ -334,7 +355,7 @@ async function loadHeader() {
     `<span class="pill"><span class="dot ${anyLogin ? 'ok' : ''}"></span>${anyLogin ? '运行中' : '未登录账号'}</span>` +
     `<span class="pill" title="点击复制 Base URL" onclick='copy(${JSON.stringify(STATE.base_url)},"Base URL")'>${esc(STATE.base_url)}</span>` +
     `<span class="pill" style="color:#9fc4ff" title="复制 ZCode 模型供应商接入配置" id="copyCfg">⧉ 复制 ZCode 配置</span>` +
-    `<span class="pill" title="默认模型（点击到模型页修改）">默认：${esc(STATE.default_model)}</span>` +
+    `<span class="pill" style="cursor:pointer" title="点击到模型库修改默认模型" onclick='showView("models")'>默认：${esc(STATE.default_model)}</span>` +
     `<span class="pill" title="本次服务运行时长">已运行 ${dur(STATE.uptime_ms || 0)}</span>`;
   $('#copyCfg').onclick = async () => {
     try {
@@ -352,19 +373,47 @@ async function loadHeader() {
   };
 }
 
-/* ---------- Tab 0：总览大屏（0.3.23，数据大屏式布局） ----------
- * 设计目标：一屏看全局，不进子页签就能回答「还剩多少分 / 今天跑了什么 / 速率如何 / 出了什么事」。
- * 数据全部复用现有接口（/bridge /usage /tasks /events /state），零后端改动；
- * 30s 轮询 + SSE 推送都走 paint()，数据没变不动 DOM。每个面板右上角可跳对应子页签。 */
-async function loadOverview() {
-  const el = $('#tab-overview');
+/* ---------- 大屏主页（0.3.24，无页签架构的唯一主页面） ----------
+ * 数据大屏思维：一屏回答「还剩多少分 / 今天跑了什么 / 用哪个模型 / 出了什么事」，
+ * 所有卡片都可下钻进子页面（账号/模型/任务/用量/事件/设置），返回条或浏览器后退回来。
+ * 数据全部复用现有接口（/bridge /usage /tasks /events /state /models /health），零后端改动；
+ * 30s 轮询 + SSE 推送都走 paint()，数据没变不动 DOM。 */
+let tcSummary = null; // 大屏任务摘要：{ at, rows:[{site,id,label,claimable,playable,at,error}] }
+async function loadTcSummary() {
+  if (tcSummary && Date.now() - tcSummary.at < 10 * 60_000) return; // 10 分钟内不重复拉
+  tcSummary = { at: Date.now(), rows: [], loading: true };
   try {
-    const [bridge, usage, tasks, evts, state] = await Promise.all([
+    const b = await api('/bridge');
+    const list = [];
+    for (const s of b.sites || []) for (const a of s.accounts || []) {
+      if (a.enabled === false) continue;
+      list.push({ site: s.site, id: a.id, label: a.label || a.nickname || a.id, claimable: 0, playable: 0, at: null, error: null });
+    }
+    tcSummary = { at: Date.now(), rows: list };
+    await Promise.all(list.map(async (x) => {
+      try {
+        // 非强制：走服务端缓存（每日 listTimes 预取 + 6h TTL），不会连续打上游
+        const r = await api('/task-center?site=' + encodeURIComponent(x.site) + '&accountId=' + encodeURIComponent(x.id));
+        x.claimable = (r.tasks || []).filter((t) => t.claimable && !t.claimed).length;
+        x.playable = (r.tasks || []).filter((t) => t.autoplayable && !t.claimable).length;
+        x.at = r.cachedAt || null;
+      } catch (e) { x.error = e.message; }
+    }));
+  } catch (e) { tcSummary = { at: Date.now(), rows: [], error: e.message }; }
+  if (active === 'home') loadOverview(); // 回填渲染（paint 自会防抖）
+}
+
+async function loadOverview() {
+  const el = $('#view-home');
+  try {
+    const [bridge, usage, tasks, evts, state, modelsResp, health] = await Promise.all([
       api('/bridge'),
       api('/usage?days=7'),
       api('/tasks'),
       api('/events').catch(() => ({ events: [] })),
       api('/state'),
+      api('/models').catch(() => null),
+      api('/health').catch(() => null),
     ]);
     STATE = state; // 顶栏的运行时长/状态随之保鲜
     const accts = [];
@@ -390,15 +439,15 @@ async function loadOverview() {
     };
     const ck = taskState(tasks.checkin), gr = taskState(tasks.growth), tv = taskState(tasks.travel);
 
-    // ---- KPI 横幅 ----
+    // ---- KPI 横幅（全部可点下钻） ----
     const anyLogin = (state.sites || []).some((s) => s.logged_in);
     const kpis = `
-      <div class="kpi2"><b class="ok">${fmtCredit(totalRemain)}</b><span>可用积分余额 · ${enabled.length} 个账号</span></div>
-      <div class="kpi2"><b class="warn">${fmtCredit(today.credit ?? 0)}</b><span>今日消耗积分</span></div>
-      <div class="kpi2"><b>${today.calls ?? 0}</b><span>今日调用 · 错误 ${today.errors ?? 0}</span></div>
-      <div class="kpi2"><b class="${weekExpiry > 0 ? 'warn' : ''}">${fmtCredit(weekExpiry)}</b><span>7 天内到期积分</span></div>
-      <div class="kpi2"><b>${enabled.filter((x) => !String(x.a.lastError || x.a.last_error || '').includes('401')).length}<span style="font-size:14px;color:var(--muted)">/${enabled.length}</span></b><span>健康账号（401 视为失效）</span></div>
-      <div class="kpi2"><b class="${anyLogin ? 'ok' : 'bad'}" style="font-size:18px;padding-top:5px">${anyLogin ? '● 运行中' : '○ 未登录'}</b><span>服务 · 已运行 ${dur(state.uptime_ms || 0)}</span></div>`;
+      <div class="kpi2" data-go="accounts"><b class="ok">${fmtCredit(totalRemain)}</b><span>可用积分余额 · ${enabled.length} 个账号</span></div>
+      <div class="kpi2" data-go="usage"><b class="warn">${fmtCredit(today.credit ?? 0)}</b><span>今日消耗积分</span></div>
+      <div class="kpi2" data-go="usage"><b>${today.calls ?? 0}</b><span>今日调用 · 错误 ${today.errors ?? 0}</span></div>
+      <div class="kpi2" data-go="accounts"><b class="${weekExpiry > 0 ? 'warn' : ''}">${fmtCredit(weekExpiry)}</b><span>7 天内到期积分</span></div>
+      <div class="kpi2" data-go="accounts"><b>${enabled.filter((x) => !String(x.a.lastError || x.a.last_error || '').includes('401')).length}<span style="font-size:14px;color:var(--muted)">/${enabled.length}</span></b><span>健康账号（401 视为失效）</span></div>
+      <div class="kpi2" data-go="settings"><b class="${anyLogin ? 'ok' : 'bad'}" style="font-size:18px;padding-top:5px">${anyLogin ? '● 运行中' : '○ 未登录'}</b><span>服务 · 已运行 ${dur(state.uptime_ms || 0)}</span></div>`;
 
     // ---- 面板 1：积分与到期（每账号一行：名称 + 余额大字 + 最近到期批次条） ----
     const accRows = enabled.map((x) => {
@@ -410,7 +459,7 @@ async function loadOverview() {
       const pct = d === null ? 0 : Math.max(4, Math.min(100, Math.round(d / 30 * 100)));
       const col = d === null ? 'var(--chip)' : d <= 7 ? 'var(--bad)' : d <= 30 ? 'var(--warn)' : 'var(--ok)';
       const active = x.site.active_account_id === x.a.id;
-      return `<div class="acctline">
+      return `<div class="acctline" data-go="accounts" title="点开管理该账号">
         <b style="min-width:104px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(accNames[x.a.id] || x.a.id)}</b>
         ${active ? '<span class="badge ok">使用中</span>' : '<span class="badge" style="visibility:hidden">占位</span>'}
         <b style="font-size:19px;min-width:76px;text-align:right" class="${d !== null && d <= 7 ? 'warn' : ''}">${remain != null ? fmtCredit(remain) : '—'}</b>
@@ -421,11 +470,20 @@ async function loadOverview() {
       </div>`;
     }).join('');
 
-    // ---- 面板 2：今日自动任务（三个状态块 + 快捷执行 + 待领提示） ----
+    // ---- 面板 2：今日自动任务（状态块 + 每账号任务摘要 + 快捷执行） ----
     const taskTile = (name, st) => `<div class="tile">
       <b class="${st.done ? 'ok' : st.some ? 'warn' : ''}">${st.done ? '✓ 全部完成' : st.some ? st.ok + '/' + st.total : '— 未执行'}</b>
       <span>${name}</span></div>`;
-    const claimable = lastTcData ? (lastTcData.tasks || []).filter((x) => x.claimable && !x.claimed).length : null;
+    let tcRows = '';
+    if (!tcSummary) tcRows = '';
+    else if (tcSummary.loading) tcRows = '<div class="muted" style="font-size:12px;margin-top:10px"><span class="spin"></span>正在读取任务进度…</div>';
+    else if (tcSummary.error) tcRows = `<div class="bad" style="font-size:12px;margin-top:10px">任务摘要读取失败：${esc(tcSummary.error)}</div>`;
+    else tcRows = tcSummary.rows.map((r) => `<div class="evline" data-go="tasks" style="cursor:pointer">
+        <b style="font-size:12.5px;min-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.label)}</b>
+        ${r.error ? `<span class="bad" style="font-size:12px">读取失败</span>`
+          : `<span style="font-size:12.5px">待领 <b class="${r.claimable ? 'warn' : ''}">${r.claimable ?? 0}</b> · 可代打 <b>${r.playable ?? 0}</b></span>
+             <span class="muted" style="font-size:11px;margin-left:auto">数据 ${r.at ? esc(new Date(r.at).toLocaleTimeString()) : '—'}</span>`}
+      </div>`).join('');
     const g = tasks.gainedTotal || { credit: 0, claims: 0 };
 
     // ---- 面板 3：近 7 天消耗柱图 ----
@@ -441,29 +499,71 @@ async function loadOverview() {
       return `<div class="evline"><span class="muted" style="font-size:11.5px;white-space:nowrap">${esc(new Date(e.at).toLocaleTimeString())}</span><span class="badge ${EVENT_BADGE[e.kind] || ''}" style="flex:0 0 auto">${esc(kind)}</span><span style="font-size:12.5px;overflow:hidden">${esc(e.text)}${e.site ? ` · ${esc(e.site)}` : ''}${who}</span></div>`;
     }).join('');
 
+    // ---- 面板 5：推荐模型（巡检性价比 Top3，可直接设默认） ----
+    const mres = (modelsResp && modelsResp.data) || [];
+    const defModel = modelsResp ? modelsResp.default_model : null;
+    const hres = (health && health.results) || [];
+    const hByModel = {};
+    for (const r of hres) if (r.ok && !hByModel[r.model]) hByModel[r.model] = r; // results 已按性价比排序
+    let topModels = Object.entries(hByModel).map(([id, r]) => ({ id, site: r.site, mult: r.mult, ms: r.ms })).slice(0, 3);
+    if (!topModels.length) {
+      topModels = mres.filter((x) => !x.pending_login)
+        .sort((p, q) => (p.multiplier ?? 99) - (q.multiplier ?? 99))
+        .slice(0, 3).map((x) => ({ id: x.id, site: x.site, mult: x.multiplier, ms: null }));
+    }
+    const topRows = topModels.map((r) => `<div class="acctline">
+        <b style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.id)}</b>
+        ${r.mult === 0 ? '<span class="badge ok">免费</span>' : r.mult != null ? `<span class="badge">x${r.mult}</span>` : ''}
+        <span class="muted" style="font-size:12px;min-width:60px;text-align:right">${r.ms != null ? r.ms + ' ms' : '—'}</span>
+        ${r.id === defModel ? '<span class="badge acc">默认</span>' : `<button class="btn mini" data-setdef="${esc(r.id)}" data-site="${esc(r.site || '')}">设默认</button>`}
+      </div>`).join('');
+
     const changed = paint(el, `
       <div class="kpis6">${kpis}</div>
       <div class="dash">
-        <div class="card"><div class="panel-h"><b>积分与到期</b><span class="sub">策略 ${esc(bridge.policy || 'expiry-first')} · 到期优先自动换号</span><a data-go="accounts">账号详情 →</a></div>
-          ${accRows || '<div class="muted" style="padding:14px">还没有账号 —— 到「账号与积分」页添加</div>'}</div>
+        <div class="card"><div class="panel-h"><b>积分与到期</b><span class="sub">策略 ${esc(bridge.policy || 'expiry-first')} · 点行管理</span><a data-go="accounts">账号管理 →</a></div>
+          ${accRows || '<div class="muted" style="padding:14px">还没有账号 —— 点右上角「账号管理 →」添加</div>'}</div>
         <div class="card"><div class="panel-h"><b>今日自动任务</b><span class="sub">${esc(tasks.today || '')}</span><a data-go="tasks">任务中心 →</a></div>
           <div style="display:flex;gap:10px;margin-bottom:12px">${taskTile('每日签到', ck)}${taskTile('成长任务', gr)}${taskTile('猫猫旅行', tv)}</div>
-          <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
-            ${claimable ? `<span class="badge warn">任务中心有 ${claimable} 个奖励可领</span>` : ''}
+          ${tcRows}
+          <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px">
             <span class="spacer"></span>
             <button class="btn mini" id="ovCheckin">立即签到</button>
             <button class="btn mini" id="ovGrowth">扫描成长</button>
             <button class="btn mini" id="ovTravel">🐾 巡逻</button>
           </div>
-          <div class="muted" style="font-size:11.5px;margin-top:10px">累计白嫖 ${fmtCredit(g.credit ?? 0)} 积分 · ${g.claims ?? 0} 次领奖（列表数据每日 09:00/15:00/21:00 自动刷新，不实时拉取）</div>
+          <div class="muted" style="font-size:11.5px;margin-top:8px">累计白嫖 ${fmtCredit(g.credit ?? 0)} 积分 · ${g.claims ?? 0} 次领奖 · 任务进度每日 09:00/15:00/21:00 自动刷新，不实时打上游</div>
         </div>
         <div class="card"><div class="panel-h"><b>近 7 天消耗</b><span class="sub">柱高 = 调用次数 · 标注 = 积分</span><a data-go="usage">用量明细 →</a></div>
           <div class="bars" style="height:128px">${trend || '<span class="muted">暂无数据</span>'}</div></div>
         <div class="card"><div class="panel-h"><b>最新事件</b><span class="sub">任务 / 账号 / 策略 / 登录</span><a data-go="events">全部事件 →</a></div>
           ${evRows || '<div class="muted" style="padding:14px">暂无事件</div>'}</div>
+        <div class="card"><div class="panel-h"><b>推荐模型</b><span class="sub">巡检可用 · 倍率低优先</span><a data-go="models">全部模型 →</a></div>
+          ${topRows || '<div class="muted" style="padding:14px">还没有模型 —— 先添加账号</div>'}</div>
+        <div class="card"><div class="panel-h"><b>快捷入口</b><span class="sub">低频功能都收在这</span></div>
+          <div style="display:flex;flex-wrap:wrap;gap:8px">
+            <button class="btn mini" data-go="settings">📖 接入配置</button>
+            <button class="btn mini" data-go="settings">⚙ 设置与运维</button>
+            <button class="btn mini" data-go="events">🔔 全部事件</button>
+            <button class="btn mini" id="ovReloadTc">↻ 刷新任务摘要</button>
+          </div>
+          <div class="muted" style="font-size:11.5px;margin-top:12px">默认模型 <b>${esc(defModel || '—')}</b> · ${esc(state.base_url || '')} · v${esc(state.version || '?')}</div>
+        </div>
       </div>`);
     if (changed) {
-      for (const a of el.querySelectorAll('[data-go]')) a.onclick = () => switchTab(a.dataset.go);
+      for (const a of el.querySelectorAll('[data-go]')) a.onclick = () => showView(a.dataset.go);
+      for (const b of el.querySelectorAll('[data-setdef]')) {
+        b.onclick = async () => {
+          b.disabled = true; b.textContent = '设置中…';
+          try {
+            await api('/default-model', { method: 'POST', body: { model: b.dataset.setdef, site: b.dataset.site } });
+            toast('默认模型 → ' + b.dataset.setdef, 'ok');
+            loadHeader();
+            loadOverview();
+          } catch (e) { toast('设置失败：' + e.message, 'bad'); b.disabled = false; b.textContent = '设默认'; }
+        };
+      }
+      const rt = $('#ovReloadTc'); if (rt) rt.onclick = () => { tcSummary = null; void loadTcSummary(); };
       const bind = (id, kind) => { const b = $(id); if (b) b.onclick = () => runTask(kind); };
       bind('#ovCheckin', 'checkin'); bind('#ovGrowth', 'growth'); bind('#ovTravel', 'travel');
     }
@@ -558,7 +658,7 @@ const POLICIES = [
 ];
 
 async function loadAccounts() {
-  const el = $('#tab-accounts');
+  const el = $('#view-accounts');
   try {
     const [policy, bridge0] = await Promise.all([api('/policy'), api('/bridge')]);
     // 有账号但一个批次明细都没有（还没刷过）→ 自动刷一轮，让到期排序直接可用
@@ -878,7 +978,7 @@ function showImportModal(r) {
 
 /* ---------- Tab 2：模型 ---------- */
 async function loadModels() {
-  const el = $('#tab-models');
+  const el = $('#view-models');
   try {
     const [m, h] = await Promise.all([api('/models'), api('/health').catch(() => null)]);
     const rows = (m.data || []).map((x) => {
@@ -996,7 +1096,7 @@ function capBadge(x, kind) {
 
 /* ---------- Tab：接入指南（各客户端现成可复制的接入配置） ---------- */
 async function loadGuide() {
-  const el = $('#tab-guide');
+  const el = $('#sec-guide');
   try {
     const c = await api('/zcode-config');
     const base = c.base_url;                          // OpenAI 兼容：…/v1
@@ -1089,7 +1189,7 @@ async function loadGuide() {
 
 /* ---------- Tab 3：自动任务 ---------- */
 async function loadTasks() {
-  const el = $('#tab-tasks');
+  const el = $('#view-tasks');
   try {
     const [t, bridge] = await Promise.all([api('/tasks'), api('/bridge')]);
     const cfg = bridge.tasks || {};
@@ -1257,7 +1357,7 @@ async function loadTasks() {
       if (lastTc && accOptions.some((o) => o.site + '|' + o.id === lastTc)) tcSel.value = lastTc;
       tcSel.onchange = () => { localStorage.setItem('wbTcAccount', tcSel.value); loadTaskCenter({ spinner: true }); };
       $('#tcReload').onclick = () => loadTaskCenter({ force: true, spinner: true });
-      if (accOptions.length) renderTcList(); // 回填最近一次数据（switchTab 的按需拉取稍后自动覆盖）
+      if (accOptions.length) renderTcList(); // 回填最近一次数据（showView 的按需拉取稍后自动覆盖）
       else $('#tcList').innerHTML = '<div class="empty" style="padding:14px">没有可用账号</div>';
     }
 
@@ -1399,7 +1499,7 @@ async function runTask(kind) {
 
 /* ---------- Tab 4：用量 ---------- */
 async function loadUsage() {
-  const el = $('#tab-usage');
+  const el = $('#view-usage');
   try {
     const [u, rr, bridge, cc] = await Promise.all([
       api('/usage?days=7'),
@@ -1539,7 +1639,7 @@ const EVENT_BADGE = { system: 'acc', task: 'ok', policy: 'warn', account: 'bad',
 let eventKindFilter = localStorage.getItem('wbEventKind') || '';
 
 async function loadEvents() {
-  const el = $('#tab-events');
+  const el = $('#view-events');
   try {
     const [r, bridge] = await Promise.all([api('/events'), api('/bridge').catch(() => null)]);
     // 账号 id → 显示名（事件里存的是 accountId，展示成用户认识的备注名）
@@ -1583,7 +1683,7 @@ function healthState(a) {
 }
 
   async function loadHealth() {
-    const el = $('#tab-health');
+    const el = $('#sec-health');
     try {
       const [bridge, keys, srr, sec, nt, pc] = await Promise.all([
         api('/bridge'), api('/keys').catch(() => null), api('/schedule-router').catch(() => null),
@@ -2058,7 +2158,7 @@ setInterval(loadAlerts, 60000); // 预警条独立于页签轮询，切页不被
     es.addEventListener('usage', () => maybeRefresh('usage'));
     function maybeRefresh(kind) {
       // 总览大屏：bridge/tasks/usage 任一推送都值得重算（数据没变时 paint() 自会跳过）
-      if (['bridge', 'tasks', 'usage'].includes(kind) && active === 'overview' && !busy.overview) {
+      if (['bridge', 'tasks', 'usage'].includes(kind) && active === 'home' && !busy.overview) {
         busy.overview = true; loadOverview().finally(() => { busy.overview = false; });
       }
       // 只有「推送所属页签正被看着」才重渲染；busy 防抖（用户手动触发的加载不重复）
@@ -2089,7 +2189,7 @@ setInterval(loadAlerts, 60000); // 预警条独立于页签轮询，切页不被
   } catch { /* 不支持就全靠轮询 */ }
 })();
 
-switchTab('overview');
+showView(parseHash());
 </script>
 </body>
 </html>
