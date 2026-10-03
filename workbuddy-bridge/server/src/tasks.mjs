@@ -18,6 +18,9 @@ import { queryCredit, openChat, aggregateFrames } from './upstream.mjs';
 import { billingHeaders } from './headers.mjs';
 import { getAuth, ensureToken } from './auth.mjs';
 import { log, warn } from './log.mjs';
+import { recordEvent } from './events.mjs';
+import { notify, notifyTask } from './notify.mjs';
+import { withRetryOnce } from './util.mjs';
 
 /* ---------------- 状态落盘 ---------------- */
 
@@ -40,6 +43,8 @@ function loadState() {
   if (!state.growth) state.growth = {};   // uid → { date, ok, accepted, claimed, msg }
   if (!state.travel) state.travel = {};   // uid → { date, ok, action, msg }
   if (!state.history) state.history = []; // 最近 200 条运行记录
+  if (!state.checkinDays) state.checkinDays = {}; // T15 签到日历：'YYYY-MM-DD' → [uid,...]
+  if (!state.gainedTotal) state.gainedTotal = { credit: 0, checkins: 0, claims: 0, travels: 0 }; // T15 累计白嫖
   return state;
 }
 
@@ -51,12 +56,42 @@ function saveState() {
   }
 }
 
+const KIND_LABEL = { checkin: '每日签到', growth: '成长任务', travel: '猫猫旅行', 'growth-manual': '任务操作' };
+
 function record(kind, uid, entry) {
   const s = loadState();
+  if (!s[kind]) s[kind] = {}; // 手动操作（growth-manual）等非预置 kind 也能落状态
   s[kind][uid] = { date: todayKey(), ...entry };
   s.history.unshift({ kind, uid, at: new Date().toISOString(), ...entry });
   if (s.history.length > 200) s.history.length = 200;
+  // T15 签到日历 + 累计白嫖统计：签到成功按天记；领到的积分（travel claimed / growth 领奖 /
+  // 签到本身成功）累计。只统计 ok 的正向事件。
+  if (entry.ok) {
+    if (kind === 'checkin') {
+      const day = todayKey();
+      if (!s.checkinDays[day]) s.checkinDays[day] = [];
+      if (!s.checkinDays[day].includes(uid)) s.checkinDays[day].push(uid);
+      s.gainedTotal.checkins += 1;
+    } else if (kind === 'growth' && (entry.creditGained || 0) > 0) {
+      s.gainedTotal.credit += entry.creditGained;
+      s.gainedTotal.claims += entry.claimed || 0;
+    } else if (kind === 'travel' && (entry.credit || 0) > 0) {
+      s.gainedTotal.credit += entry.credit;
+      s.gainedTotal.travels += 1;
+    }
+    // 签到日历最多留 120 天（约 4 个月，一屏放得下）
+    const days = Object.keys(s.checkinDays).sort();
+    while (days.length > 120) {
+      delete s.checkinDays[days.shift()];
+    }
+  }
   saveState();
+  // 事件时间线（T6）：任务结果进入统一时间线。成长任务没有一句话 msg，现场拼一条摘要
+  recordEvent('task', `${KIND_LABEL[kind] || kind} ${entry.ok ? '✓' : '✗'} ${
+    entry.msg || (kind === 'growth'
+      ? `报名 ${entry.accepted ?? 0} · 代打 ${entry.autoChats ?? 0} · 领奖 ${entry.claimed ?? 0} · +${entry.creditGained ?? 0} 积分`
+      : '') || (entry.error ?? '')
+  }`, { site: entry.site, accountId: uid });
 }
 
 /** 该账号今天这一类任务是否已经跑成功过。 */
@@ -194,8 +229,6 @@ async function claimReward(cfg, site, auth, siteCfg, taskCode) {
  * 桥接发极小对话请求（max_tokens 16）即可完成，成本可忽略（x0.06 倍率 ≈ 0.01 积分/次）。
  * 其余类型（公众号关注、体验客户端功能）无法从服务端代打，保持只报名+领奖。
  */
-const CHAT_TASK_RE = [/^Model_chat_(.+)$/i, /^chat_\d+$/i, /^RichMeow_Chat$/i];
-
 function normalizeId(s) {
   return String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 }
@@ -216,46 +249,124 @@ function guessChatModel(suffix, cfg, site) {
   return exact || partial || cfg.defaultModel;
 }
 
-function chatAttemptsFor(task) {
-  for (const re of CHAT_TASK_RE) {
-    const m = String(task.code || '').match(re);
-    if (m) return { match: true, suffix: m[1] || null };
-  }
-  return { match: false };
+/**
+ * 活动代打规则注册表（T16 扩展框架）：
+ * 每个「可通过真实对话点亮进度」的活动声明一条规则：
+ *   { test: (code) => 匹配?, suffix: (match) => 模型后缀或 null, window?: (d) => bool, note?: string }
+ * - test/code 匹配的任务才会被代打；
+ * - suffix 返回非空时用 guessChatModel 反推指定模型（如 Model_chat_GLM5.2）；
+ * - window 限定代打时段（如夜猫子 22:00–02:00），窗口外跳过并记说明；
+ * - 新活动类型（官方以后新增的活动任务）在这里 registerAutoplayRule 一条即可接入，
+ *   autoCompleteChatTasks / runSingleTask / growthTasksView 全部自动识别。
+ */
+const AUTOPLAY_RULES = [
+  { name: 'model_chat', test: (code) => /^Model_chat_(.+)$/i.exec(code), suffix: (m) => m[1] },
+  { name: 'chat_n', test: (code) => /^chat_\d+$/i.test(code), suffix: () => null },
+  { name: 'richmeow', test: (code) => /^RichMeow_Chat$/i.test(code), suffix: () => null },
+  {
+    name: 'black_cat',
+    test: (code) => code === 'black_cat',
+    suffix: () => null,
+    window: (d) => inNightWindow(d),
+    note: '夜猫子任务只在 22:00–02:00 窗口内代打',
+  },
+];
+
+/** 注册新活动规则（插件未来扩展用；运行期注册，重启后回到内置表）。 */
+export function registerAutoplayRule(rule) {
+  if (rule && typeof rule.test === 'function') AUTOPLAY_RULES.push(rule);
 }
 
-/** 对未达标的对话类任务代打极小请求，返回 { chats, tasks }（tasks 是代打过的任务标题）。 */
-async function autoCompleteChatTasks(cfg, site, accountId, tasks) {
+function ruleFor(code) {
+  if (!code) return null;
+  for (const r of AUTOPLAY_RULES) {
+    const m = r.test(code);
+    if (m) return { rule: r, match: m };
+  }
+  return null;
+}
+
+/**
+ * 判断任务此刻是否可代打。返回 { autoplayable, model, why }：
+ * why 非空时表示「类型支持但当前不可代打」的原因（时段窗口等）。
+ */
+function judgeTask(t, cfg, site, now = new Date()) {
+  const hit = ruleFor(t.code);
+  if (!hit) return { autoplayable: false, why: null };
+  const { rule, match } = hit;
+  if (rule.window && !rule.window(now)) return { autoplayable: false, why: rule.note || '不在代打时段窗口内' };
+  const suffix = rule.suffix ? rule.suffix(match) : null;
+  const model = suffix ? guessChatModel(suffix, cfg, site) : cfg.defaultModel;
+  return { autoplayable: true, model, why: null };
+}
+
+/**
+ * 夜猫子任务（black_cat，夜间折扣活动）的代打窗口：本地时间 22:00–02:00。
+ * 窗口跨零点，所以用「小时 ≥22 或 <2」而不是区间比较；抽成纯函数便于单测。
+ */
+export function inNightWindow(d = new Date()) {
+  const h = d.getHours();
+  return h >= 22 || h < 2;
+}
+
+/**
+ * 对未达标的对话类任务代打极小请求。
+ * 返回 { chats, tasks, notes }（tasks 是代打过的任务标题，notes 是给人看的跳过/异常说明）。
+ *
+ * 代打规则走 T16 活动注册表（AUTOPLAY_RULES）：对话体验类 + 夜猫子（black_cat，
+ * 22:00–02:00 窗口）都由 judgeTask 判定；growth 扫描落在窗口外时跳过并记说明，
+ * 不额外为夜猫子安排定时器；次数上限 maxChatsPerTask。
+ */
+async function autoCompleteChatTasks(cfg, site, accountId, tasks, now = new Date()) {
   const cap = Number(cfg.tasks?.maxChatsPerTask) || 5;
-  const todo = tasks.filter((t) => t.code && !t.claimed && t.acceptStatus === 'accepted' && t.current < t.target && chatAttemptsFor(t).match);
+  const notes = [];
+  const todo = [];
+  for (const t of tasks) {
+    if (!t.code || t.claimed || t.acceptStatus !== 'accepted' || t.current >= t.target) continue;
+    const j = judgeTask(t, cfg, site, now);
+    if (!j.autoplayable) {
+      if (j.why) notes.push(`${t.title}：${j.why}，本轮跳过`);
+      continue;
+    }
+    todo.push({ task: t, attempts: Math.min(t.target - t.current, cap), model: j.model });
+  }
   let chats = 0;
   const touched = [];
-  for (const t of todo) {
-    const attempts = Math.min(t.target - t.current, cap);
-    const { suffix } = chatAttemptsFor(t);
-    const model = suffix ? guessChatModel(suffix, cfg, site) : cfg.defaultModel;
-    let okCount = 0;
-    for (let i = 0; i < attempts; i++) {
-      try {
-        const r = await openChat(cfg, site, {
-          model,
-          messages: [{ role: 'user', content: '回复"ok"两个字母即可' }],
-          max_tokens: 64,
-          stream: false,
-        }, { accountId });
-        // 消费完帧再关，保证上游把这次对话计数
-        for await (const _f of r.up.frames) { void _f; }
-        r.up.close();
-        okCount++;
-        chats++;
-      } catch (e) {
-        warn(`[${site}] 任务代打失败（${t.title} 第 ${i + 1} 次）：`, String(e.message || e).slice(0, 120));
-        break;
-      }
-    }
-    if (okCount) touched.push(`${t.title}×${okCount}`);
+  for (const { task: t, attempts, model } of todo) {
+    const r = await autoplayChats(cfg, site, accountId, t, attempts, model);
+    chats += r.chats;
+    if (r.chats) touched.push(`${t.title}×${r.chats}`);
+    if (r.error && !touched.includes(t.title)) notes.push(`${t.title} 代打失败：${r.error}`);
   }
-  return { chats, tasks: touched };
+  return { chats, tasks: touched, notes };
+}
+
+/**
+ * 给单个任务代打 N 次极小对话（T14 单任务代打与扫描共用）。
+ * 返回 { chats, error }——chats 是成功次数，error 是第一次失败的摘要。
+ */
+async function autoplayChats(cfg, site, accountId, task, attempts, model) {
+  let chats = 0;
+  let error = null;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await openChat(cfg, site, {
+        model,
+        messages: [{ role: 'user', content: '回复"ok"两个字母即可' }],
+        max_tokens: 64,
+        stream: false,
+      }, { accountId });
+      // 消费完帧再关，保证上游把这次对话计数
+      for await (const _f of r.up.frames) { void _f; }
+      r.up.close();
+      chats++;
+    } catch (e) {
+      error = String(e.message || e).slice(0, 120);
+      warn(`[${site}] 任务代打失败（${task.title} 第 ${i + 1} 次）：`, error);
+      break;
+    }
+  }
+  return { chats, error };
 }
 
 /**
@@ -281,9 +392,10 @@ export async function growthScanAccount(cfg, site, accountId) {
   // 对话体验类任务代打（可关）；打过之后重新拉一次列表，让新达标的奖励在本轮就被领走
   let autoChats = 0;
   let autoTasks = [];
+  let autoNotes = [];
   if (cfg.tasks?.autoComplete !== false) {
     try {
-      ({ chats: autoChats, tasks: autoTasks } = await autoCompleteChatTasks(cfg, site, accountId, tasks));
+      ({ chats: autoChats, tasks: autoTasks, notes: autoNotes } = await autoCompleteChatTasks(cfg, site, accountId, tasks));
       if (autoChats > 0) tasks = await listGrowthTasks(cfg, site, accountId);
     } catch (e) {
       warn(`[${site}] 对话类任务代打异常：`, e.message);
@@ -303,7 +415,7 @@ export async function growthScanAccount(cfg, site, accountId) {
       warn(`[${site}] 领奖失败（${t.title}）：`, e.message);
     }
   }
-  return { ok: true, accepted, autoChats, autoTasks, claimed, creditGained, tasks: tasks.length };
+  return { ok: true, accepted, autoChats, autoTasks, autoNotes, claimed, creditGained, tasks: tasks.length };
 }
 
 /** 领奖后顺手刷新余额（积分到账要反映到调度缓存里）。 */
@@ -380,15 +492,20 @@ async function runForSite(cfg, site, kind) {
     }
     try {
       const uid = a.uid || a.id;
+      // T12：任务失败自动重试一次（签到/领奖这类操作重试成本为零，上游抖动不该让它失败）
       let result;
       if (kind === 'checkin') {
-        result = await checkinAccount(cfg, site, a.id);
+        result = await withRetryOnce(() => checkinAccount(cfg, site, a.id));
         record('checkin', uid, { ok: true, site, msg: result.msg });
       } else if (kind === 'travel') {
+        // T11 通知：猫猫到站领奖值得弹（旅行要数小时，不看控制台根本不知道）
         result = await travelScanAccount(cfg, site, a.id);
         record('travel', uid, { ok: true, site, action: result.action, msg: result.msg, credit: result.credit });
+        if (result.action === 'claimed') {
+          notifyTask(cfg, '猫猫归来 🐾', `${a.label || a.id}：${result.msg}`, a.id);
+        }
       } else {
-        result = await growthScanAccount(cfg, site, a.id);
+        result = await withRetryOnce(() => growthScanAccount(cfg, site, a.id));
         const { tasks, ...rest } = result;
         record('growth', uid, { ok: true, site, ...rest });
         if (result.claimed > 0) await refreshAfterGain(cfg, site, a.id);
@@ -398,6 +515,8 @@ async function runForSite(cfg, site, kind) {
       const msg = String(e.message || e).slice(0, 200);
       record(kind, a.uid || a.id, { ok: false, site, msg });
       out.push({ id: a.id, label: a.label || a.id, ok: false, error: msg });
+      // T11 通知：任务失败弹一次（节流 5 分钟，同账号同任务不刷屏）
+      notifyTask(cfg, `${KIND_LABEL[kind] || kind}失败 ✗`, `${a.label || a.id}：${msg.slice(0, 120)}`, a.id);
     }
   }
   return out;
@@ -431,8 +550,77 @@ export function taskStatus() {
     growth: s.growth,
     travel: s.travel,
     history: s.history.slice(0, 30),
+    // T15：签到日历（'YYYY-MM-DD' → 当天签到的 uid 数组）与累计白嫖统计
+    checkinDays: s.checkinDays || {},
+    gainedTotal: s.gainedTotal || { credit: 0, checkins: 0, claims: 0, travels: 0 },
     stateFile: statePath(),
   };
+}
+
+/* ---------------- 成长任务中心（T14）：实时视图 + 单任务代打/领奖 ---------------- */
+
+/**
+ * 实时拉取某账号的成长任务列表，并标注「能否代打」（T16 规则判定）。
+ * 控制台「任务中心」用：每个任务一条进度条 + 代打/领奖按钮。
+ */
+export async function growthTasksView(cfg, site, accountId) {
+  const tasks = await listGrowthTasks(cfg, site, accountId);
+  const now = new Date();
+  return tasks.map((t) => {
+    const j = judgeTask(t, cfg, site, now);
+    return {
+      ...t,
+      autoplayable: cfg.tasks?.autoComplete !== false && j.autoplayable && t.current < t.target,
+      autoplayModel: j.model || null,
+      autoplayBlockedReason: j.why || null,
+      remain: Math.max(0, t.target - t.current),
+    };
+  });
+}
+
+/**
+ * 单任务手动代打：按需补齐到 target（受 maxChatsPerTask 上限约束），打完重拉进度。
+ * 与扫描代打共用 autoplayChats，行为一致。
+ */
+export async function runSingleTask(cfg, site, accountId, taskCode, { times = null } = {}) {
+  const tasks = await listGrowthTasks(cfg, site, accountId);
+  const t = tasks.find((x) => x.code === taskCode);
+  if (!t) throw Object.assign(new Error(`任务不存在：${taskCode}`), { status: 404 });
+  if (t.claimed) return { ok: true, chats: 0, msg: '奖励已领取', task: t };
+  const j = judgeTask(t, cfg, site);
+  if (!j.autoplayable) {
+    return { ok: false, chats: 0, msg: j.why || '该任务类型不支持代打（人工任务）', task: t };
+  }
+  const cap = Number(cfg.tasks?.maxChatsPerTask) || 5;
+  const attempts = Math.max(0, Math.min(Number(times) || (t.target - t.current), cap, t.target - t.current));
+  if (!attempts) return { ok: true, chats: 0, msg: '进度已达标，可直接领奖', task: t };
+  const r = await autoplayChats(cfg, site, accountId, t, attempts, j.model);
+  // 打完重拉进度，前端立即看到新进度
+  const fresh = (await listGrowthTasks(cfg, site, accountId)).find((x) => x.code === taskCode) || t;
+  record('growth-manual', accountId, {
+    ok: r.chats > 0, site,
+    msg: `手动代打「${t.title}」${r.chats} 次${r.error ? `，失败：${r.error}` : ''}`,
+  });
+  return {
+    ok: r.chats > 0,
+    chats: r.chats,
+    error: r.error || null,
+    msg: r.chats > 0 ? `代打 ${r.chats} 次完成，进度 ${fresh.current}/${fresh.target}` : `代打失败：${r.error}`,
+    task: fresh,
+  };
+}
+
+/** 单任务领奖（T14；与扫描领奖同一 claimReward 路径）。 */
+export async function claimSingleTask(cfg, site, accountId, taskCode) {
+  const tasks = await listGrowthTasks(cfg, site, accountId);
+  const t = tasks.find((x) => x.code === taskCode);
+  if (!t) throw Object.assign(new Error(`任务不存在：${taskCode}`), { status: 404 });
+  if (!t.claimable) return { ok: false, msg: t.claimed ? '奖励已领取过' : `进度未达标（${t.current}/${t.target}）`, task: t };
+  const auth = getAuth(site);
+  const r = await claimReward(cfg, site, auth, cfg.sites[site], t.code);
+  record('growth-manual', accountId, { ok: true, site, msg: `手动领奖「${t.title}」+${r.credit} 积分`, credit: r.credit });
+  if (r.credit > 0) await refreshAfterGain(cfg, site, accountId);
+  return { ok: true, credit: r.credit, msg: `已领取「${t.title}」+${r.credit} 积分`, task: t };
 }
 
 /* ---------------- 定时循环 ---------------- */

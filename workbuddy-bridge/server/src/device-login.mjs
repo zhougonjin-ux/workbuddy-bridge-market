@@ -3,6 +3,7 @@
 import { hydrateFromToken } from './auth.mjs';
 import { addAccount } from './pool.mjs';
 import { commonHeaders } from './headers.mjs';
+import { recordEvent } from './events.mjs';
 
 const jars = new Map(); // site → Map(cookie)
 
@@ -86,5 +87,7 @@ export async function pollLogin(cfg, site, state, { label = null } = {}) {
   // 加进号池：同一 uid 会覆盖更新，不同 uid 则新增一个账号。
   // 首个账号加入时会自动把旧的单账号凭证并进池（用户无感迁移）。
   const saved = addAccount(site, auth, { label });
+  // 事件时间线（T6）：登录成功是时间线上最有用的锚点之一（登录态失效后何时被修复）
+  recordEvent('login', `账号登录成功：${saved.label || saved.nickname || saved.id}（${site}）`, { site, accountId: saved.id });
   return { done: true, auth: saved };
 }

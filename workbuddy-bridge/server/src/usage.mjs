@@ -94,7 +94,7 @@ export function flushUsage() {
 
 function dayOf(key = todayKey()) {
   ensureLoaded();
-  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, models: {} };
+  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, hours: {}, models: {} };
   return data.days[key];
 }
 
@@ -108,6 +108,18 @@ export function recordUsage({ site, model, mode, status, promptTokens = 0, compl
   day.completionTokens += completionTokens || 0;
   day.credit += credit || 0;
   day.ms = (day.ms || 0) + (ms || 0); // 供「平均输出速度」= Σcompletion / Σms 计算
+  // 小时分布（T7）：本地小时为键，控制台「今日小时分布」柱状图用。
+  // 旧版本落盘的 day 可能没有 hours 字段，这里就地补。
+  if (!day.hours) day.hours = {};
+  const hk = String(new Date().getHours());
+  if (!day.hours[hk]) day.hours[hk] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0 };
+  const h = day.hours[hk];
+  h.calls += 1;
+  if (!ok) h.errors += 1;
+  h.promptTokens += promptTokens || 0;
+  h.completionTokens += completionTokens || 0;
+  h.credit += credit || 0;
+  h.ms += ms || 0;
   const key = `${site}/${model}`;
   if (!day.models[key]) day.models[key] = { site, model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, tools: 0 };
   const m = day.models[key];
@@ -137,11 +149,17 @@ export function recordBalance(site, remain) {
   scheduleSave();
 }
 
-/** 汇总：今天 / 最近 N 天 / 按模型排行 / 余额趋势。 */
+/** 汇总：今天 / 最近 N 天 / 按模型排行 / 余额趋势 / 今日小时分布。 */
 export function usageSnapshot(days = 7) {
   ensureLoaded();
   const today = todayKey();
   const t = data.days[today] || { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, models: {} };
+  // 今日小时分布（T7）：固定 24 桶（本地时区），旧数据没有 hours 字段时全为 0
+  const todayHours = [];
+  for (let i = 0; i < 24; i++) {
+    const b = (t.hours || {})[String(i)] || {};
+    todayHours.push({ hour: i, calls: b.calls || 0, errors: b.errors || 0, credit: b.credit || 0, completionTokens: b.completionTokens || 0 });
+  }
   const keys = Object.keys(data.days).sort().slice(-days);
   const recent = keys.map((k) => ({ date: k, ...data.days[k], models: undefined }));
   const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0 };
@@ -166,7 +184,8 @@ export function usageSnapshot(days = 7) {
     }
   }
   return {
-    today: { date: today, ...t, models: undefined },
+    today: { date: today, ...t, hours: undefined, models: undefined },
+    todayHours,
     todayByModel: Object.values(t.models || {}).sort((a, b) => b.calls - a.calls),
     recent,
     totals,
@@ -181,4 +200,20 @@ export function resetUsage() {
   dirty = true;
   loadedFrom = file(); // 标记为已加载，避免下次调用又把旧文件读回来
   saveNow();
+}
+
+/**
+ * 今日各「site/model」的平均单次 credit 消耗（credit 异常检测的基线，T9）。
+ * 按模型而不是全站均值：不同模型倍率差一个数量级，混在一起基线就失真了。
+ * calls=0 或 credit=0（免费模型）的不返回——没有基线就不判异常。
+ */
+export function todayAvgCreditByModel() {
+  ensureLoaded();
+  const out = {};
+  const t = data.days[todayKey()];
+  if (!t) return out;
+  for (const m of Object.values(t.models || {})) {
+    if (m.calls > 0 && m.credit > 0) out[`${m.site}/${m.model}`] = m.credit / m.calls;
+  }
+  return out;
 }

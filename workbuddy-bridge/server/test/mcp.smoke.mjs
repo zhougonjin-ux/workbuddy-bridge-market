@@ -45,7 +45,7 @@ const call = await waitFor(3);
 const text = call.result?.content?.[0]?.text || '';
 console.log('wb_status →', call.result?.isError ? 'ERROR: ' + text.slice(0, 120) : text.split('\n').slice(0, 4).join(' | '));
 
-const ok = init.result?.serverInfo?.name === 'workbuddy-bridge' && list.result.tools.length === 9 && typeof text === 'string' && text.includes('调度策略');
+const ok = init.result?.serverInfo?.name === 'workbuddy-bridge' && list.result.tools.length === 12 && typeof text === 'string' && text.includes('调度策略');
 console.log(ok ? 'MCP-SMOKE-OK' : 'MCP-SMOKE-FAIL');
 child.kill();
 process.exit(ok ? 0 : 1);

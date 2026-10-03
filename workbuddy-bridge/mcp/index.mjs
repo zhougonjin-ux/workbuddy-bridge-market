@@ -126,11 +126,11 @@ const TOOLS = [
   },
   {
     name: 'wb_switch',
-    description: '切换 WorkBuddy 账号调度策略或固定某个账号。policy 取值：expiry-first（最早到期优先，默认）/ balance-first（余额优先）/ round-robin（轮询）/ pinned（固定账号，需给 accountId）。',
+    description: '切换 WorkBuddy 账号调度策略或固定某个账号。policy 取值：expiry-first（最早到期优先，默认）/ balance-first（余额优先）/ round-robin（轮询）/ pinned（固定账号，需给 accountId）/ free-first（有 0 倍率免费站点的模型优先走免费站点）。',
     inputSchema: {
       type: 'object',
       properties: {
-        policy: { type: 'string', enum: ['expiry-first', 'balance-first', 'round-robin', 'pinned'], description: '调度策略' },
+        policy: { type: 'string', enum: ['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first'], description: '调度策略' },
         accountId: { type: 'string', description: 'pinned 策略下固定使用的账号 id（wb_status 里可查）' },
       },
       required: ['policy'],
@@ -223,6 +223,81 @@ const TOOLS = [
     description: '查看自动任务的今日执行状态与历史记录。',
     inputSchema: { type: 'object', properties: {} },
     run: async (cfg) => renderTasks(await callLocal(cfg, '/admin/tasks')),
+  },
+  {
+    name: 'wb_travel_patrol',
+    description: '派猫猫旅行巡逻（立即跑一轮）：到站领奖 / 空闲则派出 / 旅行中则报告进度。状态机幂等，一天可多次。',
+    inputSchema: { type: 'object', properties: {} },
+    run: async (cfg) => {
+      const r = await callLocal(cfg, '/admin/tasks/run', { method: 'POST', body: { kind: 'travel' } });
+      const lines = [];
+      for (const [key, list] of Object.entries(r.results || {})) {
+        for (const x of list) lines.push(`  · [${key}] ${x.label || x.id}: ${x.msg || x.error || (x.skipped ? '今日已跑过' : '完成')}`);
+      }
+      return `猫猫巡逻结果：\n${lines.join('\n') || '（没有账号）'}`;
+    },
+  },
+  {
+    name: 'wb_recent_requests',
+    description: '查看最近的模型请求明细（最多 50 条，新→旧）：时间/模型/模式/耗时/tok/s/消耗积分，含异常消耗标注。排查速度与费用时用它。',
+    inputSchema: {
+      type: 'object',
+      properties: { limit: { type: 'number', description: '返回条数，默认 20，最大 50' } },
+    },
+    run: async (cfg, args) => {
+      const n = Math.min(50, Math.max(1, Number(args?.limit) || 20));
+      const r = await callLocal(cfg, `/console/api/recent-requests`);
+      const list = (r.requests || []).slice(0, n);
+      if (!list.length) return '还没有请求记录。';
+      const lines = list.map((x) => {
+        const t = new Date(x.at).toLocaleTimeString();
+        const tok = x.tok_s ? `${x.tok_s} tok/s` : x.completion != null ? `${x.completion} tok` : '';
+        return `  · ${t}  ${x.model}（${x.site}）${x.mode} ${x.status}${tok ? `  ${tok}` : ''}${x.ms ? `  ${x.ms}ms` : ''}${x.credit != null ? `  ${x.credit}分` : ''}${x.anomaly ? '  ⚠️异常消耗' : ''}${x.note ? `  ${x.note}` : ''}`;
+      });
+      return `最近 ${list.length} 条请求：\n${lines.join('\n')}`;
+    },
+  },
+  {
+    name: 'wb_task_play',
+    description: '单任务代打/领奖（成长任务中心）：对指定任务手动代打几次极小对话或领取已达标的奖励。先用 wb_tasks_status 或控制台任务中心看任务 code。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        action: { type: 'string', enum: ['play', 'claim'], description: 'play=代打几次对话点亮进度；claim=领取达标奖励' },
+        accountId: { type: 'string', description: '账号 id（wb_status 里可查）；缺省用第一个可用账号' },
+        code: { type: 'string', description: '任务 code（如 Model_chat_GLM5.2、black_cat）' },
+        times: { type: 'string', description: 'play 时代打次数（默认补齐到 target，受单任务上限约束）' },
+      },
+      required: ['action', 'code'],
+    },
+    run: async (cfg, args) => {
+      const code = String(args.code || '').trim();
+      if (!code) return '缺少任务 code（先在控制台任务中心或 wb_tasks_status 里看任务列表）。';
+      let site = null, accountId = String(args.accountId || '');
+      if (accountId) {
+        // 从桥接状态反查账号所在站点
+        const b = await callLocal(cfg, '/admin/bridge');
+        for (const s of b.sites || []) {
+          if ((s.accounts || []).some((a) => a.id === accountId)) { site = s.site; break; }
+        }
+        if (!site) return `找不到账号 ${accountId}（wb_status 里可查账号 id）。`;
+      } else {
+        const b = await callLocal(cfg, '/admin/bridge');
+        for (const s of b.sites || []) {
+          const usable = (s.accounts || []).find((a) => a.enabled !== false && !a.exhaustedAt);
+          if (usable) { site = s.site; accountId = usable.id; break; }
+        }
+        if (!site) return '没有可用账号，先添加账号。';
+      }
+      if (args.action === 'claim') {
+        const r = await callLocal(cfg, '/console/api/task-center/claim', { method: 'POST', body: { site, accountId, code } });
+        return r.ok ? `已领取：${r.msg}` : `领不了：${r.msg}`;
+      }
+      const body = { site, accountId, code };
+      if (args.times != null) body.times = Number(args.times) || undefined;
+      const r = await callLocal(cfg, '/console/api/task-center/play', { method: 'POST', body });
+      return `${r.ok ? '✅' : '✗'} ${r.msg}${r.error ? `（${r.error}）` : ''}`;
+    },
   },
 ];
 

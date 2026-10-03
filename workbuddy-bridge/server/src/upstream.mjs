@@ -15,10 +15,14 @@ import {
   calibrationFactor,
   calibrateEstimate,
   parseActualTokens,
+  recordCompression,
+  sessionMemoBudget,
+  rememberSessionBudget,
 } from './compress.mjs';
 import { chatHeaders, billingHeaders } from './headers.mjs';
 import { normalizeCreditDetail } from './expiry.mjs';
 import { warn } from './log.mjs';
+import { waitForUpstreamSlot, reportUpstream429 } from './coordination.mjs';
 
 /**
  * 上游对 system 消息做「客户端指纹」精确匹配，命中就回：
@@ -242,6 +246,25 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
       + (fit.sideTokens ? `，另扣掉不参与裁剪的工具定义 ${fit.sideTokens} tokens` : '')
       + '）',
     );
+    recordCompression(site, model, fit); // T10：压缩统计可视化
+    rememberSessionBudget(payload.messages, fit.after, { site, model }); // T28：同会话下个请求免撞 400
+  } else if (cfg.context?.enabled !== false && site) {
+    // T28：预压缩没触发（多数是估算「以为装得下」）但会话记忆说「这个会话上次压过」→
+    // 直接按上次的预算压一遍。宁可多压也不能赌估算——上次就是因为低估才撞的 400。
+    const memo = sessionMemoBudget(payload.messages);
+    if (memo && Number.isFinite(memo.budget) && memo.budget > 0) {
+      const 再压 = fitMessages(payload.messages, {
+        maxInputTokens: memo.budget,
+        reserveForOutput: Number(payload.max_tokens) || cfg.context?.reserveForOutput || 4096,
+        minKeepMessages: cfg.context?.minKeepMessages ?? 4,
+        safetyRatio: cfg.context?.safetyRatio ?? 0.95,
+      });
+      if (再压.stats.applied) {
+        payload.messages = 再压.messages;
+        warn(`[${site}] ${model} 命中会话压缩记忆（上次压到 ${memo.budget}），预压缩直接按该预算执行，不再撞 400`);
+        recordCompression(site, model, 再压.stats, { phase: 'memo' });
+      }
+    }
   }
 
   const ac = new AbortController();
@@ -285,6 +308,11 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
   for (;;) {
     for (let 尝试 = 1; 尝试 <= 最大尝试; 尝试++) {
       try {
+        // T30：全局限流协调——最近任何账号吃过 429 时，先在冷静窗里排队（客户端取消则不等）
+        if (尝试 === 1 && 压缩重试次数 === 0 && signal && !signal.aborted) {
+          const waited = await waitForUpstreamSlot(signal);
+          if (waited > 0) warn(`[${site}] 上游限流冷静窗：本请求排队等待 ${waited}ms 后放行`);
+        }
         res = await fetch(siteCfg.apiBase + '/v2/chat/completions', {
           method: 'POST',
           headers: chatHeaders(siteCfg, auth),
@@ -292,6 +320,7 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
           signal: ac.signal,
         });
         最后错误 = null;
+        if (res.status === 429) reportUpstream429(); // T30：通知全体在途/后续请求进入冷静窗
         break;
       } catch (e) {
         最后错误 = e;
@@ -376,6 +405,8 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
       + (附属 ? `；另有工具定义约 ${附属} tokens 不参与裁剪` : '')
       + '）',
     );
+    recordCompression(site, model, 更小.stats, { phase: 'retry' }); // T10：重试路径的压缩也计入统计
+    rememberSessionBudget(更小.messages, 更小.stats.after, { site, model }); // T28：记下压到的预算，同会话下次直接用
     res = undefined;
   }
   if (!res) {

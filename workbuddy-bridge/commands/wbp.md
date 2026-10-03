@@ -1,51 +1,62 @@
 ---
-description: WorkBuddy 面板：在会话里直接渲染总览（策略/账号/积分到期/任务/用量，无需浏览器；统一 wbp- 前缀）
+description: WorkBuddy 交互面板：渲染总览并给出可点选的操作菜单（回复编号即执行，无需浏览器）
 ---
 
-在当前会话里渲染 WorkBuddy 桥接的完整总览面板（不打开浏览器）。
+在当前会话里渲染 WorkBuddy 桥接的**交互式面板**：总览 + 操作菜单。用户回复菜单编号（如「2」或「2 3」），你执行对应操作后**重渲染整个面板**。
 
-按顺序调用以下 MCP 工具并**把结果整合成一份 markdown 面板**输出给用户：
+## 第一步：采集数据（并行调，全部失败才提示启动）
 
-1. `wb_status` → 调度策略 + 各账号状态
-2. `wb_credit_plan` → 消耗顺序
-3. `wb_tasks_status` → 今日签到/成长任务/猫猫旅行
-4. 用 Bash 请求 `GET http://127.0.0.1:8788/console/api/usage`（带 apiKey 的 `X-Console-Token` 或 `Authorization` 头；apiKey 在 `%USERPROFILE%\.zcode\workbuddy-bridge\config.json`）→ 今日用量
-5. 用 Bash 请求 `GET http://127.0.0.1:8788/console/api/recent-requests`（同样带 apiKey 头）→ 最近请求的 tok/s 明细
+1. `wb_status`（MCP 工具）→ 调度策略 + 各账号余额/到期
+2. `wb_tasks_status` → 今日签到/成长任务/白嫖统计
+3. Bash：`curl -s -H "Authorization: Bearer $(node -pe "JSON.parse(require('fs').readFileSync(process.env.USERPROFILE+'/.zcode/workbuddy-bridge/config.json','utf8')).apiKey")" http://127.0.0.1:8788/console/api/usage` → 今日用量
+4. Bash：同上请求 `/console/api/recent-requests` → 最近请求 tok/s
+5. Bash：同上请求 `/console/api/doctor` → 体检摘要（summary 计数 + fail/warn 项）
 
-**⚠️ 提醒区（放在面板最顶部，仅在有命中项时显示，没有则整段省略）：**
-- 🔴 **7 天内到期的积分批次**还有大量余量 → 建议立刻用 `expiry-first` 策略消耗（列出：账号/批次/余量/到期日）
-- 🟠 账号额度耗尽或登录态失效（exhausted / last_error 含 401）→ 提示重置、重新 /wbp-import 或 /wbp-login
-- 🟡 今日签到还没做的账号 → 提示可 `wb_tasks_run`
-
-**输出格式要求**（用 markdown 表格，不要贴原始 JSON）：
+## 第二步：渲染面板
 
 ```
 ### 📊 WorkBuddy 总览
 
-（⚠️ 提醒区，如有）
+**策略** expiry-first ｜ **体检** ✅12 通过 · ⚠️1 提醒 ｜ **今日** 23 次调用 · 0.9 积分 · 42.5 tok/s
 
-**调度策略**：expiry-first（积分最早到期优先）｜ 代理：运行中，已运行 x 分
-
-**账号与积分**（按消耗顺序）
 | # | 账号 | 状态 | 余额 | 最早到期 |
 |---|------|------|------|----------|
+| 1 | 周火火 | 🟢使用中 | 3177 | 10-07（4天） |
+| 2 | 公瑾 | 可用 | 4660 | 11-30 |
 
-**积分批次明细**
-| 账号 | 批次 | 余量 | 到期 |
-|------|------|------|------|
-（所有账号的所有批次，按到期时间升序）
+**今日任务**：签到 ✓×2 ｜ 成长 +12 分 ｜ 猫猫 🐾旅行中
+**最近请求**：02:27 glm-5.3-flash 62.4 tok/s（7.3s）· 02:25 …
 
-**今日任务**：签到 ✓/✗/未执行 × N 个账号 ｜ 成长任务 领奖 N 个 +M 积分 ｜ 猫猫旅行 状态
-**今日用量**：调用 N 次 ｜ 输入/输出 tokens ｜ 平均输出速度 X tok/s ｜ 消耗积分 N
-
-**最近请求速度**（最近 5 条，新→旧）
-| 时间 | 模型 | tok/s | 耗时 |
-|------|------|-------|------|
-（来自 recent-requests；若为空则省略此节）
-
-提示：改策略/切账号/加账号直接说，或 /wbp-console 打开图形面板。
+⚠️ 如有异常（余额≤200 / 7天内到期且余量>500 / 401 / 体检 fail 项）在这行列出
 ```
 
-若代理未运行：先按 /wbp-start 启动再渲染。
+## 第三步：操作菜单（面板固定结尾）
+
+```
+**操作**（回复编号执行）：
+ 1. 刷新积分明细          2. 立即签到（未签账号）    3. 成长任务扫描+领奖
+ 4. 猫猫旅行巡逻          5. 切换调度策略            6. 固定/解固定账号
+ 7. 跑一轮模型巡检        8. 一键诊断（完整报告）    9. 打开控制台（/wbp-console）
+```
+
+数据是陈旧的、用户说「刷新」、或执行完任何操作后：重新采集并重渲染。
+
+## 操作执行细则（对应编号）
+
+1. **刷新积分**：调 `wb_refresh_credits`，汇报每个账号最新余额。
+2. **立即签到**：调 `wb_tasks_run`（kind=checkin），汇报成功/已签/失败。
+3. **成长任务**：调 `wb_tasks_run`（kind=growth），汇报报名数、代打次数、领奖与积分。
+4. **猫猫巡逻**：调 `wb_tasks_run`（kind=travel），汇报派出/领奖/进行中。
+5. **切换策略**：列出五策略（expiry-first/balance-first/round-robin/free-first/pinned）+ 一句说明，**等用户选择**后调 `wb_switch`，成功后汇报并重渲染。
+6. **固定账号**：列出账号（含 #号），等用户选；`wb_switch`（policy=pinned, accountId=…）。当前已 pinned 时先问「解固定恢复自动调度？」。
+7. **模型巡检**：Bash POST `/console/api/health/scan`（同 apiKey 头，需 10~30 秒），汇报可用数与前三名性价比。
+8. **完整诊断**：Bash GET `/console/api/doctor`，把 checks 按级别分组渲染成表（✅/⚠️/❌），fail 项附操作建议。
+9. **打开控制台**：按 /wbp-console 的方式输出控制台地址让用户点击。
+
+## 约束
+
+- 采集失败（代理没起）→ 输出一句「代理未运行，回复 0 启动」；用户回 0 时走 /wbp-start。
+- 菜单动作里凡是「等用户选择」的（5/6），不要自作主张替用户挑。
+- 所有改动类操作执行后必须汇报结果（成功条数/失败原因），再重渲染面板。
 
 $ARGUMENTS

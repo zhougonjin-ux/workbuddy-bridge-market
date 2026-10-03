@@ -6,6 +6,7 @@ import { fetchModels } from './upstream.mjs';
 import { learnLimit } from './compress.mjs';
 import { usableCount } from './pool.mjs';
 import { warn } from './log.mjs';
+import { budgetRedirectActive } from './budget.mjs';
 
 const TTL_OK = 5 * 60 * 1000;
 const TTL_ERR = 60 * 1000;
@@ -192,6 +193,9 @@ function 有可用账号(site) {
  * 抽成纯函数有两个目的：消除「降级选站」与「目录匹配选站」两处重复的比较器，
  * 并且让这段最容易回归的排序逻辑能被单测覆盖（它依赖的 getCatalog 需要真实上游，
  * 直接测 computeFallback 是测不了的）。
+ *
+ * 注：free-first 策略不改这里——倍率升序本来就会把 0 倍率站点排到最前，
+ * 它真正生效的位置是 resolveTargetInner 对 default/auto 哨兵的改道（见 pickFreeModelFromCatalogs）。
  */
 export function rankSiteCandidates(candidates, defaultSite) {
   return [...candidates].sort(
@@ -200,6 +204,68 @@ export function rankSiteCandidates(candidates, defaultSite) {
       a.mult - b.mult ||
       (a.site === defaultSite ? -1 : 1),
   );
+}
+
+/** 从 cfg 里读调度策略；读不到按空串处理（走原有行为）。 */
+function poolPolicy(cfg) {
+  return (cfg && cfg.pool && cfg.pool.policy) || '';
+}
+
+/**
+ * 按时段路由（T20）的选型核心（纯函数，便于单测）：
+ * dayStart–nightStart 之间算「白天」，其余（含跨零点）算「夜间」，
+ * 返回该时段配置的模型；未启用 / 时段模型留空 / 时点非法 → null（调用方走默认行为）。
+ * 支持跨零点写法（dayStart > nightStart，如白天 09:00、夜间 02:00：09:00 之后到次日 02:00 算白天）。
+ */
+export function pickScheduledModel(sr, d = new Date()) {
+  if (!sr || sr.enabled !== true) return null;
+  const toMin = (s) => {
+    const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(String(s || '').trim());
+    return m ? Number(m[1]) * 60 + Number(m[2]) : null;
+  };
+  const day = toMin(sr.dayStart);
+  const night = toMin(sr.nightStart);
+  if (day === null || night === null) return null;
+  const cur = d.getHours() * 60 + d.getMinutes();
+  const inDay = day <= night ? cur >= day && cur < night : cur >= day || cur < night;
+  const model = String(inDay ? sr.dayModel : sr.nightModel || '').trim();
+  return model || null;
+}
+
+/**
+ * free-first 的选型核心（纯函数，便于单测）：从候选站点目录里挑「真免费」的模型。
+ * 规则：倍率恰为 0（上游 "x0.00 credits"）且站点有可用账号；多个候选时取
+ * 上下文窗口最大的（能力最强的免费代理），同窗口保持传入顺序（站点顺序）。
+ * 没有免费模型返回 null，调用方回落到原有行为。
+ */
+export function pickFreeModelFromCatalogs(catalogs) {
+  let best = null;
+  for (const c of Array.isArray(catalogs) ? catalogs : []) {
+    if (!c || c.usable === false) continue;
+    for (const m of c.models || []) {
+      if (parseMultiplier(m?.credits) !== 0) continue;
+      const ctx = Number(m?.contextWindow) || 0;
+      if (!best || ctx > best.contextWindow) best = { site: c.site, id: m.id, contextWindow: ctx };
+    }
+  }
+  return best;
+}
+
+/** 收集所有启用站点的目录交给 pickFreeModelFromCatalogs 挑免费模型。 */
+async function findFreeModel(cfg) {
+  const catalogs = [];
+  for (const s of siteKeys(cfg)) {
+    if (cfg.sites?.[s]?.enabled === false) continue;
+    let cat = null;
+    try {
+      cat = await getCatalog(cfg, s);
+    } catch {
+      continue; // 目录拿不到的站点不参与免费选型
+    }
+    if (!cat?.models?.size) continue;
+    catalogs.push({ site: s, usable: 有可用账号(s), models: [...cat.models.values()] });
+  }
+  return pickFreeModelFromCatalogs(catalogs);
 }
 
 /** 计算备用站点：除了「首选站点」以外，还有哪些站点真的拥有该模型。 */
@@ -286,9 +352,42 @@ async function resolveTargetInner(cfg, requestedModel) {
   const sites = siteKeys(cfg);
   if (!raw) raw = cfg.defaultModel;
 
-  // 0) 特殊别名：客户端只配一个 `default` 模型，之后切换模型全在控制台完成
-  if (raw.toLowerCase() === 'default' || raw.toLowerCase() === 'current') {
-    raw = expandAlias(cfg, raw) === raw ? cfg.defaultModel : expandAlias(cfg, raw);
+  // 0) 特殊哨兵：客户端只配一个 `default` 模型，之后切换模型全在控制台完成；
+  //    `auto` 是上游的自动路由入口（seedModels 里有同名条目）。
+  //    free-first 策略或「预算超限且 mode=free」（T13）都会把 default/auto 改道到
+  //    「现在真免费」的模型（见 pickFreeModelFromCatalogs）：
+  //    没有免费模型、或用户给哨兵显式配了别名时，回落到原行为（default→defaultModel，auto 透传上游）。
+  const lower = raw.toLowerCase();
+  if (lower === 'default' || lower === 'current' || lower === 'auto') {
+    const alias = expandAlias(cfg, raw);
+    if (alias !== raw) {
+      raw = alias;
+    } else if (lower !== 'current') {
+      // 按时段路由（T20）：启用时 default 在白天走 dayModel、夜间走 nightModel（本地时间）。
+      // 时段配置是用户对「这个时间该用哪个模型」的显式意图，优先于 free-first / 预算改道；
+      // 只改 default —— auto 是对上游自动路由的显式请求，保持透传。
+      const scheduled = lower === 'default' ? pickScheduledModel(cfg.scheduleRouter) : null;
+      if (scheduled && !['default', 'current', 'auto'].includes(scheduled.toLowerCase())) {
+        raw = scheduled;
+      } else {
+        if (scheduled) raw = cfg.defaultModel; // 时段模型又配了个哨兵 → 落回默认模型，避免原地打转
+        // free-first 策略或「预算超限且 mode=free」（T13）都会把 default/auto 改道到
+        // 「现在真免费」的模型（见 pickFreeModelFromCatalogs）：
+        // 没有免费模型、或用户给哨兵显式配了别名时，回落到原行为（default→defaultModel，auto 透传上游）。
+        if (poolPolicy(cfg) === 'free-first' || budgetRedirectActive(cfg)) {
+          let free = null;
+          try {
+            free = await findFreeModel(cfg);
+          } catch {
+            /* 免费选型失败按没有免费模型处理 */
+          }
+          if (free) return { site: free.site, model: free.id, requested: raw };
+          if (lower !== 'auto' && !scheduled) raw = cfg.defaultModel;
+        } else if (lower !== 'auto' && !scheduled) {
+          raw = cfg.defaultModel;
+        }
+      }
+    }
   }
 
   // 0.5) 站点存在但已禁用：明确报出真实原因，不要当成模型名继续往下走

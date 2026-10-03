@@ -17,15 +17,16 @@ import { queryCredit, supportsCreditQuery } from './src/upstream.mjs';
 import { handleConsoleApi } from './src/console-api.mjs';
 import { flushUsage } from './src/usage.mjs';
 import { flushLearned } from './src/compress.mjs';
+import { flushEvents, recordEvent } from './src/events.mjs';
 import { flushPool } from './src/pool.mjs';
 import { createRateLimiter } from './src/ratelimit.mjs';
-import { readJsonBody, sendJson, sendError } from './src/util.mjs';
+import { readJsonBody, sendJson, sendJsonWith, sendError } from './src/util.mjs';
 import { log, warn, error } from './src/log.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll, startCreditLoop, stopCreditLoop, scheduleCreditRefreshSoon } from './src/scheduler.mjs';
 import { runTasks, taskStatus, startTaskLoop, stopTaskLoop } from './src/tasks.mjs';
+import { startHealthLoop, stopHealthLoop } from './src/health.mjs';
 import { importLocalAccounts } from './src/localimport.mjs';
 import { startProviderConfigSync, stopProviderConfigSync, triggerProviderConfigSyncNow } from './src/pickersync.mjs';
-import { spawn } from 'node:child_process';
 
 // 配置读不出来时要给出可读提示，而不是抛一串裸栈。
 // 尤其是 JSON 语法错误——用户手改 config.json 很容易漏个逗号。
@@ -51,6 +52,65 @@ try {
 const CONSOLE_TOKEN = crypto.randomBytes(16).toString('hex');
 const CONSOLE_DIR = path.join(ROOT, 'console');
 
+// ---- 控制台访问 PIN（T23）----
+// 启用方式：config.json 设 consolePin: "1234"（4-12 位数字），或控制台「安全」卡直接设置。
+// 设了之后：
+//   - GET /console 返回锁屏页而不是真页面，输入 PIN → POST /console/api/unlock；
+//   - 校验通过发会话 token（同时种 HttpOnly cookie，解锁后的 API 调用与页面刷新都免重输）；
+//   - /console/api/* 照旧要求 token/apiKey —— 锁屏挡的是「别人坐在这台电脑前打开控制台」，
+//     不是替代接口鉴权。
+// 每次请求现读 cfg（控制台改 PIN 立即生效，无需重启）；校验失败 1 秒延迟 + 最多 20 次，防爆破。
+const pinAttempts = { count: 0, lastAt: 0 };
+
+function consoleLocked() {
+  const pin = cfg.consolePin;
+  return typeof pin === 'string' && pin.trim().length > 0;
+}
+
+function consolePinValue() {
+  return String(cfg.consolePin || '').trim();
+}
+
+/** 锁屏页（真页面不落盘给未解锁的浏览器）。 */
+function consoleLockPage() {
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>WorkBuddy 控制台 · 已锁定</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0d1017;color:#e8eaf0;font:15px/1.6 system-ui,'Segoe UI','Microsoft YaHei',sans-serif}
+  .box{width:320px;padding:34px 30px;border:1px solid #232a3a;border-radius:14px;background:#12161f;text-align:center}
+  h1{font-size:17px;margin:0 0 4px}.muted{color:#8a93a8;font-size:12.5px;margin:0 0 18px}
+  input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #2a3347;border-radius:9px;background:#0a0c10;color:#e8eaf0;font-size:20px;letter-spacing:8px;text-align:center;outline:none}
+  input:focus{border-color:#4d7cfe}
+  button{width:100%;margin-top:12px;padding:11px;border:0;border-radius:9px;background:#4d7cfe;color:#fff;font-size:14.5px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default}
+  .err{color:#ff6b6b;font-size:12.5px;min-height:18px;margin-top:10px}
+</style></head><body>
+<div class="box">
+  <h1>🔒 WorkBuddy 控制台</h1>
+  <p class="muted">此控制台已开启访问 PIN，请输入解锁</p>
+  <form id="f">
+    <input id="pin" type="password" inputmode="numeric" autocomplete="off" placeholder="••••" autofocus>
+    <button id="go" type="submit">解锁</button>
+    <div class="err" id="err"></div>
+  </form>
+</div>
+<script>
+'use strict';
+const f=document.getElementById('f'),pin=document.getElementById('pin'),err=document.getElementById('err'),go=document.getElementById('go');
+f.onsubmit=async(e)=>{e.preventDefault();err.textContent='';go.disabled=true;go.textContent='校验中…';
+  try{
+    const r=await fetch('/console/api/unlock',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({pin:pin.value})});
+    const j=await r.json().catch(()=>({}));
+    if(r.ok&&j.ok&&j.token){sessionStorage.setItem('wbConsoleToken',j.token);location.reload();}
+    else{err.textContent=j.error||('校验失败（HTTP '+r.status+'）');pin.value='';pin.focus();}
+  }catch(ex){err.textContent='请求失败：'+ex.message;}
+  go.disabled=false;go.textContent='解锁';};
+pin.focus();
+</script></body></html>`;
+}
+
+
 // ---- 限流 ----
 // 服务只绑 127.0.0.1，所以要挡的不是远程攻击，而是：
 //   - 客户端 bug 造成的失控重试循环
@@ -73,6 +133,11 @@ function 来源标识(req) {
 
 function consoleAuthorized(req) {
   if ((req.headers['x-console-token'] || '') === CONSOLE_TOKEN) return true;
+  // T23：PIN 解锁后发的会话 cookie（值即 token）。锁屏页判断「是否已解锁」用它——
+  // 解锁后刷新 /console 不能又弹锁屏。HttpOnly + SameSite=Strict，脚本读不到、跨站不带。
+  const cookie = String(req.headers.cookie || '');
+  const m = /(?:^|;\s*)wbConsoleToken=([^;]+)/.exec(cookie);
+  if (m && m[1] === CONSOLE_TOKEN) return true;
   return authorized(req); // 也允许直接用 apiKey 调控制台接口（方便脚本）
 }
 
@@ -155,79 +220,16 @@ function authorized(req) {
   return keys.includes(clientKey(req));
 }
 
-// ---- 不可断线保护（activeRequests / drainWaiters / gracefulExit）----
+// ---- 不可断线保护（activeRequests / 交棒重启）----
 // 本服务承载 ZCode 会话自身的模型连接：进程退出 = 会话断线。因此：
 //   1) /admin/shutdown 在有活跃请求时拒绝（除非 force=1）；
 //   2) /admin/restart 用「交棒」重启：先把新实例拉起来排队等端口，本实例等
 //      activeRequests 归零（完全空闲）后才退出交出端口 —— 进行中的请求不受影响。
+// 实现体在 lifecycle-impl.mjs（console-api 的 /service/restart 也要走同一条路径，
+// 拆出去避免 console-api → server.mjs 的循环 import）；这里只持有计数与依赖注入。
+import { bootLifecycle, drainWaiters, gracefulExit, doRestart } from './src/lifecycle-impl.mjs';
+import { setRestartHandler } from './src/lifecycle.mjs';
 let activeRequests = 0;
-let draining = false; // 已决定退出，等活跃请求清零
-let exiting = false;  // 已开始退出流程，防止重复触发
-const pendingExits = [];
-
-/** 请求结束时调用：活跃数归零且处于 draining 状态就执行挂起的退出。 */
-function drainWaiters() {
-  if (!draining || activeRequests > 0) return;
-  const fns = pendingExits.splice(0);
-  for (const fn of fns) fn();
-}
-
-/**
- * 优雅退出：刷盘 → 停后台循环 → close 服务器。
- * waitIdle=true 时等 activeRequests 归零再退出（交棒场景）；
- * 期间新到的 /v1/* 请求照常服务，不会出现「拒绝服务窗口」。
- */
-function gracefulExit(res, { waitIdle = false, reason = 'stop' } = {}) {
-  const finish = () => {
-    if (exiting) return;
-    exiting = true;
-    log(`正在保存用量统计并关闭服务（${reason}）`);
-    stopCreditLoop();
-    stopTaskLoop();
-    stopProviderConfigSync();
-    flushUsage();
-    flushPool();
-    flushLearned();
-    // 不等 close 回调超时兜底：5 秒后强制退出，防个别连接挂着不放手
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 5000).unref?.();
-  };
-  if (waitIdle && activeRequests > 0) {
-    draining = true;
-    log(`${reason}：${activeRequests} 个请求进行中，等全部完成后退出`);
-    pendingExits.push(finish);
-    return { waiting: true, active: activeRequests };
-  }
-  finish();
-  return { waiting: false };
-}
-
-/** 以分离进程拉起一个新 server 实例（交棒重启用）。新实例带 WB_HOOK_SPAWN=1，
- *  端口暂被本实例占用时自动进入 2 秒重试绑定循环（复用现成的 EADDRINUSE 逻辑）。
- *  注意 ROOT 就是 server 目录本身（src/config.mjs），不要再拼一层 server。 */
-function spawnReplacement() {
-  const serverEntry = path.join(ROOT, 'server.mjs');
-  if (!fs.existsSync(serverEntry)) {
-    error(`交棒重启失败：找不到 ${serverEntry}`);
-    return null;
-  }
-  let stdio = 'ignore';
-  try {
-    fs.mkdirSync(paths.root, { recursive: true });
-    stdio = fs.openSync(path.join(paths.root, 'server.log'), 'a');
-    fs.writeSync(stdio, `\n===== 交棒重启 ${new Date().toLocaleString()} =====\n`);
-  } catch { /* 打不开日志就退回 ignore */ }
-  const child = spawn(process.execPath, [serverEntry], {
-    cwd: ROOT,
-    detached: true,
-    stdio: ['ignore', stdio, stdio],
-    env: { ...process.env, WB_HOOK_SPAWN: '1' },
-    windowsHide: true,
-  });
-  child.on('error', () => {});
-  child.unref();
-  return child.pid;
-}
 
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
@@ -310,8 +312,18 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // 控制台页面（本机可达；页面内注入会话 token，不含 apiKey）
+    // 控制台页面（本机可达；页面内注入会话 token，不含 apiKey）。
+    // T23：开启 consolePin 时先回锁屏页，PIN 校验通过（/console/api/unlock）才发真页面。
     if ((pathname === '/console' || pathname === '/console/') && req.method === 'GET') {
+      if (consoleLocked()) {
+        // 已带有效凭证（解锁过/脚本带 apiKey）的请求直接给真页面，避免刷新又锁一次
+        if (consoleAuthorized(req)) {
+          // fallthrough 到下面的真页面逻辑
+        } else {
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+          return res.end(consoleLockPage());
+        }
+      }
       const file = path.join(CONSOLE_DIR, 'index.html');
       if (!fs.existsSync(file)) return sendError(res, 500, '控制台文件缺失：console/index.html');
       let html = fs.readFileSync(file, 'utf8');
@@ -332,6 +344,35 @@ const server = http.createServer(async (req, res) => {
         return res.end(fs.readFileSync(file));
       }
       return sendError(res, 404, '控制台资源不存在');
+    }
+
+    // T23：控制台 PIN 解锁。放在 /console/api/* 统一鉴权之前——锁屏状态下的浏览器
+    // 还没有 token，正是要靠这个接口换 token。校验失败延迟 1 秒（拖垮爆破脚本）。
+    if (pathname === '/console/api/unlock' && req.method === 'POST') {
+      if (!consoleOriginAllowed(req)) return sendError(res, 403, '控制台仅允许本机访问', 'console_forbidden');
+      if (!consoleLocked()) return sendJson(res, 200, { ok: true, token: CONSOLE_TOKEN, note: '未设置 PIN，无需解锁' });
+      // 简单爆破防护：每个进程最多受理 20 次失败尝试，超出后一律拒绝（重启服务才能重置）
+      if (pinAttempts.count >= 20) {
+        warn(`控制台 PIN 已连续失败 ${pinAttempts.count} 次，拒绝继续尝试（重启服务重置）`);
+        return sendJson(res, 429, { ok: false, error: '失败次数过多，请重启服务后再试' });
+      }
+      const body = await readJsonBody(req);
+      const given = String(body?.pin || '').trim();
+      if (given !== consolePinValue()) {
+        pinAttempts.count++;
+        pinAttempts.lastAt = Date.now();
+        warn(`控制台 PIN 校验失败（第 ${pinAttempts.count} 次）`);
+        await new Promise((r) => setTimeout(r, 1000));
+        return sendJson(res, 401, { ok: false, error: 'PIN 不正确' });
+      }
+      pinAttempts.count = 0;
+      log('控制台 PIN 校验通过，已发放会话 token');
+      // 会话 cookie：值即控制台 token，两个作用——① 刷新 /console 时识别「已解锁」不再弹锁屏；
+      // ② 浏览器后续的 /console/api 请求经 consoleAuthorized 直接通过（省得前端再存一份）。
+      // HttpOnly + SameSite=Strict：脚本读不到、跨站请求不会携带，安全性与 token 头同级。
+      return sendJsonWith(res, 200, { ok: true, token: CONSOLE_TOKEN }, {
+        'Set-Cookie': `wbConsoleToken=${CONSOLE_TOKEN}; Path=/; SameSite=Strict; HttpOnly`,
+      });
     }
 
     // 控制台 API（用会话 token 或 apiKey 鉴权）
@@ -460,7 +501,7 @@ const server = http.createServer(async (req, res) => {
           activeRequests,
         });
       }
-      const r = gracefulExit(res, { reason: '收到停止指令' });
+      const r = gracefulExit({ reason: '收到停止指令' });
       sendJson(res, 200, { ok: true, message: r.waiting ? `等 ${r.active} 个请求完成后退出` : 'shutting down' });
       return;
     }
@@ -469,11 +510,12 @@ const server = http.createServer(async (req, res) => {
     // 完成后退出交出端口。整个过程模型连接不断——进行中的请求照常跑完，
     // 新请求由接管端口的新实例服务。会话内调用安全，这是 /admin/shutdown 的替代品。
     if (pathname === '/admin/restart' && req.method === 'POST') {
-      if (exiting) return sendJson(res, 409, { ok: false, error: 'already_stopping' });
-      const pid = spawnReplacement();
-      log(`交棒重启：新实例 PID=${pid} 已拉起（排队等端口），本实例等空闲后退出`);
-      const r = gracefulExit(res, { waitIdle: true, reason: '交棒重启' });
-      sendJson(res, 200, { ok: true, message: r.waiting ? `新实例 ${pid} 排队中，本实例等 ${r.active} 个请求完成后交棒` : `新实例 ${pid} 即将接管端口` });
+      try {
+        const r = doRestart();
+        sendJson(res, 200, { ok: true, message: r.waiting ? `新实例已拉起，本实例等 ${r.active} 个请求完成后交棒` : '新实例即将接管端口' });
+      } catch (e) {
+        sendJson(res, e.status || 500, { ok: false, error: e.message || 'restart failed' });
+      }
       return;
     }
 
@@ -577,24 +619,35 @@ function reportConfigIssues() {
 }
 
 // 端口被占用等情况要给出可操作的提示，而不是抛一串裸栈
+// ⚠️ 2026-10-03 16:49 断线事故：本段曾有两个 bug 叠加，交棒重启后端口空置 73 分钟——
+//   (1) 重试 interval 被 unref()，绑定成功前它是进程唯一的存活持有者，Node 静默退出；
+//   (2) 重试期间后续 bind 失败会再次触发 error 事件、落进下面的通用分支 process.exit(1)。
+// 修复：unref 去掉（绑定成功才允许进程安眠）；hookRetryStarted 之后的 error 一律吞掉继续重试。
 let hookRetryStarted = false;
 server.on('error', (e) => {
-  // hook 拉起模式：上个实例刚优雅退出时 socket 可能仍在 TIME_WAIT，立刻 bind 会
-  // EADDRINUSE —— 自动重试绑定，而不是静默退出导致「hook 跑了服务却没起来」。
-  if (e.code === 'EADDRINUSE' && process.env.WB_HOOK_SPAWN === '1' && !hookRetryStarted) {
+  // 拉起模式（hook 拉起 / 交棒新实例）：上个实例退出时 socket 可能仍在 TIME_WAIT，
+  // 立刻 bind 会 EADDRINUSE —— 自动重试绑定，而不是静默退出导致「hook 跑了服务却没起来」。
+  if (e.code === 'EADDRINUSE' && process.env.WB_HOOK_SPAWN === '1') {
+    if (hookRetryStarted) return; // 已在重试循环里：吞掉后续 bind 失败，别掉进通用分支自杀
     hookRetryStarted = true;
     let retries = 0;
-    warn(`hook 拉起：端口 ${cfg.port} 暂被占用（上个实例刚退出），每 2 秒重试绑定…`);
-    const retry = setInterval(() => {
+    warn(`端口 ${cfg.port} 暂被占用（等上个实例退出），每 0.5 秒重试绑定…`);
+    // 监听成功即清掉本 interval：留着下一跳会对已监听的 server 重复 listen() 抛
+    // ERR_SERVER_ALREADY_LISTEN，把刚接管的进程崩掉。也不 unref：绑定成功前它是
+    // 本进程唯一的存活持有者（2026-10-03 16:49 断线事故：unref 后 Node 静默退出）。
+    let retry = null;
+    const stopRetry = () => { if (retry) clearInterval(retry); };
+    server.once('listening', stopRetry);
+    server.once('close', stopRetry);
+    retry = setInterval(() => {
       retries++;
-      if (retries > 15) {
+      if (retries > 60) {
         clearInterval(retry);
-        error('hook 拉起：端口重试 15 次仍被占用，放弃');
+        error(`端口重试 60 次（30 秒）仍被占用，放弃`);
         process.exit(1);
       }
       server.listen(cfg.port, cfg.host);
-    }, 2000);
-    retry.unref?.();
+    }, 500);
     return;
   }
   error(`服务启动失败：${e.code || e.message}`);
@@ -630,10 +683,21 @@ server.listen(cfg.port, cfg.host, () => {
   }
   log('  未登录的站点可在控制台「账号登录」里点一下，或运行：node login.mjs --site <站点名>');
   log(`  OpenAI 客户端：Base URL = http://${cfg.host}:${cfg.port}/v1`);
-  // workbuddy-bridge 后台循环：积分/到期明细刷新 + 自动签到/成长任务 + 模型池自动同步
+  // workbuddy-bridge 后台循环：积分/到期明细刷新 + 自动签到/成长任务 + 模型池自动同步 + 定时模型巡检
+  recordEvent('system', `服务启动（监听 ${cfg.host}:${cfg.port}，PID ${process.pid}）`);
+  flushEvents();
   startCreditLoop(cfg);
   startTaskLoop(cfg);
+  startHealthLoop(cfg);
   startProviderConfigSync(cfg, (e) => warn('模型池自动同步失败：', e.message));
+  // 生命周期依赖注入：交棒重启（/admin/restart、/console/api/service/restart 共用）
+  // 需要活跃计数与各循环的 stop/flush 函数；onClose 走 server.close → 进程退出。
+  bootLifecycle({
+    activeRequestsRef: () => activeRequests,
+    stoppers: [stopCreditLoop, stopTaskLoop, stopHealthLoop, stopProviderConfigSync],
+    flushers: [flushUsage, flushPool, flushLearned, flushEvents],
+  });
+  setRestartHandler(doRestart);
   // 自动导入本机已登录客户端的账号（静默；客户端续期 token 后重启服务即自动跟进）
   importLocalAccounts(cfg, { silent: true }).catch((e) => warn('本机账号自动导入失败：', e.message));
 });
@@ -641,6 +705,13 @@ server.listen(cfg.port, cfg.host, () => {
 process.on('SIGINT', () => {
   // 与 /admin/restart 同一条优雅退出路径：活跃请求没跑完就等（不主动断模型流量），
   // 全部跑完（或 close 超时兜底）才退出。
-  gracefulExit(null, { waitIdle: true, reason: '收到退出信号' });
+  gracefulExit({
+    waitIdle: true,
+    reason: '收到退出信号',
+    onClose: () => {
+      server.close(() => process.exit(0));
+      setTimeout(() => process.exit(0), 5000).unref?.();
+    },
+  });
 });
 process.on('unhandledRejection', (e) => error('未处理的 Promise 异常：', e));

@@ -16,9 +16,10 @@ description: 按 Roadmap 批量实现 workbuddy-bridge 插件功能（参数=功
 - 源码：`E:\桌面\新建文件夹\plugins\workbuddy-bridge\`（server/src/*.mjs、server/console/index.html、commands/）。**改源码，不改缓存。**
 - 数据目录：`%USERPROFILE%\.zcode\workbuddy-bridge\`（config.json 含 apiKey；usage.json/tasks-state.json/learned.json）。
 - ⚠️ **绝不允许 taskkill 监听 8788 的 node 进程**——当前会话的模型流量就走它。重启服务只有一种方式：`POST http://127.0.0.1:8788/admin/restart`（带 `Authorization: Bearer <apiKey>`，交棒重启，零断线）。
+- ⚠️ **交棒重启（含 /admin/restart 与改完 server.mjs 后的任何重启）之前，必须先在临时目录试启**：`WB_CONFIG_DIR=$(mktemp -d) node server/server.mjs` 起一个隔离实例，`curl /health` 返回 200 且日志无异常堆栈后再动生产——单测不覆盖 server.mjs 监听路径，未声明变量这类「启动即崩」只有真启动才暴露（2026-10-03 20:24 T31 批次就是这么把 8788 打挂、全会话断线的；另有 Windows 看门狗计划任务 wb-bridge-watchdog 每分钟兜底拉起，别依赖它替代试启）。
 - 发布：`node C:\Users\87352\.zcode\cli\exec\wb-publish.cjs`（读 `E:/Temp/.wb-pat` 的 PAT；**若文件不存在，停止发布并告知用户**——重建令牌需要 sudo 邮箱验证码，见记忆 github-publishing-workbuddy 的自助流程）。发布后用 `curl -L https://codeload.github.com/zhougonjin-ux/workbuddy-bridge-market/tar.gz/refs/heads/main` 解包覆盖 `~/.zcode/cli/plugins/marketplaces/dev-workbuddy-bridge-local/` 刷新市场快照。
 - 控制台 HTML 是 no-store 头，改完让用户刷新页面即可生效；`/console/api/*` 接受 `X-Console-Token`（页面内 `__WB_TOKEN__="..."`）**或** `Authorization: Bearer <apiKey>` 两套鉴权；`/admin/*` 只认 apiKey。
-- 每完成一个功能：`node --check` 全部改动文件 + `npm test`（在 server/ 下跑，当前 27 条必须全过，纯函数新增要补测试）。
+- 每完成一个功能：`node --check` 全部改动文件 + `npm test`（在 server/ 下跑，当前 47 条必须全过，纯函数新增要补测试）。
 
 ## 每个功能做完后的统一收尾流程
 

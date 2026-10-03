@@ -5,7 +5,7 @@ import { ensureToken } from './auth.mjs';
 import { isQuotaError } from './pool.mjs';
 import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText } from './router.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
-import { startSSE, writeSSE, sendJson, sendError, estimateTokens } from './util.mjs';
+import { startSSE, writeSSE, sendJson, sendError, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
 
 /** 帧白名单重建：剥掉上游噪声（空 content、空 tool_calls、未知字段），保证标准客户端可解析。 */
@@ -182,12 +182,14 @@ export async function handleChatCompletions(ctx) {
   site = r.site;
   model = r.model;
   if (!up.ok) {
-    requestLog({ site, model, mode: wantsStream ? 'stream' : 'json', status: up.status, ms: Date.now() - started, note: 'upstream_reject' });
+    requestLog({ site, model, account: up.accountId, mode: wantsStream ? 'stream' : 'json', status: up.status, ms: Date.now() - started, note: 'upstream_reject' });
     return sendError(res, up.status, upstreamErrorMessage(up.status, up.text, site));
   }
 
   if (wantsStream) {
     startSSE(res, { 'X-Service': 'workbuddy-proxy', 'X-Upstream-Site': site });
+    // T27 心跳：高推理强度模型首字/帧间隔可达数分钟，SSE 注释帧防客户端空闲超时断流
+    const heartbeat = startHeartbeat(res);
     let valid = 0;
     let finished = false;
     let upstreamUsage = null;
@@ -212,12 +214,17 @@ export async function handleChatCompletions(ctx) {
       finished = true;
       await writeSSE(res, '[DONE]');
     } finally {
+      heartbeat.stop();
       up.close();
       if (!res.writableEnded) res.end();
       const streamMs = Date.now() - started;
       const outTok = upstreamUsage?.completion_tokens ?? estimateTokens('x'.repeat(contentChars));
+      // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage
+      const credit = await estimateCredit(cfg, site, model, upstreamUsage?.credit,
+        upstreamUsage?.prompt_tokens ?? 0, upstreamUsage?.completion_tokens ?? 0);
       requestLog({
         site,
+        account: up.accountId,
         model,
         mode: 'stream',
         status: finished ? 200 : 499,
@@ -225,6 +232,7 @@ export async function handleChatCompletions(ctx) {
         ms: streamMs,
         tok_s: outTok && streamMs > 0 ? (outTok / (streamMs / 1000)).toFixed(1) : undefined,
         frames: valid,
+        credit,
       });
       recordUsage({
         site,
@@ -233,8 +241,7 @@ export async function handleChatCompletions(ctx) {
         status: finished ? 200 : 499,
         promptTokens: upstreamUsage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
         completionTokens: outTok,
-        credit: await estimateCredit(cfg, site, model, upstreamUsage?.credit,
-          upstreamUsage?.prompt_tokens ?? 0, upstreamUsage?.completion_tokens ?? 0),
+        credit,
         ms: streamMs,
         tools,
       });
@@ -247,7 +254,7 @@ export async function handleChatCompletions(ctx) {
   try {
     agg = await aggregateFrames(up.frames);
   } catch (e) {
-    requestLog({ site, model, mode: 'json', status: e.status || 502, ms: Date.now() - started, note: 'aggregate_failed' });
+    requestLog({ site, model, account: up.accountId, mode: 'json', status: e.status || 502, ms: Date.now() - started, note: 'aggregate_failed' });
     return sendError(res, e.status || 502, e.message);
   } finally {
     up.close();
@@ -275,7 +282,7 @@ export async function handleChatCompletions(ctx) {
   }
 
   if (agg.frames === 0) {
-    requestLog({ site, model, mode: 'json', status: 502, ms: Date.now() - started, note: 'empty_stream' });
+    requestLog({ site, model, account: up.accountId, mode: 'json', status: 502, ms: Date.now() - started, note: 'empty_stream' });
     return sendError(res, 502, '上游返回空响应');
   }
 
@@ -299,8 +306,12 @@ export async function handleChatCompletions(ctx) {
       total_tokens: estimateTokens(JSON.stringify(body.messages || [])) + estimateTokens(agg.content),
     };
 
+  // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage
+  const credit = await estimateCredit(cfg, site, model, usage.credit, usage.prompt_tokens, usage.completion_tokens);
+
   requestLog({
     site,
+    account: up.accountId,
     model,
     mode: 'json',
     status: 200,
@@ -309,6 +320,7 @@ export async function handleChatCompletions(ctx) {
     prompt: usage.prompt_tokens,
     completion: usage.completion_tokens,
     tools: agg.toolCallList.length || undefined,
+    credit,
   });
 
   recordUsage({
@@ -318,7 +330,7 @@ export async function handleChatCompletions(ctx) {
     status: 200,
     promptTokens: usage.prompt_tokens,
     completionTokens: usage.completion_tokens,
-    credit: await estimateCredit(cfg, site, model, usage.credit, usage.prompt_tokens, usage.completion_tokens),
+    credit,
     ms: Date.now() - started,
     tools: agg.toolCallList.length,
   });

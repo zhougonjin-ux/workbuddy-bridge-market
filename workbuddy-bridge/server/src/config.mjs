@@ -200,6 +200,7 @@ export function defaultConfig() {
       //   balance-first 余额多的先用
       //   round-robin   最久未用的先用（原上游代理默认行为）
       //   pinned        固定用 pinnedAccountId 指定的账号，不可用时回落 expiry-first
+      //   free-first    default/auto 请求自动改道到「真免费」（倍率 x0）的模型；没有免费模型则维持默认
       policy: 'expiry-first',
       pinnedAccountId: null,
     },
@@ -227,6 +228,35 @@ export function defaultConfig() {
       autoComplete: true,     // 成长任务里的「对话体验类」由桥接代打极小请求点亮进度
       maxChatsPerTask: 5,     // 单任务单次扫描最多代打次数（控制成本）
     },
+    // 按时段路由（T20）：default 请求在本地时间 dayStart–nightStart 走 dayModel，
+    // 其余（含跨零点）走 nightModel。默认关闭；改 dayModel/nightModel 即时生效（每次请求现读）。
+    // 与 free-first / 预算切免费同走哨兵改道，但优先级最高（时段是更明确的用户意图）。
+    scheduleRouter: {
+      enabled: false,
+      dayStart: '08:00',      // 白天起点（含）
+      nightStart: '23:00',    // 夜间起点（含）；dayStart < nightStart 为常规写法，> 则支持跨零点
+      dayModel: '',           // 留空表示该时段不改道（保持 defaultModel）
+      nightModel: '',
+    },
+    // 模型健康巡检（T8）：定时对全部模型发 max_tokens=1 的极小请求测可用性/延迟。
+    // 默认关闭——巡检是真实消耗，17 模型一轮 ≈0.1~0.5 积分；由用户显式开启或手动触发。
+    healthCheck: {
+      enabled: false,
+      times: [],              // ["HH:MM"] 定时巡检时点，每天最多一次（首个命中时点）
+    },
+    // 桌面通知（T11）：签到失败/猫猫归来/账号登录态失效弹 Windows toast。默认开。
+    notify: {
+      enabled: true,
+    },
+    // 每日积分预算（T13）：今日累计消耗（估算口径，与用量页同源）超过 budget 比例时
+    // 预警；到 100% 且 mode=free 时，default/auto 的请求自动改道免费模型（同 free-first）。
+    // 默认关闭——单用户白嫖场景一般用不到，重度消耗者才需要护栏。
+    budget: {
+      enabled: false,
+      dailyCredits: 100,      // 每日预算（积分，估算口径）
+      warnPercent: 80,        // 达到该比例时预警（控制台预警条 + 事件）
+      mode: 'warn',           // warn=只预警 | free=超预算后 default/auto 改道免费模型
+    },
     // 限流：服务只绑 127.0.0.1，所以要挡的不是远程攻击，而是
     //   1) 客户端 bug 导致的失控重试循环
     //   2) 重端点被反复触发（/console/api/probe 一次最多 60 次上游调用）
@@ -237,6 +267,10 @@ export function defaultConfig() {
       max: 600, // 每窗口每来源 IP 的总请求上限（≈60 次/秒）
       probeMax: 3, // 其中 /probe 更严（它一次最多 60 次上游调用 + 至少 15 秒）
     },
+    // 控制台访问 PIN（T23）：设为 4-12 位数字字符串时，打开 /console 页面需要先输 PIN；
+    // 服务端校验通过才发会话 token（token 只存内存，重启后重新输一次）。
+    // null/空串 = 不启用（默认，保持原有「本机即信任」行为）。
+    consolePin: null,
     models: DEFAULT_MODELS,
     modelAliases: {},
   };
@@ -448,8 +482,8 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     if (typeof cfg.pool.switchSiteOnExhausted !== 'boolean') {
       cfg.pool.switchSiteOnExhausted = defaults.pool.switchSiteOnExhausted;
     }
-    if (!['expiry-first', 'balance-first', 'round-robin', 'pinned'].includes(cfg.pool.policy)) {
-      fix(`pool.policy 必须是 expiry-first/balance-first/round-robin/pinned 之一（当前 ${JSON.stringify(cfg.pool.policy)}），已回退为 ${defaults.pool.policy}`);
+    if (!['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first'].includes(cfg.pool.policy)) {
+      fix(`pool.policy 必须是 expiry-first/balance-first/round-robin/pinned/free-first 之一（当前 ${JSON.stringify(cfg.pool.policy)}），已回退为 ${defaults.pool.policy}`);
       cfg.pool.policy = defaults.pool.policy;
     }
     if (cfg.pool.pinnedAccountId !== undefined && cfg.pool.pinnedAccountId !== null && !isStr(cfg.pool.pinnedAccountId)) {
@@ -516,6 +550,73 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     }
   }
 
+  // ---- 模型健康巡检 ----
+  if (!isPlainObject(cfg.healthCheck)) {
+    if (cfg.healthCheck !== undefined) fix('healthCheck 必须是对象，已回退为默认值');
+    cfg.healthCheck = structuredClone(defaults.healthCheck);
+  } else {
+    if (typeof cfg.healthCheck.enabled !== 'boolean') cfg.healthCheck.enabled = defaults.healthCheck.enabled;
+    if (cfg.healthCheck.times === undefined) { cfg.healthCheck.times = defaults.healthCheck.times; }
+    else if (!Array.isArray(cfg.healthCheck.times)
+      || !cfg.healthCheck.times.every((s) => /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(s).trim()))) {
+      fix('healthCheck.times 必须是 "HH:MM" 字符串数组（如 ["08:00"]），已回退为 []');
+      cfg.healthCheck.times = [];
+    } else {
+      cfg.healthCheck.times = cfg.healthCheck.times.map((s) => String(s).trim().padStart(5, '0'));
+    }
+  }
+
+  // ---- 桌面通知（T11）----
+  if (cfg.notify !== undefined && !isPlainObject(cfg.notify)) {
+    fix('notify 必须是对象，已回退为默认值');
+    cfg.notify = structuredClone(defaults.notify);
+  } else if (cfg.notify) {
+    if (typeof cfg.notify.enabled !== 'boolean') cfg.notify.enabled = defaults.notify.enabled;
+  }
+
+  // ---- 按时段路由（T20）----
+  if (cfg.scheduleRouter !== undefined && !isPlainObject(cfg.scheduleRouter)) {
+    fix('scheduleRouter 必须是对象，已回退为默认值');
+    cfg.scheduleRouter = structuredClone(defaults.scheduleRouter);
+  } else if (cfg.scheduleRouter) {
+    if (typeof cfg.scheduleRouter.enabled !== 'boolean') cfg.scheduleRouter.enabled = defaults.scheduleRouter.enabled;
+    for (const k of ['dayStart', 'nightStart']) {
+      const v = String(cfg.scheduleRouter[k] ?? '').trim();
+      if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(v)) {
+        fix(`scheduleRouter.${k} 必须是 "HH:MM"（当前 ${JSON.stringify(cfg.scheduleRouter[k])}），已回退为 ${defaults.scheduleRouter[k]}`);
+        cfg.scheduleRouter[k] = defaults.scheduleRouter[k];
+      } else {
+        cfg.scheduleRouter[k] = v.padStart(5, '0');
+      }
+    }
+    for (const k of ['dayModel', 'nightModel']) {
+      if (cfg.scheduleRouter[k] !== undefined && !isStr(cfg.scheduleRouter[k])) {
+        fix(`scheduleRouter.${k} 必须是字符串，已回退为空（该时段不改道）`);
+        cfg.scheduleRouter[k] = '';
+      }
+    }
+  }
+
+  // ---- 每日积分预算（T13）----
+  if (cfg.budget !== undefined && !isPlainObject(cfg.budget)) {
+    fix('budget 必须是对象，已回退为默认值');
+    cfg.budget = structuredClone(defaults.budget);
+  } else if (cfg.budget) {
+    if (typeof cfg.budget.enabled !== 'boolean') cfg.budget.enabled = defaults.budget.enabled;
+    if (!Number.isFinite(cfg.budget.dailyCredits) || cfg.budget.dailyCredits <= 0) {
+      fix(`budget.dailyCredits 必须是正数，已回退为 ${defaults.budget.dailyCredits}`);
+      cfg.budget.dailyCredits = defaults.budget.dailyCredits;
+    }
+    if (!Number.isFinite(cfg.budget.warnPercent) || cfg.budget.warnPercent <= 0 || cfg.budget.warnPercent >= 100) {
+      fix(`budget.warnPercent 必须是 (0,100) 之间的数，已回退为 ${defaults.budget.warnPercent}`);
+      cfg.budget.warnPercent = defaults.budget.warnPercent;
+    }
+    if (!['warn', 'free'].includes(cfg.budget.mode)) {
+      fix(`budget.mode 必须是 warn/free 之一，已回退为 ${defaults.budget.mode}`);
+      cfg.budget.mode = defaults.budget.mode;
+    }
+  }
+
   // ---- 限流 ----
   if (!isPlainObject(cfg.rateLimit)) {
     fix('rateLimit 必须是对象，已回退为默认值');
@@ -529,6 +630,19 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
         fix(`rateLimit.${k} 必须是正整数，已回退为 ${defaults.rateLimit[k]}`);
         cfg.rateLimit[k] = defaults.rateLimit[k];
       }
+    }
+  }
+
+  // ---- 控制台访问 PIN（T23）：4-12 位数字；空值 = 关闭。写错类型回退关闭而不是锁死控制台 ----
+  {
+    const pin = cfg.consolePin;
+    if (pin === undefined || pin === null || String(pin).trim() === '') {
+      cfg.consolePin = null;
+    } else if (!/^\d{4,12}$/.test(String(pin).trim())) {
+      fix('consolePin 必须是 4-12 位数字（或 null 关闭），已回退为关闭');
+      cfg.consolePin = null;
+    } else {
+      cfg.consolePin = String(pin).trim();
     }
   }
 

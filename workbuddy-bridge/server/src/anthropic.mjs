@@ -4,7 +4,7 @@ import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErr
 import { resolveTarget } from './router.mjs';
 import { openWithSiteFallback } from './openai.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
-import { startSSE, writeSSEEvent, sendJson, sendError, writeAsync, estimateTokens } from './util.mjs';
+import { startSSE, writeSSEEvent, sendJson, sendError, writeAsync, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
 
 const stopReasonMap = {
@@ -143,7 +143,7 @@ export async function handleMessages(ctx) {
   site = r.site;
   model = r.model;
   if (!up.ok) {
-    requestLog({ site, model, mode: wantsStream ? 'anthropic-stream' : 'anthropic-json', status: up.status, ms: Date.now() - started, note: 'upstream_reject' });
+    requestLog({ site, model, account: up.accountId, mode: wantsStream ? 'anthropic-stream' : 'anthropic-json', status: up.status, ms: Date.now() - started, note: 'upstream_reject' });
     return sendError(res, up.status, upstreamErrorMessage(up.status, up.text, site), 'api_error');
   }
 
@@ -178,7 +178,10 @@ export async function handleMessages(ctx) {
     for (const tc of agg.toolCallList) {
       content.push({ type: 'tool_use', id: tc.id || newId('toolu'), name: tc.function.name, input: parseArgs(tc.function.arguments) });
     }
-    requestLog({ site, model, mode: 'anthropic-json', status: 200, ms: Date.now() - started });
+    // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage
+    const credit = await estimateCredit(cfg, site, model, agg.usage?.credit,
+      agg.usage?.prompt_tokens ?? 0, agg.usage?.completion_tokens ?? 0);
+    requestLog({ site, model, account: up.accountId, mode: 'anthropic-json', status: 200, ms: Date.now() - started, credit });
     recordUsage({
       site,
       model,
@@ -186,8 +189,7 @@ export async function handleMessages(ctx) {
       status: 200,
       promptTokens: agg.usage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
       completionTokens: agg.usage?.completion_tokens ?? estimateTokens(agg.content),
-      credit: await estimateCredit(cfg, site, model, agg.usage?.credit,
-        agg.usage?.prompt_tokens ?? 0, agg.usage?.completion_tokens ?? 0),
+      credit,
       ms: Date.now() - started,
       tools: agg.toolCallList.length,
     });
@@ -205,6 +207,8 @@ export async function handleMessages(ctx) {
 
   // 流式：把 OpenAI 增量翻译成 Anthropic SSE 事件序列
   startSSE(res, { 'X-Service': 'workbuddy-proxy', 'X-Upstream-Site': site });
+  // T27 心跳：Anthropic 协议里 SSE 注释行同样合法且被客户端忽略
+  const heartbeat = startHeartbeat(res);
   const msgId = newId('msg');
   let blockIndex = -1; // 当前打开的内容块
   let textBlockOpened = false;
@@ -307,9 +311,13 @@ export async function handleMessages(ctx) {
       await emit('error', { type: 'error', error: { type: 'api_error', message: e.message } }).catch(() => {});
     }
   } finally {
+    heartbeat.stop();
     up.close();
     if (!res.writableEnded) res.end();
-    requestLog({ site, model, mode: 'anthropic-stream', status: closed ? 502 : 200, ms: Date.now() - started, blocks: nextBlock });
+    // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage
+    const credit = await estimateCredit(cfg, site, model, usage?.credit,
+      usage?.prompt_tokens ?? 0, usage?.completion_tokens ?? 0);
+    requestLog({ site, model, account: up.accountId, mode: 'anthropic-stream', status: closed ? 502 : 200, ms: Date.now() - started, blocks: nextBlock, credit });
     recordUsage({
       site,
       model,
@@ -317,8 +325,7 @@ export async function handleMessages(ctx) {
       status: closed ? 502 : 200,
       promptTokens: usage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
       completionTokens: usage?.completion_tokens ?? Math.max(1, Math.ceil(textLen / 3)),
-      credit: await estimateCredit(cfg, site, model, usage?.credit,
-        usage?.prompt_tokens ?? 0, usage?.completion_tokens ?? 0),
+      credit,
       ms: Date.now() - started,
       tools: toolBlocks.size,
     });

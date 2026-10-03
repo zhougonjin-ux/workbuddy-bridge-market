@@ -2,6 +2,7 @@
 // 仅本机可用（服务只监听 127.0.0.1），鉴权用控制台会话 token 或 config.json 的 apiKey。
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { ROOT, siteKeys, saveConfig, paths, authPathFor, authKeys, primaryKey } from './config.mjs';
 import { getAuth, isLoggedIn, accountSnapshot } from './auth.mjs';
 import {
@@ -16,17 +17,28 @@ import {
   updateCreditDetail,
 } from './pool.mjs';
 import { getCatalog, mergedModels, parseMultiplier } from './router.mjs';
-import { openChat, queryCredit, classifyFrame, upstreamErrorMessage, supportsCreditQuery } from './upstream.mjs';
+import { queryCredit, supportsCreditQuery } from './upstream.mjs';
+import { probeModel, runHealthScan, healthStatus } from './health.mjs';
 import { startLogin, pollLogin } from './device-login.mjs';
-import { usageSnapshot, resetUsage, flushUsage, recordBalance } from './usage.mjs';
+import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel } from './usage.mjs';
 import { recentLogs, recentRequests, log } from './log.mjs';
+import { recentEvents } from './events.mjs';
+import { compressionStats } from './compress.mjs';
 import { sendJson } from './util.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
-import { runTasks, taskStatus } from './tasks.mjs';
+import { runTasks, taskStatus, growthTasksView, runSingleTask, claimSingleTask } from './tasks.mjs';
 import { importLocalAccounts } from './localimport.mjs';
+import { budgetStatus, budgetCheckAndAnnounce } from './budget.mjs';
+import { checkForUpdate } from './updatecheck.mjs';
+import { runDiagnostics } from './doctor.mjs';
+import { flushPool } from './pool.mjs';
+import { flushLearned } from './compress.mjs';
+import { flushEvents } from './events.mjs';
 
 const startedAt = Date.now();
 const loginStates = new Map(); // site → { state, authUrl, at }
+
+const isPlainObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 /**
  * 读版本号：优先取插件清单（.zcode-plugin/plugin.json）——那是插件市场里
@@ -84,35 +96,7 @@ async function siteSummary(cfg, site) {
   };
 }
 
-/** 探测单个模型是否可用（不消耗或极少消耗额度）。 */
-async function probeModel(cfg, site, model) {
-  const t0 = Date.now();
-  try {
-    const up = await openChat(cfg, site, {
-      model,
-      stream: true,
-      max_tokens: 1,
-      messages: [{ role: 'user', content: 'ping' }],
-    }, {});
-    if (!up.ok) {
-      return { model, site, status: up.status, ok: false, msg: upstreamErrorMessage(up.status, up.text, site), ms: Date.now() - t0 };
-    }
-    let first = null;
-    try {
-      for await (const payload of up.frames) {
-        const parsed = classifyFrame(payload);
-        first = parsed;
-        break;
-      }
-    } finally {
-      up.close();
-    }
-    if (first?.kind === 'error') return { model, site, status: 502, ok: false, msg: first.message, ms: Date.now() - t0 };
-    return { model, site, status: 200, ok: true, msg: '可用', ms: Date.now() - t0 };
-  } catch (e) {
-    return { model, site, status: 0, ok: false, msg: e.message, ms: Date.now() - t0 };
-  }
-}
+/** 探测单个模型是否可用：实现上移到 health.mjs（/probe 与巡检共用同一套逻辑）。 */
 
 export async function handleConsoleApi(ctx) {
   const { cfg, req, res, url } = ctx;
@@ -273,7 +257,9 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, r.ok ? 200 : 400, r);
   }
   if (p === '/bridge' && method === 'GET') {
-    return sendJson(res, 200, bridgeStatus(cfg));
+    const b = bridgeStatus(cfg);
+    b.budget = budgetCheckAndAnnounce(cfg); // T13：预警条数据源 + 每天一次的预算提醒
+    return sendJson(res, 200, b);
   }
   if (p === '/credit/refresh' && method === 'POST') {
     const results = await refreshCreditsAll(cfg);
@@ -333,6 +319,54 @@ export async function handleConsoleApi(ctx) {
     });
   }
 
+  // ---- workbuddy-bridge：成长任务中心（T14）----
+  // 实时任务视图（进度条 + 每任务代打/领奖按钮的数据源）
+  if (p === '/task-center' && method === 'GET') {
+    const site = String(url.searchParams.get('site') || cfg.defaultSite);
+    const accountId = String(url.searchParams.get('accountId') || '');
+    if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
+    if (!accountId) return sendJson(res, 400, { error: '缺少 accountId' });
+    if (!getAccount(site, accountId)) return sendJson(res, 404, { error: `账号不存在：${accountId}` });
+    try {
+      const tasks = await growthTasksView(cfg, site, accountId);
+      return sendJson(res, 200, { ok: true, site, accountId, tasks });
+    } catch (e) {
+      return sendJson(res, 502, { error: `拉取任务列表失败：${String(e.message || e).slice(0, 160)}` });
+    }
+  }
+  // 单任务手动代打（body: { site?, accountId, code, times? }）
+  if (p === '/task-center/play' && method === 'POST') {
+    const body = ctx.body || {};
+    const site = String(body.site || cfg.defaultSite);
+    const accountId = String(body.accountId || '');
+    const code = String(body.code || '');
+    if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
+    if (!getAccount(site, accountId)) return sendJson(res, 404, { error: `账号不存在：${accountId}` });
+    if (!code) return sendJson(res, 400, { error: '缺少 code' });
+    try {
+      const r = await runSingleTask(cfg, site, accountId, code, { times: body.times != null ? Number(body.times) : null });
+      return sendJson(res, 200, r);
+    } catch (e) {
+      return sendJson(res, e.status === 404 ? 404 : 502, { error: String(e.message || e).slice(0, 160) });
+    }
+  }
+  // 单任务领奖（body: { site?, accountId, code }）
+  if (p === '/task-center/claim' && method === 'POST') {
+    const body = ctx.body || {};
+    const site = String(body.site || cfg.defaultSite);
+    const accountId = String(body.accountId || '');
+    const code = String(body.code || '');
+    if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
+    if (!getAccount(site, accountId)) return sendJson(res, 404, { error: `账号不存在：${accountId}` });
+    if (!code) return sendJson(res, 400, { error: '缺少 code' });
+    try {
+      const r = await claimSingleTask(cfg, site, accountId, code);
+      return sendJson(res, 200, r);
+    } catch (e) {
+      return sendJson(res, 502, { error: String(e.message || e).slice(0, 160) });
+    }
+  }
+
   // ---- workbuddy-bridge：导入本机已登录客户端的账号 ----
   if (p === '/local/import' && method === 'POST') {
     const result = await importLocalAccounts(cfg);
@@ -347,9 +381,91 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, 200, { ok: true, result: r.result, models: r.models });
   }
 
-  // 最近请求的结构化记录（/wbp 面板显示 tok/s 用；agent 带 apiKey 即可调）
+  // 最近请求的结构化记录（/wbp 面板与控制台「用量」页显示 tok/s 用；agent 带 apiKey 即可调）。
+  // T9：对照「该模型今日平均单次消耗」标注异常——单次 > 均值 ×5 且 ≥1 积分才算
+  // （低倍率模型 0.0x 积分的自然波动不标；无基线/无 credit 的请求不标）。
   if (p === '/recent-requests' && method === 'GET') {
-    return sendJson(res, 200, { ok: true, requests: recentRequests(20) });
+    const avg = todayAvgCreditByModel();
+    const requests = recentRequests(50).map((r) => {
+      const base = r.credit != null ? avg[`${r.site}/${r.model}`] : null;
+      if (base != null && base > 0 && r.credit > base * 5 && r.credit >= 1) {
+        return { ...r, creditAvg: Math.round(base * 100) / 100, anomaly: true };
+      }
+      return r;
+    });
+    return sendJson(res, 200, { ok: true, requests });
+  }
+
+  // 事件时间线（T6）：系统/任务/账号/策略等结构化事件的统一视图，前端过滤 kind
+  if (p === '/events' && method === 'GET') {
+    const limit = Math.min(300, Number(url.searchParams.get('limit')) || 300);
+    return sendJson(res, 200, { ok: true, events: recentEvents({ limit }) });
+  }
+
+  // 上下文压缩统计（T10）：累计总量 + 最近事件
+  if (p === '/compressions' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, ...compressionStats() });
+  }
+
+  // 模型健康巡检（T8）：查结果 / 手动跑一轮（同步，模型多时需等 10~30 秒）/ 保存定时设置
+  if (p === '/health' && method === 'GET') {
+    return sendJson(res, 200, healthStatus(cfg));
+  }
+  if (p === '/health/scan' && method === 'POST') {
+    const r = await runHealthScan(cfg);
+    return sendJson(res, r.ok ? 200 : 409, r);
+  }
+  if (p === '/health/config' && method === 'POST') {
+    const body = ctx.body || {};
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+      cfg.healthCheck.enabled = body.enabled;
+    }
+    if (body.times !== undefined) {
+      const times = String(body.times ?? '')
+        .split(/[,，;；\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((s) => s.padStart(5, '0'));
+      if (times.some((s) => !/^([01]?\d|2[0-3]):[0-5]\d$/.test(s))) {
+        return sendJson(res, 400, { ok: false, error: `times 里有非法时点（应为 HH:MM，如 08:00）：${times.join(',')}` });
+      }
+      cfg.healthCheck.times = times;
+    }
+    saveConfig(cfg);
+    // 定时开关/时点立即生效：先停旧循环再按新配置启动（startHealthLoop 对重复调用幂等）
+    const { stopHealthLoop, startHealthLoop } = await import('./health.mjs');
+    stopHealthLoop();
+    startHealthLoop(cfg);
+    return sendJson(res, 200, { ok: true, config: { enabled: cfg.healthCheck.enabled, times: cfg.healthCheck.times } });
+  }
+
+  // ---- workbuddy-bridge：每日积分预算（T13）----
+  if (p === '/budget' && method === 'GET') {
+    return sendJson(res, 200, budgetStatus(cfg));
+  }
+  if (p === '/budget' && method === 'POST') {
+    const body = ctx.body || {};
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+      cfg.budget.enabled = body.enabled;
+    }
+    if (body.dailyCredits !== undefined) {
+      const n = Number(body.dailyCredits);
+      if (!Number.isFinite(n) || n <= 0) return sendJson(res, 400, { ok: false, error: 'dailyCredits 必须是正数' });
+      cfg.budget.dailyCredits = n;
+    }
+    if (body.warnPercent !== undefined) {
+      const n = Number(body.warnPercent);
+      if (!Number.isFinite(n) || n <= 0 || n >= 100) return sendJson(res, 400, { ok: false, error: 'warnPercent 必须是 (0,100) 之间的数' });
+      cfg.budget.warnPercent = n;
+    }
+    if (body.mode !== undefined) {
+      if (!['warn', 'free'].includes(body.mode)) return sendJson(res, 400, { ok: false, error: 'mode 必须是 warn/free' });
+      cfg.budget.mode = body.mode;
+    }
+    saveConfig(cfg);
+    return sendJson(res, 200, { ok: true, budget: budgetStatus(cfg) });
   }
 
   // ---- 号池：启用/禁用、重置状态、删除、改标签 ----
@@ -463,12 +579,258 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, 200, { ok: true, site, remaining: 0 });
   }
 
+  // ---- T18：多 apiKey 管理（列表 / 新增 / 删除）----
+  // 注意 apiKey 是数组或字符串两种形态，统一走 authKeys() 规范化成数组再操作，
+  // 保存时永远写回数组（loadConfig 对数组形态有校验，字符串形态只是向后兼容）。
+  if (p === '/keys' && method === 'GET') {
+    const keys = authKeys(cfg);
+    return sendJson(res, 200, { ok: true, keys: keys.map((k, i) => ({ index: i, masked: maskKey(k), isPrimary: i === 0, hint: k === primaryKey(cfg) ? '控制台复制接入配置时显示的就是这把' : '' })) });
+  }
+  if (p === '/keys/add' && method === 'POST') {
+    const body = ctx.body || {};
+    // 不带 key 时自动生成一把（控制台「添加 Key」按钮的默认路径）
+    const raw = String(body.key || '').trim() || 'sk-wb-' + crypto.randomBytes(12).toString('hex');
+    if (!/^sk-wb-/.test(raw)) return sendJson(res, 400, { error: 'key 须以 sk-wb- 开头（与本服务密钥风格一致，防手粘错别的服务的 key）' });
+    const keys = authKeys(cfg);
+    if (keys.includes(raw)) return sendJson(res, 409, { error: '该 key 已存在' });
+    keys.push(raw);
+    cfg.apiKey = keys;
+    saveConfig(cfg);
+    return sendJson(res, 200, { ok: true, count: keys.length, masked: maskKey(raw), key: raw, generated: !body.key });
+  }
+  if (p === '/keys/remove' && method === 'POST') {
+    const body = ctx.body || {};
+    const raw = String(body.key || '').trim();
+    const keys = authKeys(cfg);
+    if (raw === primaryKey(cfg)) return sendJson(res, 400, { error: '主密钥不能删除（它出现在接入配置里）；要换主密钥请先删到只剩它之外的 key 再手动调整顺序，或直接改 config.json' });
+    const next = keys.filter((k) => k !== raw);
+    if (next.length === keys.length) return sendJson(res, 404, { error: 'key 不存在' });
+    if (!next.length) return sendJson(res, 400, { error: '不能删掉最后一把 key（删了服务就不做鉴权了）' });
+    cfg.apiKey = next;
+    saveConfig(cfg);
+    return sendJson(res, 200, { ok: true, count: next.length });
+  }
+
+  // ---- T19：路由规则（别名 + 模型→站点钉死路由 + 全局白/黑名单）----
+  if (p === '/routes' && method === 'GET') {
+    const m = await mergedModels(cfg);
+    return sendJson(res, 200, {
+      aliases: cfg.modelAliases || {},
+      routes: cfg.modelRoutes || {},
+      allowModels: cfg.allowModels || [],
+      excludeModels: cfg.excludeModels || [],
+      models: m.map((x) => ({ id: x.id, site: x.site, aliasOf: x.aliasOf || null })),
+    });
+  }
+  if (p === '/routes' && method === 'POST') {
+    const body = ctx.body || {};
+    // 每个子项独立合并：前端一次只改一块，也允许整包提交
+    if (body.aliases !== undefined) {
+      if (!isPlainObj(body.aliases)) return sendJson(res, 400, { error: 'aliases 必须是对象（别名 → 模型 或 站点/模型）' });
+      for (const [k, v] of Object.entries(body.aliases)) {
+        if (!k.trim() || typeof v !== 'string' || !v.trim()) return sendJson(res, 400, { error: `别名 ${k} 的键值都不能为空` });
+      }
+      cfg.modelAliases = body.aliases;
+    }
+    if (body.routes !== undefined) {
+      if (!isPlainObj(body.routes)) return sendJson(res, 400, { error: 'routes 必须是对象（模型 → 站点）' });
+      for (const [k, v] of Object.entries(body.routes)) {
+        if (!k.trim() || !cfg.sites[v]) return sendJson(res, 400, { error: `路由 ${k} 指向的站点 "${v}" 不存在或未启用` });
+      }
+      cfg.modelRoutes = body.routes;
+    }
+    for (const field of ['allowModels', 'excludeModels']) {
+      if (body[field] !== undefined) {
+        if (!Array.isArray(body[field]) || body[field].some((s) => typeof s !== 'string')) {
+          return sendJson(res, 400, { error: `${field} 必须是字符串数组（支持 * 通配符）` });
+        }
+        cfg[field] = body[field].map((s) => s.trim()).filter(Boolean);
+      }
+    }
+    saveConfig(cfg);
+    return sendJson(res, 200, { ok: true, aliases: cfg.modelAliases, routes: cfg.modelRoutes, allowModels: cfg.allowModels, excludeModels: cfg.excludeModels });
+  }
+
+  // ---- T19：模型清单过滤（白/黑名单预览：保存前看看哪些模型会被剔除）----
+  if (p === '/models-filter' && method === 'POST') {
+    const body = ctx.body || {};
+    const patch = {};
+    for (const field of ['allowModels', 'excludeModels']) {
+      if (Array.isArray(body[field])) patch[field] = body[field];
+    }
+    const { isExcluded } = await import('./router.mjs');
+    const trial = { ...cfg, ...patch };
+    const m = await mergedModels(cfg);
+    const rows = m.map((x) => ({ id: x.id, site: x.site, kept: !isExcluded(trial, x.site, x.id) }));
+    return sendJson(res, 200, { ok: true, total: rows.length, kept: rows.filter((r) => r.kept).length, rows });
+  }
+
+  // ---- T20：按时段路由 ----
+  if (p === '/schedule-router' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, scheduleRouter: cfg.scheduleRouter, defaultModel: cfg.defaultModel });
+  }
+  if (p === '/schedule-router' && method === 'POST') {
+    const body = ctx.body || {};
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+      cfg.scheduleRouter.enabled = body.enabled;
+    }
+    const parseTimes = (v) => String(v ?? '').trim().padStart(5, '0');
+    for (const [k, key] of [['dayStart', 'dayStart'], ['nightStart', 'nightStart']]) {
+      if (body[k] !== undefined) {
+        const v = parseTimes(body[k]);
+        if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(v)) return sendJson(res, 400, { ok: false, error: `${k} 必须是 HH:MM` });
+        cfg.scheduleRouter[k] = v;
+      }
+    }
+    for (const k of ['dayModel', 'nightModel']) {
+      if (body[k] !== undefined) {
+        if (typeof body[k] !== 'string') return sendJson(res, 400, { ok: false, error: `${k} 必须是字符串（留空表示该时段不改道）` });
+        cfg.scheduleRouter[k] = body[k].trim();
+      }
+    }
+    saveConfig(cfg);
+    return sendJson(res, 200, { ok: true, scheduleRouter: cfg.scheduleRouter });
+  }
+
+  // ---- T21：配置备份导出/导入（config + 账号池 + learned/usage/tasks/events/health）----
+  // 凭证敏感（pool 里是上游 token），所以本接口与 /zcode-config 同级：仅本机 + 鉴权后才可调。
+  if (p === '/backup' && method === 'GET') {
+    const files = {};
+    const want = ['config.json', 'learned.json', 'usage.json', 'tasks-state.json', 'events.json', 'health.json'];
+    for (const name of want) {
+      try {
+        const f = path.join(paths.root, name);
+        if (fs.existsSync(f)) files[name] = JSON.parse(fs.readFileSync(f, 'utf8'));
+      } catch { /* 单个文件坏了跳过，别拖垮整个备份 */ }
+    }
+    // 账号池：auth.<site>.pool.json
+    for (const site of siteKeys(cfg)) {
+      try {
+        const f = poolPathFor(site);
+        if (fs.existsSync(f)) files[`auth.${site}.pool.json`] = JSON.parse(fs.readFileSync(f, 'utf8'));
+      } catch { /* 同上 */ }
+    }
+    return sendJson(res, 200, {
+      ok: true,
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      pluginVersion: pkgVersion(),
+      files,
+    });
+  }
+  if (p === '/backup/restore' && method === 'POST') {
+    const body = ctx.body || {};
+    const files = body.files;
+    if (!isPlainObj(files) || !Object.keys(files).length) return sendJson(res, 400, { error: '缺少 files 对象（用 /backup 的返回体原样 POST 回来即可）' });
+    const known = new Set(['config.json', 'learned.json', 'usage.json', 'tasks-state.json', 'events.json', 'health.json']);
+    for (const site of siteKeys(cfg)) known.add(`auth.${site}.pool.json`);
+    const accepted = [], skipped = [];
+    for (const [name, val] of Object.entries(files)) {
+      if (!known.has(name)) { skipped.push(name); continue; }
+      if (val === null || typeof val !== 'object') { skipped.push(name); continue; }
+      // 先把要被覆盖的文件备份成 .prestore-<ts>，恢复错了还能手工救回来
+      try {
+        const f = name.startsWith('auth.') ? poolPathFor(name.replace(/^auth\.(.*)\.pool\.json$/, '$1')) : path.join(paths.root, name);
+        if (fs.existsSync(f)) fs.copyFileSync(f, `${f}.prestore-${Date.now()}`);
+        writeJsonFileAtomic(f, val, { mode: name.startsWith('auth.') ? 0o600 : undefined });
+        accepted.push(name);
+      } catch (e) {
+        skipped.push(`${name}（${String(e.message || e).slice(0, 60)}）`);
+      }
+    }
+    return sendJson(res, 200, { ok: accepted.length > 0, accepted, skipped, note: '恢复的 config.json 需重启服务生效（下方「重启服务」按钮）；账号池/统计类文件已被新流程即时读取' });
+  }
+
+  // ---- T22：插件自更新检查 ----
+  if (p === '/update-check' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, ...(await checkForUpdate()) });
+  }
+
+  // ---- 交棒重启（T21 恢复 config 后用；与 /admin/restart 同一条安全路径）----
+  if (p === '/service/restart' && method === 'POST') {
+    const { requestRestart } = await import('./lifecycle.mjs');
+    try {
+      const r = requestRestart();
+      return sendJson(res, 200, { ok: true, pid: r.pid, message: r.waiting ? `新实例 ${r.pid} 排队中，本实例等 ${r.active} 个请求完成后交棒（连接不断）` : `新实例 ${r.pid} 即将接管端口` });
+    } catch (e) {
+      return sendJson(res, e.status || 500, { ok: false, error: String(e.message || e) });
+    }
+  }
+
   // ---- 服务控制 ----
   if (p === '/service/stop' && method === 'POST') {
     sendJson(res, 200, { ok: true, message: 'shutting down' });
     flushUsage();
     setTimeout(() => process.exit(0), 200);
     return;
+  }
+
+  // ---- T23：控制台访问 PIN（控制台里的设置卡片；PIN 值永远不回传，只回是否已启用）----
+  if (p === '/security' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, pinEnabled: Boolean(cfg.consolePin) });
+  }
+  if (p === '/security' && method === 'POST') {
+    const body = ctx.body || {};
+    // 已启用时改动需先验证当前 PIN（防旁人趁 unlocked 页面顺手关掉）；未启用时直接设
+    if (cfg.consolePin && String(body.currentPin ?? '').trim() !== String(cfg.consolePin).trim()) {
+      return sendJson(res, 403, { ok: false, error: '当前 PIN 不正确' });
+    }
+    const next = String(body.pin ?? '').trim();
+    if (next === '') {
+      cfg.consolePin = null; // 清空 = 关闭锁屏
+      saveConfig(cfg);
+      recordEvent('system', '控制台访问 PIN 已关闭');
+      return sendJson(res, 200, { ok: true, pinEnabled: false });
+    }
+    if (!/^\d{4,12}$/.test(next)) return sendJson(res, 400, { ok: false, error: 'PIN 必须是 4-12 位数字' });
+    cfg.consolePin = next;
+    saveConfig(cfg);
+    recordEvent('system', '控制台访问 PIN 已启用/更新');
+    return sendJson(res, 200, { ok: true, pinEnabled: true });
+  }
+
+  // ---- T24：一键诊断（/wbp-doctor 与控制台「诊断」共用同一份体检逻辑）----
+  if (p === '/doctor' && method === 'GET') {
+    const d = await runDiagnostics(cfg);
+    return sendJson(res, 200, { ok: true, ...d });
+  }
+
+  // ---- T29：控制台推送流（SSE）----
+  // 把账号/任务/用量三类高频轮询（原来前端各挂一个 setInterval 30~60s）合并成一条
+  // 服务端推送：bridge 每 20s、tasks 每 30s、usage 每 60s 各发一个具名事件；
+  // 前端 EventSource 按事件名分发。轮询代码保留作降级（SSE 建不上时自动回落）。
+  if (p === '/stream' && method === 'GET') {
+    const { startSSE, writeSSEEvent } = await import('./util.mjs');
+    startSSE(res, { 'X-Console-Stream': 'workbuddy-bridge' });
+    let closed = false;
+    res.on('close', () => { closed = true; });
+    const push = async (event, data) => {
+      if (closed || res.writableEnded) return false;
+      try { await writeSSEEvent(res, event, JSON.stringify(data)); return true; }
+      catch { closed = true; return false; }
+    };
+    // 首帧立即给，前端建流后不用再等一个周期
+    await push('bridge', bridgeStatus(cfg, { redact: true }));
+    await push('tasks', taskStatus());
+    await push('usage', usageSnapshot(7));
+    const jobs = [
+      ['bridge', () => bridgeStatus(cfg, { redact: true }), 20_000],
+      ['tasks', () => taskStatus(), 30_000],
+      ['usage', () => usageSnapshot(7), 60_000],
+      ['ping', () => ({ at: Date.now() }), 15_000], // 保活帧（也兼作服务存活探测）
+    ];
+    for (const [event, make, ms] of jobs) {
+      const t = setInterval(async () => {
+        if (closed) { clearInterval(t); return; }
+        try {
+          const ok = await push(event, make());
+          if (!ok) clearInterval(t);
+        } catch { clearInterval(t); }
+      }, ms);
+      t.unref?.();
+    }
+    return; // SSE 常开，不落入 JSON 返回
   }
 
   return sendJson(res, 404, { error: `未知控制台接口 ${method} ${p}` });

@@ -41,6 +41,7 @@ function loadLearned() {
     for (const [k, v] of Object.entries(data.calibration || {})) {
       if (Number.isFinite(v) && v >= 1 && v <= 4) estimateCalibration.set(k, v);
     }
+    loadCompressions(data);
   } catch {
     // 坏了就当没学过：重新学只是慢，不影响正确性
   }
@@ -60,6 +61,7 @@ function saveLearnedNow() {
     const data = {
       limits: Object.fromEntries(learnedLimits),
       calibration: Object.fromEntries(estimateCalibration),
+      compressions: { totals: compressTotals, events: compressEvents.slice(-MAX_COMPRESS_EVENTS) },
     };
     fs.writeFileSync(LEARNED_FILE(), JSON.stringify(data, null, 2) + '\n', 'utf8');
   } catch {
@@ -234,12 +236,126 @@ export function isProviderParamRejection(text) {
 export function resetLearnedLimits() {
   learnedLimits.clear();
   estimateCalibration.clear();
+  compressEvents.length = 0;
+  compressTotals.count = 0;
+  compressTotals.dropped = 0;
+  compressTotals.truncated = 0;
+  compressTotals.savedTokens = 0;
   learnedLoadedFrom = null; // 让下次 loadLearned 重新从（可能已变化的）配置目录读
   try {
     if (fs.existsSync(LEARNED_FILE())) fs.unlinkSync(LEARNED_FILE());
   } catch {
     // 删不掉也无妨：内存里已经空了
   }
+}
+
+// ---------------- 压缩事件统计（T10：上下文压缩统计可视化）----------------
+//
+// 压缩一直在默默工作（openChat 的预压缩 + 超限后的按比例收缩重试），但从没留下过
+// 记录——用户在控制台看不到它救了多少次请求、省了多少 token。这里把每次压缩记成
+// 结构化事件，与学习数据共用 learned.json（同一套惰性加载 + 节流落盘，无新文件）。
+// 事件只留最近 100 条，totals 永久累计。
+
+const MAX_COMPRESS_EVENTS = 100;
+const compressEvents = []; // 旧 → 新：{ at, site, model, phase, dropped, truncated, before, after, limit }
+const compressTotals = { count: 0, dropped: 0, truncated: 0, savedTokens: 0 };
+
+/** 从 learned.json 恢复压缩统计（loadLearned 调用）。 */
+function loadCompressions(data) {
+  const c = data?.compressions;
+  if (!c) return;
+  if (c.totals && typeof c.totals === 'object') {
+    for (const k of ['count', 'dropped', 'truncated', 'savedTokens']) {
+      if (Number.isFinite(c.totals[k])) compressTotals[k] = c.totals[k];
+    }
+  }
+  if (Array.isArray(c.events)) {
+    for (const e of c.events.slice(-MAX_COMPRESS_EVENTS)) {
+      if (e && typeof e === 'object') compressEvents.push(e);
+    }
+  }
+}
+
+/**
+ * 记录一次压缩。stats 是 fitMessages/applyContextFit 返回的统计（applied=true 才记）。
+ * phase：'primary' = openChat 发送前的预压缩；'retry' = 超限后按比例收缩的重试路径。
+ */
+export function recordCompression(site, model, stats, { phase = 'primary' } = {}) {
+  if (!stats?.applied) return;
+  compressEvents.push({
+    at: new Date().toISOString(),
+    site: site || null,
+    model: model || null,
+    phase,
+    dropped: stats.dropped || 0,
+    truncated: stats.truncated || 0,
+    before: stats.before || 0,
+    after: stats.after || 0,
+    limit: stats.limit ?? null,
+  });
+  if (compressEvents.length > MAX_COMPRESS_EVENTS) compressEvents.splice(0, compressEvents.length - MAX_COMPRESS_EVENTS);
+  compressTotals.count += 1;
+  compressTotals.dropped += stats.dropped || 0;
+  compressTotals.truncated += stats.truncated || 0;
+  compressTotals.savedTokens += Math.max(0, (stats.before || 0) - (stats.after || 0));
+  scheduleLearnedSave();
+}
+
+/** 压缩统计视图（/console/api/compressions 用，事件新→旧）。 */
+export function compressionStats() {
+  loadLearned();
+  return { totals: { ...compressTotals }, events: compressEvents.slice(-80).reverse() };
+}
+
+// ---------------- 会话压缩进度记忆（T28）----------------
+//
+// 场景：同一个长会话里，第 N 个请求撞了 400 → 按比例收缩重试才成功；第 N+1 个请求
+// 只多了几百 token，却还要从全量重新撞一遍 400、白等 20~30 秒——上游报错路径昂贵，
+// 而我们会话的形状几乎没变。
+//
+// 做法：以「会话尾巴」为键（最后一条 user 消息 + 消息条数的哈希，同会话连续请求的
+// 尾巴稳定，不同会话几乎必不相同），记下上次压到的预算。下次预压缩时若命中同一会话，
+// 直接从上次预算往下压（仍走 fitMessages 保证正确性），跳过「先撞 400」的学费。
+//
+// 内存有界（最多 200 条，LRU 淘汰），进程重启即清——这只是加速缓存，不是事实源。
+
+const MAX_SESSION_MEMOS = 200;
+const sessionMemos = new Map(); // tailKey → { budget, at, site, model }
+
+/** 会话尾巴键：最后一条消息的内容哈希 + 消息条数。相邻请求共享尾巴（客户端追加式生长）。 */
+export function sessionTailKey(messages) {
+  if (!Array.isArray(messages) || !messages.length) return null;
+  const last = messages[messages.length - 1];
+  const text = typeof last?.content === 'string' ? last.content : JSON.stringify(last?.content ?? '');
+  let h = 0;
+  for (let i = Math.max(0, text.length - 4000); i < text.length; i++) {
+    h = ((h * 31) + text.charCodeAt(i)) | 0;
+  }
+  return `${h}:${messages.length}`;
+}
+
+/** 查某会话上次压到的预算；没有记过返回 null。 */
+export function sessionMemoBudget(messages) {
+  const key = sessionTailKey(messages);
+  if (!key) return null;
+  const memo = sessionMemos.get(key);
+  return memo ? memo : null;
+}
+
+/** 记下「这个会话形状上次压到了多少预算」。 */
+export function rememberSessionBudget(messages, budget, { site = null, model = null } = {}) {
+  const key = sessionTailKey(messages);
+  if (!key || !Number.isFinite(budget) || budget <= 0) return;
+  if (sessionMemos.has(key)) sessionMemos.delete(key); // LRU：先删再插，命中信息保持在最前
+  sessionMemos.set(key, { budget: Math.floor(budget), at: Date.now(), site, model });
+  while (sessionMemos.size > MAX_SESSION_MEMOS) {
+    sessionMemos.delete(sessionMemos.keys().next().value);
+  }
+}
+
+/** 测试隔离：清空会话压缩记忆。 */
+export function resetSessionMemos() {
+  sessionMemos.clear();
 }
 
 /**

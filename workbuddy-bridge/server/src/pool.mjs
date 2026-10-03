@@ -29,6 +29,7 @@ import { getConfigDir, authPathFor, loadConfig } from './config.mjs';
 import { orderAccounts } from './expiry.mjs';
 import { warn } from './log.mjs';
 import { writeJsonFileAtomic, readJsonFileWithBackup } from './util.mjs';
+import { recordEvent } from './events.mjs';
 
 /** 池文件里代表「旧版单账号凭证」的固定 id。 */
 export const DEFAULT_ACCOUNT_ID = 'default';
@@ -406,6 +407,14 @@ export function markSuccess(site, id) {
  * 路由就会一直把已经 429 的单账号站点当成健康站点（详见 legacyState 说明）。
  */
 export function markFailure(site, id, { status = 0, message = '' } = {}) {
+  // 事件时间线（T6）：账号失败/冷却进时间线。冷却阶梯会挡住连续重试，
+  // 所以正常情况下不会刷屏；真刷屏本身就是「该账号在持续失败」的信号。
+  recordEvent(
+    'account',
+    `账号请求失败${status ? `（HTTP ${status}）` : ''}：${String(message || '未知原因').slice(0, 140)}`
+      + (isQuotaError(status, message) ? '，判定额度耗尽' : ''),
+    { site, accountId: id },
+  );
   if (!hasPoolFile(site)) return mutateLegacy(site, id, (a) => applyFailure(a, { status, message }));
   return mutate(site, (pool) => {
     const a = pool.accounts.find((x) => x.id === id);
@@ -416,8 +425,16 @@ export function markFailure(site, id, { status = 0, message = '' } = {}) {
 
 /** 明确标记某账号额度耗尽（由额度查询/业务码驱动）。 */
 export function markExhausted(site, id, message = '额度不足') {
+  // 事件时间线（T6）：只在「可用 → 耗尽」的转变时记一条——余额轮询会对已耗尽的
+  // 账号反复调用这里，不判转变的话时间线每 30 秒就被刷一条重复事件。
+  const announce = (a) => {
+    if (!a.exhaustedAt) {
+      recordEvent('account', `账号额度耗尽：${String(message).slice(0, 140)}`, { site, accountId: id });
+    }
+  };
   if (!hasPoolFile(site)) {
     return mutateLegacy(site, id, (a) => {
+      announce(a);
       a.exhaustedAt = Date.now();
       a.cooldownUntil = null;
       a.lastError = String(message).slice(0, 200);
@@ -427,6 +444,7 @@ export function markExhausted(site, id, message = '额度不足') {
   return mutate(site, (pool) => {
     const a = pool.accounts.find((x) => x.id === id);
     if (!a) return null;
+    announce(a);
     a.exhaustedAt = Date.now();
     a.cooldownUntil = null;
     a.lastError = String(message).slice(0, 200);

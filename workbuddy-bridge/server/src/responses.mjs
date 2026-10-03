@@ -10,7 +10,7 @@ import { resolveTarget } from './router.mjs';
 import { openWithSiteFallback } from './openai.mjs';
 import { openChat, openChatRotating, classifyFrame, upstreamErrorMessage } from './upstream.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
-import { startSSE, writeSSEEvent, sendJson, sendError, estimateTokens } from './util.mjs';
+import { startSSE, writeSSEEvent, sendJson, sendError, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
 
 /** 生成 Responses 风格 id。 */
@@ -274,7 +274,7 @@ export async function handleResponses(ctx) {
   site = r.site;
   model = r.model;
   if (!up.ok) {
-    requestLog({ site, model, mode: 'responses', status: up.status, ms: Date.now() - started, note: 'upstream_reject' });
+    requestLog({ site, model, account: up.accountId, mode: 'responses', status: up.status, ms: Date.now() - started, note: 'upstream_reject' });
     return sendError(res, up.status, upstreamErrorMessage(up.status, up.text, site));
   }
 
@@ -323,6 +323,8 @@ export async function handleResponses(ctx) {
 
   // ---------- 流式 ----------
   startSSE(res, { 'X-Service': 'workbuddy-proxy', 'X-Upstream-Site': site });
+  // T27 心跳：Codex/DSH 长思考期间用 SSE 注释帧防空闲断流（注释行对协议无感）
+  const heartbeat = startHeartbeat(res);
 
   let seq = 0;
   const emit = (type, payload) =>
@@ -583,14 +585,20 @@ export async function handleResponses(ctx) {
   } catch (e) {
     warn(`[${site}] Responses 流式转换异常：${e?.message || e}`);
   } finally {
+    heartbeat.stop();
     up.close();
     if (!res.writableEnded) res.end();
+    // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage
+    const credit = await estimateCredit(cfg, site, model, upstreamUsage?.credit,
+      upstreamUsage?.prompt_tokens ?? 0, upstreamUsage?.completion_tokens ?? 0);
     requestLog({
       site,
+      account: up.accountId,
       model,
       mode: 'responses',
       status: finished ? 200 : 499,
       ms: Date.now() - started,
+      credit,
     });
     recordUsage({
       site,
@@ -599,8 +607,7 @@ export async function handleResponses(ctx) {
       status: finished ? 200 : 499,
       promptTokens: upstreamUsage?.prompt_tokens ?? estimateTokens(JSON.stringify(chatReq.messages || [])),
       completionTokens: upstreamUsage?.completion_tokens ?? estimateTokens('x'.repeat(contentChars)),
-      credit: await estimateCredit(cfg, site, model, upstreamUsage?.credit,
-        upstreamUsage?.prompt_tokens ?? 0, upstreamUsage?.completion_tokens ?? 0),
+      credit,
       ms: Date.now() - started,
       tools: toolItems.size,
     });

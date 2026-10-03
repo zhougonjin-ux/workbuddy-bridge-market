@@ -75,6 +75,18 @@ export function sendJson(res, status, obj) {
   res.end(body);
 }
 
+/** 同 sendJson，但允许调用方追加响应头（如 T23 控制台解锁接口的 Set-Cookie）。 */
+export function sendJsonWith(res, status, obj, extraHeaders = {}) {
+  const body = JSON.stringify(obj);
+  if (res.headersSent) return;
+  res.writeHead(status, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Length': Buffer.byteLength(body),
+    ...extraHeaders,
+  });
+  res.end(body);
+}
+
 export function sendError(res, status, message, type = 'upstream_error') {
   sendJson(res, status, { error: { message, type, code: status } });
 }
@@ -108,8 +120,41 @@ export function writeSSEEvent(res, event, payload) {
   return writeAsync(res, `event: ${event}\ndata: ${payload}\n\n`);
 }
 
+/**
+ * 流式心跳（T27）：上游「长时间只思考不吐字」（deepseek/glm 高强度推理实测可达数分钟）
+ * 时，客户端与中间层可能因空闲超时掐断连接（Claude Code、反代、浏览器各有 30~120s 空闲窗）。
+ * SSE 注释行（`: ping`）是协议保留的死信通道：任何标准客户端都会忽略，不算数据帧。
+ * 返回 setInterval 句柄，调用方在流结束后 clearInterval（stop() 里同时补发一次清缓冲）。
+ */
+export function startHeartbeat(res, { intervalMs = 15000 } = {}) {
+  const timer = setInterval(() => {
+    if (res.destroyed || res.writableEnded) return;
+    res.write(': ping\n\n');
+  }, Math.max(3000, intervalMs));
+  timer.unref?.();
+  return {
+    stop() {
+      clearInterval(timer);
+    },
+  };
+}
+
 export function estimateTokens(text) {
   if (!text) return 0;
   // 粗略估算：中英混排按 3 字符 ≈ 1 token
   return Math.max(1, Math.ceil(String(text).length / 3));
+}
+
+/**
+ * 失败自动重试一次（T12）：fn 抛错时等 backoffMs 再试一次，仍失败才抛出。
+ * 只重试一次是有意的：任务类操作（签到/领奖）重试成本为零，但多轮重试会把
+ * 「上游暂时抖动」放大成「连续打上游」，退避阶梯已经由账号池的冷却机制负责。
+ */
+export async function withRetryOnce(fn, { backoffMs = 1500 } = {}) {
+  try {
+    return await fn();
+  } catch (e) {
+    if (backoffMs > 0) await new Promise((r) => setTimeout(r, backoffMs));
+    return fn();
+  }
 }
