@@ -117,6 +117,51 @@ input[type=date]{color-scheme:dark}
 .empty{color:var(--muted);text-align:center;padding:26px;border:1px dashed var(--line);border-radius:10px}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--muted);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:6px}
 @keyframes sp{to{transform:rotate(360deg)}}
+
+/* ---------- T38 移动端适配 ----------
+   手机上看这张控制台的真实场景是「人不在电脑前，收个推送顺手查一眼」，
+   窄屏优先级：① 顶栏预警条不被挤没 ② 页签能横向滚到 ③ 表格能横滑
+   ④ 卡片单列、按钮够大能点。桌面端布局完全不受影响（媒体查询仅窄屏生效）。 */
+@media (max-width: 720px){
+  header{padding:10px 12px;gap:8px}
+  .brand{font-size:14px}
+  #srvMeta{margin-left:0;width:100%;order:3}
+  /* 预警条独占一行；顶栏太高会把正文挤出屏幕 */
+  #alerts{order:4;flex-direction:column;gap:6px}
+  .alertbar{font-size:12px;padding:6px 10px;line-height:1.5}
+  /* 8 个页签在 375px 宽屏放不下，折成一行可横向滑动的条 */
+  nav{padding:8px 12px 0;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+  nav::-webkit-scrollbar{display:none}
+  nav button{padding:9px 12px;font-size:13px;white-space:nowrap;flex:0 0 auto}
+  main{padding:14px 12px 48px}
+  h2{font-size:14px;flex-wrap:wrap;gap:4px 8px;margin:18px 0 8px}
+  h2 .sub{flex-basis:100%;font-size:11.5px}
+  /* 卡片单列；表格保持自身宽度由外层横滑（压缩列宽会把中文挤成竖条） */
+  .accts,.policies,.kpis,.grid{grid-template-columns:1fr!important}
+  .card{padding:12px;border-radius:10px}
+  .row{gap:8px}
+  /* 触摸目标 ≥40px（iOS HIG 建议 44，取折中值） */
+  button.btn{padding:9px 14px;font-size:13.5px;min-height:40px}
+  button.btn.mini{padding:7px 11px;min-height:34px}
+  select,input[type=text],input[type=number],input[type=date]{padding:9px 10px;font-size:16px}
+  /* 16px 是硬要求：iOS Safari 聚焦时输入框小于 16px 会自动放大整页，导致没法输入 */
+  input[type=number],input[type=text]{width:100%!important;max-width:220px}
+  table{font-size:12.5px;min-width:520px}
+  th,td{padding:7px 8px}
+  .modal .box{width:100%;padding:16px;max-width:100vw}
+  #toast{left:12px;right:12px;bottom:12px}
+  .toast{max-width:none}
+  .bal{font-size:22px}
+  .bars{height:84px;gap:4px}
+  .bars .col span{font-size:9px;transform:rotate(-45deg);transform-origin:center}
+  #logBox{height:52vh;font-size:11.5px}
+  .plan .step{font-size:12px;padding:6px 9px}
+}
+/* 横屏手机（高度很矮）：再收一档，减少纵向滚动 */
+@media (max-width: 720px) and (max-height: 480px){
+  .bars{height:64px}
+  h2{margin:12px 0 6px}
+}
 </style>
 </head>
 <body>
@@ -265,9 +310,13 @@ async function loadHeader() {
 }
 
 /* ---------- 顶栏积分预警（所有页签常驻，60s 轮询；无命中不渲染） ---------- */
-const ALERT_LOW_BALANCE = 200; // 任一账号余额 ≤ 此值 → 红「余额不足」
-const ALERT_EXPIRE_DAYS = 7;   // 批次 N 天内到期
-const ALERT_EXPIRE_MIN = 500;  // 且批次余量 > 此值 → 橙「到期提醒」
+// T34：这三个阈值原先写死在这里，现由后端 /bridge 的 alerts 字段下发（config.alerts）。
+// 取不到时回落到与旧硬编码相同的默认值——后端不可达时预警条仍能按老逻辑工作。
+const ALERT_FALLBACK = { lowBalance: 200, expiryDays: 7, expiryMinAmount: 500 };
+let ALERT_TH = { ...ALERT_FALLBACK };
+const alLow = () => ALERT_TH.lowBalance;
+const alDays = () => ALERT_TH.expiryDays;
+const alMin = () => ALERT_TH.expiryMinAmount;
 
 // T22：更新提示 12h 提一次（localStorage 节流，用户点「知道了」也顺延 12h）
 async function loadUpdateAlert(items) {
@@ -296,21 +345,25 @@ async function loadAlerts() {
   const el = $('#alerts');
   try {
     const b = await api('/bridge');
+    // T34：阈值随 /bridge 一起下发，改配置后下一轮（≤60s）自动生效
+    ALERT_TH = { ...ALERT_FALLBACK, ...(b.alerts || {}) };
     const items = [];
     // T13：每日积分预算预警（/bridge 里的 budget 状态，后端已做每天一次的提醒节流）
     if (b.budget && b.budget.enabled) {
       const bt = b.budget;
+      const act = bt.mode === 'free' ? '已切免费模型' : bt.mode === 'pause' ? '新请求已被拒绝' : '仅提醒';
+      const actTip = bt.mode === 'free' ? '；default/auto 请求已自动改道免费模型' : bt.mode === 'pause' ? '；所有新模型请求返回 429' : '';
       if (bt.exceeded) {
-        items.push(`<span class="alertbar red" title="今日已消耗 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分${bt.mode === 'free' ? '；default/auto 请求已自动改道免费模型' : ''}">🔴 预算超限：今日 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分（${bt.mode === 'free' ? '已切免费模型' : '仅提醒'}）</span>`);
+        items.push(`<span class="alertbar red" title="今日已消耗 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分${actTip}">🔴 预算超限：今日 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分（${act}）</span>`);
       } else if (bt.warn) {
-        items.push(`<span class="alertbar orange" title="今日已消耗 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分，达到预警线 ${bt.percent >= 0 ? '' : ''}">🟠 预算预警：今日 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分（${bt.percent}%）</span>`);
+        items.push(`<span class="alertbar orange" title="今日已消耗 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分，已达预警线">🟠 预算预警：今日 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分（${bt.percent}%）</span>`);
       }
     }
     const accName = (a) => esc(a.label || a.nickname || a.id);
     for (const s of b.sites || []) for (const a of s.accounts || []) {
       if (a.enabled === false) continue;
       const remain = accountRemainOf(a);
-      if (remain !== null && remain <= ALERT_LOW_BALANCE) {
+      if (remain !== null && remain <= alLow()) {
         items.push(`<span class="alertbar red" title="该账号余额仅剩 ${remain} 积分，继续消耗会触发换号/失败">🔴 余额不足：${accName(a)} 剩 ${remain} 积分</span>`);
       }
       if (String(a.lastError || '').includes('401') || String(a.last_error || '').includes('401')) {
@@ -318,7 +371,7 @@ async function loadAlerts() {
       }
       for (const bt of a.creditDetail || []) {
         const d = fmtDays(bt.expireAt);
-        if (d === null || d < 0 || d > ALERT_EXPIRE_DAYS || (bt.remain || 0) <= ALERT_EXPIRE_MIN) continue;
+        if (d === null || d < 0 || d > alDays() || (bt.remain || 0) <= alMin()) continue;
         items.push(`<span class="alertbar orange" title="快到期的积分先用掉：保持 expiry-first 策略，或多发起调用消耗">${d === 0 ? '不到 1 天' : d + ' 天内'}到期还有 ${fmtCredit(bt.remain)} 积分（${accName(a)} · ${esc(bt.package || '积分包')}）</span>`);
       }
     }
@@ -712,6 +765,17 @@ async function loadModels() {
           <input id="hcTimes" value="${esc((hcfg.times || []).join(', '))}" placeholder="08:00" style="width:110px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
           <button class="btn mini" id="hcSave">保存定时设置</button>
         </div>
+        <div class="row" style="margin-top:9px;padding-top:9px;border-top:1px solid var(--line)">
+          <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="T35 省钱模式：只巡检这写模型（逗号分隔，支持 * 前缀通配如 glm-*）。留空 = 全部模型都探。巡检是真实消耗，探得越少花得越少">
+            <input type="checkbox" id="hcOnlyOn" ${(hcfg.only || []).length ? 'checked' : ''}> 只巡检指定模型
+          </label>
+          <input id="hcOnly" value="${esc((hcfg.only || []).join(', '))}" placeholder="如 glm-5.3-flash, kimi-*" style="width:260px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px" ${(hcfg.only || []).length ? '' : 'disabled'}>
+          <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="只探倍率 0 的免费模型 —— 这批探起来不花积分。适合「只想知道免费模型还能不能用」">
+            <input type="checkbox" id="hcOnlyFree" ${hcfg.onlyFree ? 'checked' : ''}> 只巡检免费模型（x0）
+          </label>
+          <button class="btn mini" id="hcSaveOnly">保存省钱模式</button>
+          <span class="muted" id="hcOnlyNow" style="font-size:12px">${(hcfg.only || []).length || hcfg.onlyFree ? '当前：' + esc(((hcfg.only || []).length ? (hcfg.only || []).join('、') : '全部') + (hcfg.onlyFree ? '（且仅免费）' : '')) : '当前：全量巡检'}</span>
+        </div>
         <div style="overflow:auto">${hrows ? `<table><thead><tr><th>模型</th><th>站点</th><th>倍率</th><th>状态 / 延迟</th></tr></thead><tbody>${hrows}</tbody></table>` : '<div class="muted" style="padding:16px;text-align:center">还没有巡检结果 —— 点「▶ 全量巡检」实测所有模型（约 10~30 秒）</div>'}</div>
       </div>`;
     $('#btnPoolSync').onclick = async () => {
@@ -746,6 +810,20 @@ async function loadModels() {
       try {
         const r = await api('/health/config', { method: 'POST', body: { enabled: $('#hcEnabled').checked, times: $('#hcTimes').value } });
         toast('巡检设置已保存：' + (r.config.enabled ? (r.config.times.length ? '每天 ' + r.config.times.join(' / ') + ' 自动巡检' : '已开启但未填时点（不会自动跑）') : '定时巡检已关闭'), 'ok');
+      } catch (e) { toast('保存失败：' + e.message, 'bad'); }
+    };
+    // T35：省钱模式勾选框控制白名单输入框的可用态（没勾时输入也没意义，后端会当空数组）
+    $('#hcOnlyOn').onchange = () => { $('#hcOnly').disabled = !$('#hcOnlyOn').checked; };
+    $('#hcSaveOnly').onclick = async () => {
+      try {
+        const body = { onlyFree: $('#hcOnlyFree').checked };
+        // 勾了「只巡检指定模型」才提交白名单；没勾就是清空（回到全量）
+        body.only = $('#hcOnlyOn').checked ? $('#hcOnly').value : [];
+        const r = await api('/health/config', { method: 'POST', body });
+        const c = r.config;
+        const desc = (c.only.length ? c.only.join('、') : '全部模型') + (c.onlyFree ? '（且仅免费 x0）' : '');
+        toast('省钱模式已保存：下一轮巡检只探 ' + desc, 'ok');
+        loadModels();
       } catch (e) { toast('保存失败：' + e.message, 'bad'); }
     };
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
@@ -917,16 +995,17 @@ async function loadTasks() {
           <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="达到该比例时顶栏预警 + 桌面通知（每天最多一次）">预警线（%）
             <input id="bdWarn" type="number" min="1" max="99" value="${cfg.budget?.warnPercent ?? 80}" style="width:70px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
           </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="warn=只提醒；free=超预算后 default/auto 自动改道到免费模型（不拦显式指定的模型）">超限动作
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="warn=只提醒；free=超预算后 default/auto 自动改道到免费模型（不拦显式指定的模型）；pause=超预算后直接拒绝所有新模型请求（429），防失控烧积分">超限动作
             <select id="bdMode" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-              <option value="warn" ${cfg.budget?.mode !== 'free' ? 'selected' : ''}>仅提醒</option>
+              <option value="warn" ${cfg.budget?.mode === 'warn' || !cfg.budget?.mode ? 'selected' : ''}>仅提醒</option>
               <option value="free" ${cfg.budget?.mode === 'free' ? 'selected' : ''}>自动切免费模型</option>
+              <option value="pause" ${cfg.budget?.mode === 'pause' ? 'selected' : ''}>暂停新请求（429）</option>
             </select>
           </label>
           <button class="btn" id="bdSave">保存预算</button>
           <span class="muted" id="bdNow" style="font-size:12px"></span>
         </div>
-        <div class="muted" style="font-size:12px;margin-top:8px">预算口径与「用量」页一致（上游没报积分时按倍率×tokens 估算）；显式指定的模型不受「自动切免费」影响。</div>
+        <div class="muted" style="font-size:12px;margin-top:8px">预算口径与「用量」页一致（上游没报积分时按倍率×tokens 估算）；「自动切免费」不影响显式指定的模型，「暂停新请求」则会拦下所有模型请求（含显式指定）。</div>
       </div>
       <div class="row" style="margin-bottom:14px">
         <span class="badge ${cfg.enabled === false ? '' : 'ok'}">总开关：${cfg.enabled === false ? '关' : '开'}</span>
@@ -1176,6 +1255,12 @@ async function loadUsage() {
       <td>${(e.before || 0).toLocaleString()} → ${(e.after || 0).toLocaleString()}</td></tr>`).join('');
     el.innerHTML = `
       <h2>今日 <span class="sub">自 ${esc(u.since || '')} 起累计统计 · 数据在数据目录 usage.json</span></h2>
+      <div class="row" style="margin:-4px 0 12px">
+        <span class="muted" style="font-size:12px">导出报表（T36）：按模型 / 按账号 / 按日期三个维度分段，直接用 Excel 打开</span>
+        <span class="spacer"></span>
+        <button class="btn mini" data-csv="7">⬇ 近 7 天 CSV</button>
+        <button class="btn mini" data-csv="30">⬇ 近 30 天 CSV</button>
+      </div>
       <div class="grid kpis">
         <div class="kpi"><b>${today.calls ?? 0}</b><span>调用次数</span></div>
         <div class="kpi"><b class="${(today.errors || 0) > 0 ? 'bad' : ''}">${today.errors ?? 0}</b><span>错误</span></div>
@@ -1207,6 +1292,28 @@ async function loadUsage() {
       await api('/usage/reset', { method: 'POST' });
       toast('已重置', 'ok'); loadUsage();
     };
+    // T36：CSV 下载。不能直接用 <a href> —— 控制台接口要 X-Console-Token 头，
+    // 裸链接带不上；所以 fetch 回来再转 Blob 触发保存。
+    for (const b of el.querySelectorAll('[data-csv]')) {
+      b.onclick = async () => {
+        const days = b.dataset.csv;
+        b.disabled = true; const old = b.textContent; b.textContent = '导出中…';
+        try {
+          const res = await fetch('/console/api/usage/export?days=' + days, { headers: { 'X-Console-Token': TOKEN } });
+          if (!res.ok) throw new Error('HTTP ' + res.status);
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = 'workbuddy-usage-' + days + 'd.csv';
+          document.body.appendChild(a); a.click(); a.remove();
+          // 立刻 revoke 会让部分浏览器下载中断，给它一帧的寿命
+          setTimeout(() => URL.revokeObjectURL(url), 1000);
+          toast(`已导出近 ${days} 天报表（三个维度）`, 'ok');
+        } catch (e) { toast('导出失败：' + e.message, 'bad'); }
+        b.disabled = false; b.textContent = old;
+      };
+    }
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 
@@ -1271,8 +1378,20 @@ function healthState(a) {
   async function loadHealth() {
     const el = $('#tab-health');
     try {
-      const [bridge, keys, srr, sec] = await Promise.all([
-        api('/bridge'), api('/keys').catch(() => null), api('/schedule-router').catch(() => null), api('/security').catch(() => null)]);
+      const [bridge, keys, srr, sec, nt, pc] = await Promise.all([
+        api('/bridge'), api('/keys').catch(() => null), api('/schedule-router').catch(() => null),
+        api('/security').catch(() => null), api('/notify').catch(() => null), api('/protocol').catch(() => null)]);
+    // T34：预警阈值从 /bridge 下发，写进卡片输入框（loadAlerts 已同步更新同一份）
+    const at = bridge.alerts || {};
+    ALERT_TH = { ...ALERT_FALLBACK, ...(at || {}) };
+    // ---- T39：协议自检结果行 ----
+    const pcSites = (pc && pc.sites) || [];
+    const pcRows = pcSites.length ? `<div style="overflow:auto"><table><thead><tr><th>站点</th><th>结果</th><th>不符项</th></tr></thead><tbody>${pcSites.map((s) => `
+      <tr>
+        <td><b>${esc(s.site)}</b></td>
+        <td>${s.skipped ? `<span class="badge">跳过（${esc(s.error || '未登录')}）</span>` : s.drifted ? `<span class="badge bad">${s.drifted}/${s.total} 项不符</span>` : `<span class="badge ok">${s.total} 项全对</span>`}</td>
+        <td style="font-size:12px">${(s.results || []).map((r) => `<div><code>${esc(r.key)}</code> — ${esc(r.detail)}</div>`).join('') || '<span class="muted">—</span>'}</td>
+      </tr>`).join('')}</tbody></table></div>` : '';
     const sites = bridge.sites || [];
     // ---- T17：账号健康总览（全站点的健康状态一目了然）----
     const allAccs = [];
@@ -1402,7 +1521,51 @@ function healthState(a) {
           <span class="muted" style="font-size:12px">服务只监听 127.0.0.1；PIN 防的是「别人坐在这台电脑前打开控制台」。忘记 PIN 时改数据目录 config.json 的 consolePin 字段。</span>
         </div>
       </div>
-      <h2>一键诊断 <span class="sub">T24 · 只读体检：服务/配置/登录态/账号池/路由/数据文件/后台循环，与 /wbp-doctor 同源</span></h2>
+      <h2>预警阈值 <span class="sub">T34 · 控制台顶栏红色/橙色预警条的判定门槛；改完下一轮（≤60 秒）自动生效</span></h2>
+      <div class="card" style="margin-bottom:20px">
+        <div class="row" style="flex-wrap:wrap;gap:12px;align-items:center">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="任一账号余额 ≤ 此值 → 顶栏红「余额不足」">余额不足（积分）
+            <input id="alLow" type="number" min="0" step="10" value="${alLow()}" style="width:96px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="批次在此天数内到期才提醒">到期提醒（天）
+            <input id="alDays" type="number" min="1" step="1" value="${alDays()}" style="width:76px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="且余量大于此值才提醒 —— 余量太小的批次提醒了也没意义">余量下限（积分）
+            <input id="alMin" type="number" min="0" step="50" value="${alMin()}" style="width:96px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
+          <button class="btn" id="alSave">保存阈值</button>
+          <button class="btn" id="alReset" title="恢复 200 / 7 / 500">恢复默认</button>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:8px">「登录态失效」红条没有阈值可调 —— 账号报 401 就一定提醒，否则会话会莫名其妙失败。</div>
+      </div>
+      <h2>通知通道 <span class="sub">T33 · 把「猫猫归来 / 余额不足 / 登录态失效 / 预算预警」推到手机，人不在电脑前也能收</span></h2>
+      <div class="card" style="margin-bottom:20px">
+        <div class="row" style="margin-bottom:10px">
+          <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="关掉后桌面气泡与所有外部通道都不再发送">
+            <input type="checkbox" id="ntEnabled" ${nt && nt.enabled ? 'checked' : ''}> 启用通知
+          </label>
+          <button class="btn" id="ntTest">🔔 测试通知</button>
+          <span class="muted" id="ntMsg" style="font-size:12px"></span>
+        </div>
+        <div id="ntList"></div>
+        <button class="btn mini" id="ntAdd" style="margin-top:9px">＋ 添加通道</button>
+        <button class="btn mini primary" id="ntSave">保存通道</button>
+        <div class="muted" style="font-size:12px;margin-top:9px">
+          <b>webhook</b>：POST JSON <code>{ title, text }</code>，适合自建中转。<br>
+          <b>bark</b>：地址填到设备 key 为止，如 <code>https://api.day.app/你的Key</code>，标题正文自动拼到路径里。<br>
+          <b>serverchan</b>：填完整的 SendKey 地址，如 <code>https://sctapi.ftqq.com/你的Key.send</code>。<br>
+          地址里含密钥，保存后这里只显示打码值；不配置就完全不发外部请求。每个通道按事件独立 5 分钟节流。
+        </div>
+      </div>
+      <h2>协议自检 <span class="sub">T39 · 比对上游响应的关键结构；上游改版时提前告警，而不是等「积分全是 0 / 目录空了」才发现</span></h2>
+      <div class="card" style="margin-bottom:20px">
+        <div class="row" style="margin-bottom:10px">
+          <button class="btn primary" id="pcRun">▶ 立即自检</button>
+          <span class="muted" id="pcSummary" style="font-size:12.5px">${pc && pc.at ? '上次自检 ' + esc(new Date(pc.at).toLocaleString()) + '（6 小时缓存）' : '还没自检过'}</span>
+        </div>
+        <div id="pcBox">${pcRows || '<div class="muted" style="padding:8px 2px;text-align:center">点「立即自检」比对上游响应结构（只读探针，不消耗积分、不发对话）</div>'}</div>
+      </div>
+      <h2>一键诊断 <span class="sub">T24 · 只读体检：服务/配置/登录态/账号池/路由/数据文件/后台循环/协议，与 /wbp-doctor 同源</span></h2>
       <div class="card" style="margin-bottom:20px">
         <div class="row" style="margin-bottom:10px">
           <button class="btn primary" id="docRun">▶ 运行诊断</button>
@@ -1546,6 +1709,83 @@ function healthState(a) {
         loadHealth();
       } catch (e) { toast('保存失败：' + e.message, 'bad'); }
     };
+    // ---- T34 行为绑定：预警阈值 ----
+    $('#alSave').onclick = async () => {
+      try {
+        const r = await api('/alerts', { method: 'POST', body: {
+          lowBalance: $('#alLow').value, expiryDays: $('#alDays').value, expiryMinAmount: $('#alMin').value,
+        } });
+        ALERT_TH = r.alerts;
+        toast(`阈值已保存：余额 ≤${r.alerts.lowBalance}、${r.alerts.expiryDays} 天内到期且余量 >${r.alerts.expiryMinAmount}`, 'ok');
+        loadAlerts(); // 立刻重画预警条，不用等 60 秒
+      } catch (e) { toast('保存失败：' + e.message, 'bad'); }
+    };
+    $('#alReset').onclick = async () => {
+      try {
+        const r = await api('/alerts', { method: 'POST', body: { lowBalance: 200, expiryDays: 7, expiryMinAmount: 500 } });
+        ALERT_TH = r.alerts;
+        $('#alLow').value = r.alerts.lowBalance; $('#alDays').value = r.alerts.expiryDays; $('#alMin').value = r.alerts.expiryMinAmount;
+        toast('已恢复默认阈值 200 / 7 / 500', 'ok');
+        loadAlerts();
+      } catch (e) { toast('重置失败：' + e.message, 'bad'); }
+    };
+
+    // ---- T33 行为绑定：通知通道 ----
+    const renderChannels = (list) => {
+      $('#ntList').innerHTML = (list && list.length) ? list.map((c, i) => `
+        <div class="row" data-ch="${i}" style="margin-bottom:8px;padding:9px 11px;border:1px solid var(--line);border-radius:9px">
+          <select data-ch-type="${i}" style="min-width:118px">
+            ${['webhook', 'bark', 'serverchan'].map((t) => `<option value="${t}" ${c.type === t ? 'selected' : ''}>${t}</option>`).join('')}
+          </select>
+          <input type="text" data-ch-url="${i}" value="${esc(c.url || '')}" placeholder="完整地址（含密钥）" style="flex:1;min-width:200px">
+          <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input type="checkbox" data-ch-on="${i}" ${c.enabled !== false ? 'checked' : ''}> 启用</label>
+          <button class="btn mini danger" data-ch-del="${i}">删除</button>
+        </div>`).join('') : '<div class="muted" style="padding:10px 0;font-size:12.5px">还没有通道 —— 不配置也不影响桌面气泡，两者是并行的。</div>';
+      // 行内控件改动后同步回内存列表，保存时直接提交
+      for (const sel of el.querySelectorAll('[data-ch-type]')) sel.onchange = () => { list[+sel.dataset.chType].type = sel.value; };
+      for (const inp of el.querySelectorAll('[data-ch-url]')) inp.oninput = () => { list[+inp.dataset.chUrl].url = inp.value; };
+      for (const cb of el.querySelectorAll('[data-ch-on]')) cb.onchange = () => { list[+cb.dataset.chOn].enabled = cb.checked; };
+      for (const b of el.querySelectorAll('[data-ch-del]')) b.onclick = () => { list.splice(+b.dataset.chDel, 1); renderChannels(list); };
+    };
+    let chList = ((nt && nt.channels) || []).map((c) => ({ ...c }));
+    renderChannels(chList);
+    $('#ntAdd').onclick = () => { chList.push({ type: 'webhook', url: '', enabled: true }); renderChannels(chList); };
+    $('#ntSave').onclick = async () => {
+      const bad = chList.find((c) => !String(c.url || '').trim());
+      if (bad) { toast('有通道还没填地址 —— 填不上就点「删除」', 'bad'); return; }
+      try {
+        await api('/notify', { method: 'POST', body: { enabled: $('#ntEnabled').checked, channels: chList } });
+        toast('通知通道已保存（地址已按密钥打码显示）', 'ok');
+        loadHealth();
+      } catch (e) { toast('保存失败：' + e.message, 'bad'); }
+    };
+    $('#ntTest').onclick = async () => {
+      const b = $('#ntTest');
+      b.disabled = true;
+      try {
+        // 先存再测：测试的是「当前配置」，不是页面上还没保存的草稿
+        await api('/notify', { method: 'POST', body: { enabled: true, channels: chList.filter((c) => String(c.url || '').trim()) } });
+        const r = await api('/notify/test', { method: 'POST' });
+        $('#ntMsg').textContent = r.note || '';
+        toast(r.note || '已发送', r.sent ? 'ok' : 'bad');
+      } catch (e) { toast('测试失败：' + e.message, 'bad'); }
+      b.disabled = false;
+    };
+
+    // ---- T39 行为绑定：协议自检 ----
+    $('#pcRun').onclick = async () => {
+      const b = $('#pcRun');
+      b.disabled = true; b.textContent = '自检中…';
+      try {
+        const r = await api('/protocol/check', { method: 'POST' });
+        $('#pcSummary').innerHTML = r.drifted
+          ? `<span class="bad">发现 ${r.drifted}/${r.total} 项与预期不符 —— 上游可能改版了，展开下表看具体字段</span>`
+          : `<span class="ok">${r.total} 项签名全部符合预期</span>`;
+        toast(r.drifted ? `协议自检：${r.drifted} 项不符` : '协议自检通过', r.drifted ? 'bad' : 'ok');
+        loadHealth();
+      } catch (e) { toast('自检失败：' + e.message, 'bad'); b.disabled = false; b.textContent = '▶ 立即自检'; }
+    };
+
     // ---- T24 行为绑定：一键诊断 ----
     $('#docRun').onclick = async () => {
       const b = $('#docRun');

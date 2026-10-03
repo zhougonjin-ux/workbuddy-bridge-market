@@ -59,15 +59,48 @@ function loadState() {
   state = disk && typeof disk === 'object' ? disk : {};
   if (!Array.isArray(state.results)) state.results = [];
   if (!Array.isArray(state.history)) state.history = [];
+  // scanning 只是「本进程正在巡检」的内存锁，却一直跟着 saveState 落盘。
+  // 进程若在巡检途中被重启（交棒重启 / 崩溃 / 断电），盘上就留下 scanning:true，
+  // 而 loadState 会把它读回来 —— 于是「巡检进行中」被永久锁死，再也跑不了
+  // （2026-10-03 实测：health.json 里躺着一份 10-02 的残留锁，用户点巡检永远转圈）。
+  // 加载时无条件清掉：此刻本进程确实没在巡检，锁本来就该是干净的。
+  state.scanning = false;
   return state;
 }
 
 function saveState() {
   try {
-    writeJsonFileAtomic(file(), state);
+    // scanning 是进程内的瞬时锁，不该落盘（落盘就会在重启后变成永久锁，见 loadState）
+    const { scanning, ...rest } = state;
+    writeJsonFileAtomic(file(), { ...rest, scanning: false });
   } catch (e) {
     warn('health.json 写入失败：', e.message);
   }
+}
+
+/**
+ * T35 巡检省钱模式的候选筛选（纯函数，便于单测）。
+ *
+ * 巡检是真实消耗，17 个模型一轮 ≈0.1~0.5 积分。用户只想知道「我要用的那几个还能用吗」时，
+ * 不该为无关模型付钱：
+ *   - onlyFree:true  → 只探倍率 0 的模型（完全免费的那一批）
+ *   - only:[ids]     → 只探白名单里的模型（支持 * 前缀通配，与 allowModels 同一套语义）
+ * 两者叠加（白名单里再筛免费）；都不设 = 全量（保持原行为）。
+ *
+ * mult 为 null 表示目录没报倍率（拉不到），按「不是免费」处理——「只探免费」时不该
+ * 因为倍率未知就把一堆付费模型探一遍。
+ */
+export function selectScanTargets(targets, cfg) {
+  const hc = cfg?.healthCheck || {};
+  const only = Array.isArray(hc.only) ? hc.only.map((s) => String(s).trim()).filter(Boolean) : [];
+  const onlyFree = hc.onlyFree === true;
+  if (!only.length && !onlyFree) return targets;
+  const hit = (p, v) => (p.endsWith('*') ? String(v).startsWith(p.slice(0, -1)) : p === v);
+  return targets.filter((t) => {
+    if (only.length && !only.some((p) => hit(p, t.id))) return false;
+    if (onlyFree && !(Number.isFinite(t.mult) && t.mult === 0)) return false;
+    return true;
+  });
 }
 
 /** 巡检状态视图（/console/api/health 用），带当前配置回显。 */
@@ -81,12 +114,15 @@ export function healthStatus(cfg) {
     config: {
       enabled: cfg?.healthCheck?.enabled === true,
       times: Array.isArray(cfg?.healthCheck?.times) ? cfg.healthCheck.times : [],
+      only: Array.isArray(cfg?.healthCheck?.only) ? cfg.healthCheck.only : [],
+      onlyFree: cfg?.healthCheck?.onlyFree === true,
     },
   };
 }
 
 /**
- * 跑一轮全量巡检：目录里每个「已登录站点」的模型各探测一次（串行 + 250ms 间隔）。
+ * 跑一轮巡检：目录里每个「已登录站点」的模型各探测一次（串行 + 250ms 间隔），
+ * 候选集先经 selectScanTargets 按 T35 省钱模式裁剪。
  * 结果按性价比排序：可用在前 → 倍率低在前 → 延迟低在前。同步返回统计，控制台按钮直接等结果
  * （与 /probe 同一模式；17 个模型正常 10~30 秒）。
  */
@@ -96,11 +132,17 @@ export async function runHealthScan(cfg) {
   s.scanning = true;
   try {
     const merged = await mergedModels(cfg);
-    const targets = [];
+    const all = [];
     for (const m of merged) {
       if (m.aliasOf) continue; // 站点前缀别名与本体是同一个上游模型，探一次就够
       if (!isLoggedIn(m.site)) continue;
-      targets.push({ id: m.id, site: m.site, mult: Number.isFinite(m.mult) ? m.mult : null });
+      all.push({ id: m.id, site: m.site, mult: Number.isFinite(m.mult) ? m.mult : null });
+    }
+    const targets = selectScanTargets(all, cfg);
+    if (!targets.length) {
+      const why = `省钱模式过滤后没有可巡检的模型（候选 ${all.length} 个）——检查 healthCheck.only / onlyFree`;
+      warn(why);
+      return { ok: false, error: why, total: all.length, scanned: 0 };
     }
     const results = [];
     for (const t of targets) {

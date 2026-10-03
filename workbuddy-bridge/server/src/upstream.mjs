@@ -599,6 +599,34 @@ function fetchWithTimeout(url, { timeoutMs, ...init } = {}) {
   return p;
 }
 
+/**
+ * T39：模型目录端点的**原始** JSON 响应（不做结构解析）。
+ * 协议漂移自检要对着真实响应逐字段比对，所以需要绕过 fetchModels 的解析层。
+ * 只读端点，不消耗积分。
+ */
+export async function fetchModelsRaw(cfg, site) {
+  const siteCfg = cfg.sites[site];
+  await ensureToken(cfg, site);
+  const auth = getAuth(site);
+  const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
+  let res, text;
+  try {
+    const r = await fetchWithTimeout(siteCfg.apiBase + '/console/enterprises/personal/models', {
+      timeoutMs,
+      headers: { ...chatHeaders(siteCfg, auth), Accept: 'application/json' },
+    });
+    res = r.res;
+    text = await r.text();
+  } catch (e) {
+    throw new UpstreamError(`[${site}] 模型接口请求失败（${describeFetchFailure(e, timeoutMs)}）`, { status: 504, transport: true, site });
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new UpstreamError(`[${site}] 模型接口返回无法解析（HTTP ${res.status}）`, { status: 502, site });
+  }
+}
+
 /** 拉取站点可用模型清单（含积分倍率）。 */
 export async function fetchModels(cfg, site) {
   const siteCfg = cfg.sites[site];
@@ -659,6 +687,53 @@ export function supportsCreditQuery(cfg, site) {
  * 查询站点剩余积分（免费额度）。国际版计费口径不同，失败时静默返回错误信息。
  * accountId 指定时查该账号——控制台要逐个账号看余额。
  */
+/** 额度查询的请求体（T39 的原始探针与 queryCredit 共用，保证探的就是同一个接口）。 */
+function creditQueryBody() {
+  const now = new Date();
+  const end = new Date(now.getTime() + 365 * 101 * 24 * 3600 * 1000);
+  const fmt = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
+  return {
+    PageNumber: 1,
+    PageSize: 100,
+    ProductCode: 'p_tcaca',
+    Status: [0, 3],
+    PackageEndTimeRangeBegin: fmt(now),
+    PackageEndTimeRangeEnd: fmt(end),
+  };
+}
+
+/**
+ * T39：额度端点的**原始** JSON 响应（不解析成 remain/detail）。
+ * 只读接口，不消耗积分。协议漂移自检用它逐字段比对上游结构。
+ */
+export async function fetchCreditRaw(cfg, site, accountId = null) {
+  const siteCfg = cfg.sites[site];
+  if (!supportsCreditQuery(cfg, site)) {
+    throw new UpstreamError(`[${site}] 该站点不支持额度查询（未配置 billingBase）`, { status: 501, site });
+  }
+  await ensureToken(cfg, site, { accountId });
+  const auth = getAuth(site);
+  const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
+  let res, text;
+  try {
+    const r = await fetchWithTimeout(siteCfg.billingBase + '/v2/billing/meter/get-user-resource', {
+      timeoutMs,
+      method: 'POST',
+      headers: billingHeaders(siteCfg, auth),
+      body: JSON.stringify(creditQueryBody()),
+    });
+    res = r.res;
+    text = await r.text();
+  } catch (e) {
+    throw new UpstreamError(`[${site}] 额度接口请求失败（${describeFetchFailure(e, timeoutMs)}）`, { status: 504, transport: true, site });
+  }
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new UpstreamError(`[${site}] 额度接口返回无法解析（HTTP ${res.status}）`, { status: 502, site });
+  }
+}
+
 export async function queryCredit(cfg, site, accountId = null) {
   const siteCfg = cfg.sites[site];
   if (!supportsCreditQuery(cfg, site)) {

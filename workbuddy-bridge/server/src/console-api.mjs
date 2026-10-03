@@ -3,7 +3,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { ROOT, siteKeys, saveConfig, paths, authPathFor, authKeys, primaryKey } from './config.mjs';
+import { ROOT, siteKeys, saveConfig, paths, authPathFor, authKeys, primaryKey, NOTIFY_CHANNEL_TYPES } from './config.mjs';
 import { getAuth, isLoggedIn, accountSnapshot } from './auth.mjs';
 import {
   poolPathFor,
@@ -20,7 +20,7 @@ import { getCatalog, mergedModels, parseMultiplier } from './router.mjs';
 import { queryCredit, supportsCreditQuery } from './upstream.mjs';
 import { probeModel, runHealthScan, healthStatus } from './health.mjs';
 import { startLogin, pollLogin } from './device-login.mjs';
-import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel } from './usage.mjs';
+import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel, usageCsv } from './usage.mjs';
 import { recentLogs, recentRequests, log } from './log.mjs';
 import { recentEvents } from './events.mjs';
 import { compressionStats } from './compress.mjs';
@@ -29,6 +29,8 @@ import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
 import { runTasks, taskStatus, growthTasksView, runSingleTask, claimSingleTask } from './tasks.mjs';
 import { importLocalAccounts } from './localimport.mjs';
 import { budgetStatus, budgetCheckAndAnnounce } from './budget.mjs';
+import { testChannels } from './notify.mjs';
+import { runProtocolCheck, protocolCheckBrief } from './protocol.mjs';
 import { burnoutReport, predictAccount } from './burnout.mjs';
 import { recentDailyCreditAvg } from './usage.mjs';
 import { checkForUpdate } from './updatecheck.mjs';
@@ -124,6 +126,22 @@ function burnoutBrief(cfg) {
   const dailyAvg = recentDailyCreditAvg(7);
   const report = burnoutReport(siteAccountPairs(cfg), { dailyAvg });
   return { dailyAvg: report.dailyAvg, riskCount: report.riskCount, totalWaste: report.totalWaste, risks: report.accounts.filter((a) => a.riskCount > 0).map((a) => ({ site: a.site, id: a.id, label: a.label, totalWaste: a.totalWaste, batches: a.batches.filter((b) => b.burnout.willExpireUnused).map((b) => ({ package: b.package, remain: b.remain, expireAt: b.expireAt, advice: b.burnout.advice, wasteCredits: b.burnout.wasteCredits, daysLeft: b.burnout.daysLeft })) })) };
+}
+
+/**
+ * T34：顶栏预警阈值的读取与归一。
+ * 前端原先把 200 / 7 / 500 写死，现在从 config.alerts 下发；缺项或被改坏时回落到
+ * 与旧硬编码相同的默认值，行为不倒退。
+ */
+const ALERT_DEFAULTS = { lowBalance: 200, expiryDays: 7, expiryMinAmount: 500 };
+function alertThresholds(cfg) {
+  const a = cfg?.alerts || {};
+  const num = (v, d, min) => (Number.isFinite(Number(v)) && Number(v) >= min ? Number(v) : d);
+  return {
+    lowBalance: num(a.lowBalance, ALERT_DEFAULTS.lowBalance, 0),
+    expiryDays: num(a.expiryDays, ALERT_DEFAULTS.expiryDays, 1),
+    expiryMinAmount: num(a.expiryMinAmount, ALERT_DEFAULTS.expiryMinAmount, 0),
+  };
 }
 
 /** T32：把预测结果挂到 /pool 返回的账号快照上，账号卡批次行据此显示「预计用不完」。 */
@@ -301,6 +319,7 @@ export async function handleConsoleApi(ctx) {
     const b = bridgeStatus(cfg, { redact: true });
     b.budget = budgetCheckAndAnnounce(cfg); // T13：预警条数据源 + 每天一次的预算提醒
     b.burnout = burnoutBrief(cfg); // T32：预警条的「预计用不完」项
+    b.alerts = alertThresholds(cfg); // T34：预警阈值（原先写死在前端，现由配置下发）
     return sendJson(res, 200, b);
   }
   if (p === '/credit/refresh' && method === 'POST') {
@@ -458,6 +477,15 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, 200, { ok: true, ...compressionStats() });
   }
 
+  // ---- T39：协议漂移自检（只读探针端点，不消耗积分）----
+  if (p === '/protocol' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, ...protocolCheckBrief(cfg) });
+  }
+  if (p === '/protocol/check' && method === 'POST') {
+    const r = await runProtocolCheck(cfg, { force: true });
+    return sendJson(res, 200, { ok: true, ...r });
+  }
+
   // 模型健康巡检（T8）：查结果 / 手动跑一轮（同步，模型多时需等 10~30 秒）/ 保存定时设置
   if (p === '/health' && method === 'GET') {
     return sendJson(res, 200, healthStatus(cfg));
@@ -483,12 +511,26 @@ export async function handleConsoleApi(ctx) {
       }
       cfg.healthCheck.times = times;
     }
+    // T35 省钱模式：只巡检白名单模型 / 只巡检免费模型
+    if (body.only !== undefined) {
+      const list = Array.isArray(body.only)
+        ? body.only
+        : String(body.only ?? '').split(/[,，;；\s]+/);
+      if (!list.every((s) => typeof s === 'string')) {
+        return sendJson(res, 400, { ok: false, error: 'only 必须是模型名数组或逗号分隔的字符串' });
+      }
+      cfg.healthCheck.only = list.map((s) => s.trim()).filter(Boolean);
+    }
+    if (body.onlyFree !== undefined) {
+      if (typeof body.onlyFree !== 'boolean') return sendJson(res, 400, { ok: false, error: 'onlyFree 必须是布尔值' });
+      cfg.healthCheck.onlyFree = body.onlyFree;
+    }
     saveConfig(cfg);
     // 定时开关/时点立即生效：先停旧循环再按新配置启动（startHealthLoop 对重复调用幂等）
     const { stopHealthLoop, startHealthLoop } = await import('./health.mjs');
     stopHealthLoop();
     startHealthLoop(cfg);
-    return sendJson(res, 200, { ok: true, config: { enabled: cfg.healthCheck.enabled, times: cfg.healthCheck.times } });
+    return sendJson(res, 200, { ok: true, config: healthStatus(cfg).config });
   }
 
   // ---- workbuddy-bridge：每日积分预算（T13）----
@@ -512,11 +554,85 @@ export async function handleConsoleApi(ctx) {
       cfg.budget.warnPercent = n;
     }
     if (body.mode !== undefined) {
-      if (!['warn', 'free'].includes(body.mode)) return sendJson(res, 400, { ok: false, error: 'mode 必须是 warn/free' });
+      if (!['warn', 'free', 'pause'].includes(body.mode)) return sendJson(res, 400, { ok: false, error: 'mode 必须是 warn/free/pause' });
       cfg.budget.mode = body.mode;
     }
     saveConfig(cfg);
     return sendJson(res, 200, { ok: true, budget: budgetStatus(cfg) });
+  }
+
+  // ---- T34：顶栏预警阈值 ----
+  if (p === '/alerts' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, alerts: alertThresholds(cfg) });
+  }
+  if (p === '/alerts' && method === 'POST') {
+    const body = ctx.body || {};
+    if (body.lowBalance !== undefined) {
+      const n = Number(body.lowBalance);
+      if (!Number.isFinite(n) || n < 0) return sendJson(res, 400, { ok: false, error: 'lowBalance 必须是 ≥0 的数（积分）' });
+      cfg.alerts.lowBalance = n;
+    }
+    if (body.expiryDays !== undefined) {
+      const n = Number(body.expiryDays);
+      if (!Number.isFinite(n) || n < 1) return sendJson(res, 400, { ok: false, error: 'expiryDays 必须是 ≥1 的整数（天）' });
+      cfg.alerts.expiryDays = Math.round(n);
+    }
+    if (body.expiryMinAmount !== undefined) {
+      const n = Number(body.expiryMinAmount);
+      if (!Number.isFinite(n) || n < 0) return sendJson(res, 400, { ok: false, error: 'expiryMinAmount 必须是 ≥0 的数（积分）' });
+      cfg.alerts.expiryMinAmount = n;
+    }
+    saveConfig(cfg);
+    return sendJson(res, 200, { ok: true, alerts: alertThresholds(cfg) });
+  }
+
+  // ---- T33：通知通道配置 + 测试 ----
+  // 回显时把 url 的密钥段打码：Server酱 SendKey / Bark 设备 key 都在 url 里，
+  // 控制台是本机页面但日志/截图都可能流出去，展示时只留头尾。
+  const maskChannelUrl = (u) => {
+    const s = String(u || '');
+    return s.length <= 16 ? s : `${s.slice(0, 10)}…${s.slice(-4)}`;
+  };
+  if (p === '/notify' && method === 'GET') {
+    const n = cfg.notify || {};
+    return sendJson(res, 200, {
+      ok: true,
+      enabled: n.enabled !== false,
+      channels: (n.channels || []).map((c) => ({ ...c, url: maskChannelUrl(c.url) })),
+    });
+  }
+  if (p === '/notify' && method === 'POST') {
+    const body = ctx.body || {};
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+      cfg.notify.enabled = body.enabled;
+    }
+    if (body.channels !== undefined) {
+      if (!Array.isArray(body.channels)) return sendJson(res, 400, { ok: false, error: 'channels 必须是数组' });
+      const kept = [];
+      for (const c of body.channels) {
+        const type = String(c?.type || '').trim();
+        if (!NOTIFY_CHANNEL_TYPES.includes(type)) {
+          return sendJson(res, 400, { ok: false, error: `未知通道类型 ${type || '(空)'}，只支持 webhook/bark/serverchan` });
+        }
+        // 前端回显的是打码值；打码值原样回传视为「没改这个字段」，保留原 url
+        const url = String(c?.url || '').trim();
+        if (!url) return sendJson(res, 400, { ok: false, error: `${type} 通道缺少 url` });
+        kept.push({ type, url, enabled: c.enabled !== false });
+      }
+      cfg.notify.channels = kept;
+    }
+    saveConfig(cfg);
+    return sendJson(res, 200, {
+      ok: true,
+      enabled: cfg.notify.enabled !== false,
+      channels: (cfg.notify.channels || []).map((c) => ({ ...c, url: maskChannelUrl(c.url) })),
+    });
+  }
+  if (p === '/notify/test' && method === 'POST') {
+    // force=true 绕过 5 分钟节流，用户点按钮就是想立刻看到结果
+    const n = testChannels(cfg);
+    return sendJson(res, 200, { ok: true, sent: n, note: n ? `已向 ${n} 个通道投递（HTTP 是异步的，稍等几秒看手机）` : '没有已启用的通道——先添加一个并保存' });
   }
 
   // ---- 号池：启用/禁用、重置状态、删除、改标签 ----
@@ -558,6 +674,23 @@ export async function handleConsoleApi(ctx) {
   if (p === '/usage/reset' && method === 'POST') {
     resetUsage();
     return sendJson(res, 200, { ok: true });
+  }
+  // ---- T36：用量报表导出 CSV（浏览器直接下载，Content-Disposition 触发保存）----
+  if (p === '/usage/export' && method === 'GET') {
+    const days = Math.min(365, Math.max(1, Number(url.searchParams.get('days')) || 7));
+    // 账号维度用用户自己起的名字（accountSnapshot 已做白名单投影，不含 token）
+    const names = new Map();
+    for (const s of siteKeys(cfg)) {
+      for (const a of accountSnapshot(s)) names.set(`${s}/${a.id}`, a.label || a.nickname || a.id);
+    }
+    const csv = usageCsv(days, { accountLabel: (site, id) => names.get(`${site}/${id}`) });
+    const fname = `workbuddy-usage-${new Date().toISOString().slice(0, 10)}-${days}d.csv`;
+    res.writeHead(200, {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${fname}"`,
+      'Cache-Control': 'no-store',
+    });
+    return res.end(csv);
   }
 
   // ---- 模型探测（顺序执行，避免打爆上游） ----

@@ -1,14 +1,18 @@
-// Windows 桌面通知（workbuddy-bridge 新增，T11）：签到失败 / 猫猫归来 / 账号登录态失效
-// 这类「不看控制台就错过」的事，弹一个系统 toast。
+// 通知（T11 桌面气泡 + T33 外部通道）：签到失败 / 猫猫归来 / 账号登录态失效 /
+// 预算预警这类「不看控制台就错过」的事，弹一个系统 toast，并可同时推到手机。
 //
-// 实现：零依赖，走 Windows 自带的 PowerShell + System.Windows.Forms.NotifyIcon
+// 桌面气泡实现：零依赖，走 Windows 自带的 PowerShell + System.Windows.Forms.NotifyIcon
 // 气泡通知（Win10/11 均可用，无需 BurntToast 模块）。要点：
 //   - spawn 分离进程（detached + unref），通知的生命周期不占本服务，也不阻塞调用方；
 //   - 参数经 stdin 传 JSON（命令行传中文在 cmd/chcp 65001 之外的终端会乱码）；
 //   - 全程吞错：通知是锦上添花，绝不能绊倒任务主流程；
 //   - 节流：同一 key（如 "account-401-acc_x"）5 分钟内只弹一次，防止上游持续 401
 //     时每 30 秒积分刷新都弹一遍。
-// 非 Windows 平台静默跳过；notify.enabled=false（config）关闭。
+// 非 Windows 平台静默跳过；notify.enabled=false（config）关闭桌面气泡。
+//
+// T33 外部通道：同一条通知并行分发到 config.notify.channels 里的
+// webhook / bark / serverchan，用途是「人不在电脑前也能收」（配合 T38 手机端控制台）。
+// 通道投递是 fire-and-forget：notify() 同步返回，HTTP 在后台跑，永不影响调用方。
 import { spawn } from 'node:child_process';
 import { log, warn } from './log.mjs';
 
@@ -56,12 +60,20 @@ $n.Dispose()
 }
 
 /**
- * 发一条桌面通知。key 相同的 5 分钟内只发一次；opts:{ key, force } 可去重/强发。
- * 返回是否真的发出了（供测试断言；测试可注入 fake fire）。
+ * 发一条通知：桌面气泡（T11）+ 外部通道（T33）并行。
+ * key 相同的 5 分钟内只发一次（两个通道各自独立节流）；
+ * opts:{ key, force } 可去重/强发；_fire 供测试注入。
+ * 返回是否真的弹了桌面气泡（供测试断言）。
+ *
+ * 外部通道在平台判断**之前**分发：气泡只在 Windows 有，通道是跨平台的，
+ * 放在后面会被 `process.platform !== 'win32'` 提前 return 吃掉。
+ * 反过来节流也不能共用 key——气泡用裸 key，通道用 `ch-<type>-` 前缀，各走各的表。
  */
 export function notify(cfg, title, text, { key = null, force = false, _fire = firePS } = {}) {
+  if (cfg?.notify?.enabled === false) return false;
+  // 通道投递是 fire-and-forget，异常已在内部吞掉
+  try { notifyChannels(cfg, title, text, { key, force }); } catch { /* 旁观者不绊倒主流程 */ }
   try {
-    if (cfg?.notify?.enabled === false) return false;
     if (process.platform !== 'win32') return false;
     if (!force && key && !shouldNotify(key)) return false;
     const ok = _fire(title, text);
@@ -75,6 +87,103 @@ export function notify(cfg, title, text, { key = null, force = false, _fire = fi
 /** 便捷包装：任务类通知（自动带任务 key 去重）。cfg 缺省时用空配置（仍受平台限制）。 */
 export function notifyTask(cfg, title, text, keySuffix = '') {
   return notify(cfg, title, text, { key: `task-${title}-${keySuffix}` });
+}
+
+/* ---------------- T33：外部通知通道（Webhook / Bark / Server酱） ---------------- */
+// 桌面气泡只在人守着电脑时有用。这三个通道把同一条通知推到手机：
+//   webhook    —— 自建/第三方通用 webhook，POST JSON { title, text }
+//   bark       —— Bark 推送服务：GET <url>/<title>/<body>
+//   serverchan —— Server 酱：POST <url>，表单 title= & desp=
+// 全部 fire-and-forget：投递在后台跑，notify() 立刻返回，绝不阻塞任务主流程。
+// 节流复用 shouldNotify 的同一张表（按通道分 key），一个通道坏了不影响别的。
+
+const CHANNEL_TYPES = new Set(['webhook', 'bark', 'serverchan']);
+
+/** 清洗成 URL 安全的一段（title/body 里可能有空格与中文）。 */
+function urlSeg(s, max = 80) {
+  return encodeURIComponent(String(s ?? '').slice(0, max));
+}
+
+/** 配置里已启用的通道（纯函数便于单测：类型合法 + enabled 不为 false + url 非空）。 */
+export function enabledChannels(cfg) {
+  const list = cfg?.notify?.channels;
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((c) => c && CHANNEL_TYPES.has(String(c.type)) && c.url && c.enabled !== false)
+    .map((c) => ({ type: String(c.type), url: String(c.url).trim() }));
+}
+
+/**
+ * 构造一次投递的 { url, init }（纯函数，便于单测断言各通道的报文形状）。
+ * 返回 null 表示这个通道构造不出合法请求。
+ */
+export function buildChannelRequest(ch, title, text) {
+  const t = String(title ?? '');
+  const b = String(text ?? '');
+  if (ch.type === 'webhook') {
+    return {
+      url: ch.url,
+      init: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title: t, text: b }) },
+    };
+  }
+  if (ch.type === 'bark') {
+    // Bark 的设备 key 已在 url 里，正文追加两个路径段（官方协议就是 GET 路径参数）
+    return {
+      url: `${ch.url.replace(/\/+$/, '')}/${urlSeg(t)}/${urlSeg(b, 200)}`,
+      init: { method: 'GET' },
+    };
+  }
+  if (ch.type === 'serverchan') {
+    return {
+      url: ch.url,
+      init: {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ title: t, desp: b }).toString(),
+      },
+    };
+  }
+  return null;
+}
+
+/** 向一个通道投递（不抛错；10 秒超时防挂住事件循环）。 */
+function deliver(ch, title, text) {
+  const req = buildChannelRequest(ch, title, text);
+  if (!req) return;
+  const ac = new AbortController();
+  const to = setTimeout(() => ac.abort(), 10_000);
+  fetch(req.url, { ...req.init, signal: ac.signal })
+    .then((r) => {
+      if (r.ok) log(`通知已投递：${ch.type}`);
+      else warn(`通知通道 ${ch.type} 返回 ${r.status}`);
+    })
+    .catch((e) => warn(`通知通道 ${ch.type} 投递失败：`, e.message || String(e)))
+    .finally(() => clearTimeout(to));
+}
+
+/**
+ * 把一条通知分发到所有已启用的外部通道。每个通道按 `ch-<type>-<key>` 独立节流，
+ * 所以一个通道连发失败不会把别的通道顺带节流掉。返回投递了几个（供测试断言）。
+ */
+export function notifyChannels(cfg, title, text, { key = null, force = false } = {}) {
+  const channels = enabledChannels(cfg);
+  if (!channels.length) return 0;
+  let n = 0;
+  for (const ch of channels) {
+    if (!force && key && !shouldNotify(`ch-${ch.type}-${key}`)) continue;
+    try {
+      deliver(ch, title, text);
+      n++;
+    } catch (e) {
+      warn(`通知通道 ${ch.type} 异常：`, e.message);
+    }
+  }
+  return n;
+}
+
+/** 控制台「测试通知」：忽略节流，往所有通道真发一条。返回投递数。 */
+export function testChannels(cfg, title = 'WorkBuddy 积分桥测试 🔔', text = '通知通道已连通，收到即配置成功。') {
+  return notifyChannels(cfg, title, text, { force: true });
 }
 
 /** 测试隔离：清空节流表。 */

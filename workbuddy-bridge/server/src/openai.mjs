@@ -244,6 +244,7 @@ export async function handleChatCompletions(ctx) {
         credit,
         ms: streamMs,
         tools,
+        account: up.accountId,
       });
     }
     return;
@@ -333,6 +334,7 @@ export async function handleChatCompletions(ctx) {
     credit,
     ms: Date.now() - started,
     tools: agg.toolCallList.length,
+    account: up.accountId,
   });
 
   sendJson(res, 200, {

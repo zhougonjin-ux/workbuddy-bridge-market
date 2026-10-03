@@ -6,7 +6,7 @@ import { fetchModels } from './upstream.mjs';
 import { learnLimit } from './compress.mjs';
 import { usableCount } from './pool.mjs';
 import { warn } from './log.mjs';
-import { budgetRedirectActive } from './budget.mjs';
+import { budgetRedirectActive, budgetStatus, budgetBlockActive, budgetBlockError } from './budget.mjs';
 
 const TTL_OK = 5 * 60 * 1000;
 const TTL_ERR = 60 * 1000;
@@ -327,6 +327,12 @@ async function 改派到有额度的站点(cfg, 站点, 模型) {
  *      压缩就因为没有上限而完全不触发，表现为长上下文照样吃 400。
  */
 export async function resolveTarget(cfg, requestedModel) {
+  // T37 预算 pause：超限时拒绝新请求。这是「今天到此为止」的硬护栏，
+  // 与 mode=free 的区别是它连显式指定模型也拦（显式指定正是失控烧分的元凶）。
+  // 放在路由最前面：命中就直接抛，不打上游、不消耗任何额度。
+  const bst = budgetStatus(cfg);
+  if (budgetBlockActive(cfg, bst)) throw budgetBlockError(bst);
+
   let target = await resolveTargetInner(cfg, requestedModel);
 
   const 改派站点 = await 改派到有额度的站点(cfg, target.site, target.model);

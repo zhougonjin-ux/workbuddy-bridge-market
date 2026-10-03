@@ -240,22 +240,38 @@ export function defaultConfig() {
     },
     // 模型健康巡检（T8）：定时对全部模型发 max_tokens=1 的极小请求测可用性/延迟。
     // 默认关闭——巡检是真实消耗，17 模型一轮 ≈0.1~0.5 积分；由用户显式开启或手动触发。
+    // T35 省钱模式：only 白名单（支持 * 前缀通配）与 onlyFree（只探 x0 免费模型），
+    // 两者可叠加；都不设 = 全量。想省钱就把这两个用起来。
     healthCheck: {
       enabled: false,
       times: [],              // ["HH:MM"] 定时巡检时点，每天最多一次（首个命中时点）
+      only: [],               // 只巡检这些模型（空 = 全部）
+      onlyFree: false,        // true = 只巡检倍率 0 的免费模型
     },
     // 桌面通知（T11）：签到失败/猫猫归来/账号登录态失效弹 Windows toast。默认开。
+    // channels（T33）：把同一条通知并行推到手机，fire-and-forget。
+    //   webhook    POST JSON { title, text }
+    //   bark       GET <url>/<title>/<body>（Bark 的设备 key 写在 url 里）
+    //   serverchan POST <url>，表单 title= & desp=
+    // 不预置——用户填自己的地址，不配就完全不联网。
     notify: {
       enabled: true,
+      channels: [],
+    },
+    // 顶栏预警阈值（T34）：原先写死在前端（200 / 7 / 500），挪进配置让用户按自己的
+    // 积分规模调。改完即时生效（预警条每 60s 拉一次 /bridge）。
+    alerts: {
+      lowBalance: 200,       // 任一账号余额 ≤ 此值 → 红「余额不足」
+      expiryDays: 7,         // 批次在此天数内到期
+      expiryMinAmount: 500,  // 且余量 > 此值才提醒（余量太小的不值得占位）
     },
     // 每日积分预算（T13）：今日累计消耗（估算口径，与用量页同源）超过 budget 比例时
-    // 预警；到 100% 且 mode=free 时，default/auto 的请求自动改道免费模型（同 free-first）。
-    // 默认关闭——单用户白嫖场景一般用不到，重度消耗者才需要护栏。
+    // 预警；到 100% 后按 mode 动作。默认关闭——单用户白嫖场景一般用不到，重度消耗者才需要护栏。
     budget: {
       enabled: false,
       dailyCredits: 100,      // 每日预算（积分，估算口径）
       warnPercent: 80,        // 达到该比例时预警（控制台预警条 + 事件）
-      mode: 'warn',           // warn=只预警 | free=超预算后 default/auto 改道免费模型
+      mode: 'warn',           // warn=只预警 | free=超限后 default/auto 改道免费模型（T13）| pause=超限直接拒绝新请求（T37）
     },
     // 限流：服务只绑 127.0.0.1，所以要挡的不是远程攻击，而是
     //   1) 客户端 bug 导致的失控重试循环
@@ -318,6 +334,9 @@ function migrateLegacy(raw) {
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const isStr = (v) => typeof v === 'string';
 const isBool = (v) => typeof v === 'boolean';
+
+/** T33 认可的外部通知通道类型（与 notify.mjs 的 CHANNEL_TYPES 保持一致）。 */
+export const NOTIFY_CHANNEL_TYPES = ['webhook', 'bark', 'serverchan'];
 
 /** 有限正数（端口允许 0，表示随机端口）。 */
 function isPort(v) {
@@ -564,14 +583,58 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     } else {
       cfg.healthCheck.times = cfg.healthCheck.times.map((s) => String(s).trim().padStart(5, '0'));
     }
+    // T35 省钱模式：only 白名单 + onlyFree（都不设 = 全量）
+    if (cfg.healthCheck.only === undefined) { cfg.healthCheck.only = defaults.healthCheck.only; }
+    else if (!Array.isArray(cfg.healthCheck.only) || cfg.healthCheck.only.some((s) => !isStr(s))) {
+      fix('healthCheck.only 必须是字符串数组（模型名，支持 * 前缀通配），已回退为 []');
+      cfg.healthCheck.only = [];
+    } else {
+      cfg.healthCheck.only = cfg.healthCheck.only.map((s) => s.trim()).filter(Boolean);
+    }
+    if (typeof cfg.healthCheck.onlyFree !== 'boolean') cfg.healthCheck.onlyFree = defaults.healthCheck.onlyFree;
   }
 
-  // ---- 桌面通知（T11）----
+  // ---- 桌面通知（T11）+ 外部通知通道（T33）----
   if (cfg.notify !== undefined && !isPlainObject(cfg.notify)) {
     fix('notify 必须是对象，已回退为默认值');
     cfg.notify = structuredClone(defaults.notify);
   } else if (cfg.notify) {
     if (typeof cfg.notify.enabled !== 'boolean') cfg.notify.enabled = defaults.notify.enabled;
+    // channels 逐条校验：类型不认识或没 url 的直接丢掉（留着只会静默失败，不如报错）
+    if (cfg.notify.channels === undefined) {
+      cfg.notify.channels = [];
+    } else if (!Array.isArray(cfg.notify.channels)) {
+      fix('notify.channels 必须是数组，已回退为空');
+      cfg.notify.channels = [];
+    } else {
+      const kept = [];
+      for (const c of cfg.notify.channels) {
+        if (!isPlainObject(c) || !NOTIFY_CHANNEL_TYPES.includes(String(c.type))) {
+          fix(`notify.channels 里的 ${JSON.stringify(c?.type)} 不是 webhook/bark/serverchan，已丢弃该条`);
+          continue;
+        }
+        if (!isStr(c.url) || !c.url.trim()) {
+          fix(`notify.channels 里的 ${c.type} 通道缺少 url，已丢弃该条`);
+          continue;
+        }
+        kept.push({ type: c.type, url: c.url.trim(), enabled: c.enabled !== false });
+      }
+      cfg.notify.channels = kept;
+    }
+  }
+
+  // ---- 顶栏预警阈值（T34）----
+  if (cfg.alerts !== undefined && !isPlainObject(cfg.alerts)) {
+    fix('alerts 必须是对象，已回退为默认值');
+    cfg.alerts = structuredClone(defaults.alerts);
+  } else if (cfg.alerts) {
+    for (const [k, min] of [['lowBalance', 0], ['expiryDays', 1], ['expiryMinAmount', 0]]) {
+      const n = Number(cfg.alerts[k]);
+      if (!Number.isFinite(n) || n < min) {
+        fix(`alerts.${k} 必须是 ≥${min} 的数，已回退为 ${defaults.alerts[k]}`);
+        cfg.alerts[k] = defaults.alerts[k];
+      }
+    }
   }
 
   // ---- 按时段路由（T20）----
@@ -611,8 +674,8 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
       fix(`budget.warnPercent 必须是 (0,100) 之间的数，已回退为 ${defaults.budget.warnPercent}`);
       cfg.budget.warnPercent = defaults.budget.warnPercent;
     }
-    if (!['warn', 'free'].includes(cfg.budget.mode)) {
-      fix(`budget.mode 必须是 warn/free 之一，已回退为 ${defaults.budget.mode}`);
+    if (!['warn', 'free', 'pause'].includes(cfg.budget.mode)) {
+      fix(`budget.mode 必须是 warn/free/pause 之一，已回退为 ${defaults.budget.mode}`);
       cfg.budget.mode = defaults.budget.mode;
     }
   }

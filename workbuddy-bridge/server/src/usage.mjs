@@ -94,12 +94,14 @@ export function flushUsage() {
 
 function dayOf(key = todayKey()) {
   ensureLoaded();
-  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, hours: {}, models: {} };
+  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, hours: {}, models: {}, accounts: {} };
+  // 老数据（在 accounts 维度上线前落的盘）就地补，不动已有字段
+  if (!data.days[key].accounts) data.days[key].accounts = {};
   return data.days[key];
 }
 
-/** 记录一次调用。 */
-export function recordUsage({ site, model, mode, status, promptTokens = 0, completionTokens = 0, credit = 0, ms = 0, tools = 0 }) {
+/** 记录一次调用。account = 实际出力的账号 id（T36 报表的账号维度；缺失时记 'unknown'）。 */
+export function recordUsage({ site, model, mode, status, promptTokens = 0, completionTokens = 0, credit = 0, ms = 0, tools = 0, account = null }) {
   const day = dayOf();
   const ok = status >= 200 && status < 400;
   day.calls += 1;
@@ -130,6 +132,18 @@ export function recordUsage({ site, model, mode, status, promptTokens = 0, compl
   m.credit += credit || 0;
   m.ms += ms || 0;
   m.tools += tools || 0;
+  // 账号维度（T36）：同一个模型可能被多个账号轮流服务，报表要能按账号归集消耗。
+  // 键用 站点/账号id —— 账号 id 全局唯一，但带上站点在导出时更直观。
+  const ak = `${site}/${account || 'unknown'}`;
+  if (!day.accounts) day.accounts = {};
+  if (!day.accounts[ak]) day.accounts[ak] = { site, account: account || null, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0 };
+  const a = day.accounts[ak];
+  a.calls += 1;
+  if (!ok) a.errors += 1;
+  a.promptTokens += promptTokens || 0;
+  a.completionTokens += completionTokens || 0;
+  a.credit += credit || 0;
+  a.ms += ms || 0;
   scheduleSave();
 }
 
@@ -235,4 +249,72 @@ export function recentDailyCreditAvg(days = 7) {
     if (c > 0) { sum += c; n += 1; }
   }
   return n > 0 ? sum / n : 0;
+}
+
+/* ---------------- T36：用量报表导出 CSV ---------------- */
+
+/** 单个字段的 CSV 转义（纯函数）。含分隔符/引号/换行时用双引号包起来，内部引号翻倍。 */
+export function csvCell(v) {
+  const s = v === null || v === undefined ? '' : String(v);
+  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+/** 一行 → 一行 CSV（纯函数）。 */
+export function csvRow(cells) {
+  return cells.map(csvCell).join(',');
+}
+
+const DIM_LABEL = { model: '按模型', account: '按账号', day: '按日期' };
+
+/**
+ * 生成用量报表 CSV（T36）。三个维度各自成段，段前空行 + 「# 维度」注释行，
+ * 这样单个文件丢进 Excel 也能一眼看出分段。
+ *
+ * 纯函数（只读 data，不落盘），便于单测断言列头与转义。
+ * accountLabel 可选：把 acc_xxx 映射成用户自己起的名字（/usage/export 由 console-api 传入）。
+ */
+export function usageCsv(days = 7, { accountLabel = null } = {}) {
+  ensureLoaded();
+  const keys = Object.keys(data.days).sort().slice(-days);
+  const out = [];
+  const label = (site, id) => (accountLabel ? accountLabel(site, id) : id) || id || 'unknown';
+
+  // ---- 段 1：按模型 × 日期 ----
+  out.push(`# ${DIM_LABEL.model}（近 ${days} 天）`);
+  out.push(csvRow(['日期', '站点', '模型', '调用', '错误', '输入tok', '输出tok', '积分']));
+  for (const k of keys) {
+    for (const m of Object.values(data.days[k].models || {})) {
+      out.push(csvRow([k, m.site, m.model, m.calls, m.errors, m.promptTokens, m.completionTokens, round2(m.credit)]));
+    }
+  }
+
+  // ---- 段 2：按账号 × 日期 ----
+  out.push('');
+  out.push(`# ${DIM_LABEL.account}（近 ${days} 天）`);
+  out.push(csvRow(['日期', '站点', '账号', '调用', '错误', '输入tok', '输出tok', '积分']));
+  for (const k of keys) {
+    for (const a of Object.values(data.days[k].accounts || {})) {
+      out.push(csvRow([k, a.site, label(a.site, a.account), a.calls, a.errors, a.promptTokens, a.completionTokens, round2(a.credit)]));
+    }
+  }
+
+  // ---- 段 3：按日期汇总 ----
+  out.push('');
+  out.push(`# ${DIM_LABEL.day}（近 ${days} 天）`);
+  out.push(csvRow(['日期', '调用', '错误', '输入tok', '输出tok', '积分']));
+  let cAll = 0, eAll = 0, pAll = 0, tAll = 0, crAll = 0;
+  for (const k of keys) {
+    const d = data.days[k];
+    cAll += d.calls || 0; eAll += d.errors || 0;
+    pAll += d.promptTokens || 0; tAll += d.completionTokens || 0; crAll += d.credit || 0;
+    out.push(csvRow([k, d.calls, d.errors, d.promptTokens, d.completionTokens, round2(d.credit)]));
+  }
+  out.push(csvRow(['合计', cAll, eAll, pAll, tAll, round2(crAll)]));
+
+  // Excel 打开中文 CSV 需要 BOM，否则表头会显示成乱码
+  return '﻿' + out.join('\r\n') + '\r\n';
+}
+
+function round2(n) {
+  return Math.round((Number(n) || 0) * 100) / 100;
 }

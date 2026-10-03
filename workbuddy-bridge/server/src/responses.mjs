@@ -304,6 +304,7 @@ export async function handleResponses(ctx) {
       credit: await estimateCredit(cfg, site, model, agg.usage?.credit, usage.input_tokens, usage.output_tokens),
       ms: Date.now() - started,
       tools: agg.toolCallList.length,
+      account: up.accountId,
     });
 
     return sendJson(
@@ -610,6 +611,7 @@ export async function handleResponses(ctx) {
       credit,
       ms: Date.now() - started,
       tools: toolItems.size,
+      account: up.accountId,
     });
   }
 }

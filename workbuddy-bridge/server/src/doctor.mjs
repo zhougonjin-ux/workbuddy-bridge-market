@@ -18,6 +18,7 @@ import { recentEvents } from './events.mjs';
 import { taskStatus } from './tasks.mjs';
 import { healthStatus } from './health.mjs';
 import { compressionStats } from './compress.mjs';
+import { protocolCheckBrief } from './protocol.mjs';
 import { localVersion as updatecheckLocalVersion } from './updatecheck.mjs';
 
 /**
@@ -206,6 +207,24 @@ export async function runDiagnostics(cfg) {
     add('版本', 'pass', `workbuddy-bridge v${v}`);
   } catch (e) {
     add('版本', 'fail', String(e.message || e));
+  }
+
+  // ---- 13. 协议漂移（T39）----
+  // 读上次探测结果（不现探，避免诊断本身去打上游）：漂移即 fail，
+  // 并把不符的字段名逐条列出——那是「上游改版了」的定位线索。
+  try {
+    const p = protocolCheckBrief(cfg);
+    const checked = p.sites.filter((x) => !x.skipped);
+    if (!checked.length) {
+      add('协议自检', 'warn', '还没有探测记录——控制台「协议」卡点「立即自检」，或等 6 小时缓存过期后自动跑');
+    } else if (p.drifted) {
+      const bad = checked.flatMap((x) => x.results.map((r) => `${x.site}/${r.key}：${r.detail}`));
+      add('协议自检', 'fail', `${p.drifted}/${p.total} 项与预期不符，上游可能改版：${bad.slice(0, 3).join('；')}`);
+    } else {
+      add('协议自检', 'pass', `${p.sites.filter((x) => !x.skipped).map((x) => x.site).join('、')} 共 ${p.total} 项签名全部符合预期（上次 ${p.at ? new Date(p.at).toLocaleString() : '—'}）`);
+    }
+  } catch (e) {
+    add('协议自检', 'fail', String(e.message || e));
   }
 
   const summary = { pass: 0, warn: 0, fail: 0 };

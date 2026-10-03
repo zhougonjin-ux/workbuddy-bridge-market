@@ -657,7 +657,9 @@ const server = http.createServer(async (req, res) => {
       error(`${req.method} ${pathname} 处理失败：`, e.stack || e.message);
     }
     // 响应已断开就别再写了（对端已销毁，写入没有意义）
-    if (!res.headersSent && !res.writableEnded && !res.destroyed) sendError(res, status, e.message || 'internal error');
+    // e.type 一并带出去：T37 的预算拦截要靠它让客户端认出「预算超限」而不是
+    // 当成普通上游故障（上游错误一律塞成 upstream_error，会丢掉这个区分）。
+    if (!res.headersSent && !res.writableEnded && !res.destroyed) sendError(res, status, e.message || 'internal error', e.type || 'upstream_error');
     else if (!res.writableEnded && !res.destroyed) res.end();
   } finally {
     if (pathname !== '/health') {

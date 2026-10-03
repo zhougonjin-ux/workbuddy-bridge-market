@@ -754,3 +754,182 @@ test('B4 隔离实例即使继承了指向生产的覆盖变量，也只写隔�
     delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
   }
 });
+
+/* ---------------- T33/T34/T35/T36/T37/T39：新功能纯函数 ---------------- */
+
+const { enabledChannels, buildChannelRequest, notifyChannels } = await import('../src/notify.mjs');
+const { selectScanTargets } = await import('../src/health.mjs');
+const { csvCell, csvRow, usageCsv, flushUsage } = await import('../src/usage.mjs');
+const { budgetBlockActive, budgetBlockError } = await import('../src/budget.mjs');
+const { evaluateSignatures, PROTOCOL_SIGNATURES } = await import('../src/protocol.mjs');
+const { setConfigDir } = await import('../src/config.mjs');
+
+test('T33 enabledChannels：只认三种类型、必须有 url、enabled:false 被排除', () => {
+  const cfg = { notify: { channels: [
+    { type: 'webhook', url: 'https://a.example/hook' },
+    { type: 'bark', url: 'https://b.example/key', enabled: false },   // 显式关掉
+    { type: 'serverchan', url: '  https://c.example/send  ' },       // 前后空格要 trim
+    { type: 'telegram', url: 'https://d.example' },                  // 未知类型：丢弃
+    { type: 'webhook', url: '' },                                    // 没 url：丢弃
+    null,
+  ] } };
+  const got = enabledChannels(cfg).map((c) => `${c.type}:${c.url}`);
+  assert.deepEqual(got, ['webhook:https://a.example/hook', 'serverchan:https://c.example/send']);
+  assert.deepEqual(enabledChannels({}), [], '没有 channels 字段应返回空');
+  assert.deepEqual(enabledChannels({ notify: { channels: 'x' } }), [], 'channels 不是数组返回空');
+});
+
+test('T33 buildChannelRequest：三种通道的报文形状各不相同', () => {
+  const wh = buildChannelRequest({ type: 'webhook', url: 'https://a/h' }, '标题', '正文');
+  assert.equal(wh.init.method, 'POST');
+  assert.equal(wh.init.headers['Content-Type'], 'application/json');
+  assert.deepEqual(JSON.parse(wh.init.body), { title: '标题', text: '正文' });
+
+  const bark = buildChannelRequest({ type: 'bark', url: 'https://b.example/devicekey/' }, '余额不足', '剩 12 分');
+  assert.equal(bark.init.method, 'GET');
+  assert.equal(bark.url, 'https://b.example/devicekey/%E4%BD%99%E9%A2%9D%E4%B8%8D%E8%B6%B3/%E5%89%A9%2012%20%E5%88%86',
+    'Bark 是 GET 路径参数，中文与空格都要百分号编码');
+
+  const sc = buildChannelRequest({ type: 'serverchan', url: 'https://c.example/send' }, '猫猫归来', 'a&b=c');
+  assert.equal(sc.init.method, 'POST');
+  assert.equal(sc.init.headers['Content-Type'], 'application/x-www-form-urlencoded');
+  assert.equal(sc.init.body, 'title=%E7%8C%AB%E7%8C%AB%E5%BD%92%E6%9D%A5&desp=a%26b%3Dc',
+    'Server酱是表单编码，& 必须被转义');
+
+  assert.equal(buildChannelRequest({ type: 'nope', url: 'x' }, 't', 'b'), null, '未知类型返回 null');
+});
+
+test('T33 notifyChannels：按类型独立节流，一个通道失败不影响别的', () => {
+  resetNotifyThrottle();
+  const cfg = { notify: { channels: [
+    { type: 'webhook', url: 'https://a/h' },
+    { type: 'bark', url: 'https://b/k' },
+  ] } };
+  // 走模块内部节流表：首次两个通道都投递（真发走 fetch，沙箱里只是 warning，不影响计数）
+  assert.equal(notifyChannels(cfg, 't', 'b', { key: 'k1' }), 2, '首次应投递两个通道');
+  assert.equal(notifyChannels(cfg, 't', 'b', { key: 'k1' }), 0, '同一 key 5 分钟内应全被节流');
+  assert.equal(notifyChannels(cfg, 't', 'b', { key: 'k1', force: true }), 2, 'force 绕过节流');
+  assert.equal(notifyChannels({}, 't', 'b'), 0, '没配通道返回 0');
+  // 只有一个通道被节流时，另一个（不同 key）仍可投递 —— 证明节流是按 key 而非全局
+  assert.equal(notifyChannels(cfg, 't', 'b', { key: 'k2' }), 2, '换 key 后恢复投递');
+  resetNotifyThrottle();
+});
+
+test('T34 预警阈值：配置缺失/非法时回落到旧硬编码值', () => {
+  // validateConfig 原地改 cfg 并返回 issues；空对象会顺带报一堆别的字段缺失，
+  // 所以只断言与 alerts 相关的条目，不对 issue 总数做断言
+  const c1 = { alerts: { lowBalance: 'abc', expiryDays: 0, expiryMinAmount: -5 } };
+  const issues1 = validateConfig(c1);
+  assert.equal(c1.alerts.lowBalance, 200, '非数字应回退默认');
+  assert.equal(c1.alerts.expiryDays, 7, '0 天非法，回退默认');
+  assert.equal(c1.alerts.expiryMinAmount, 500, '负数非法，回退默认');
+  assert.equal(issues1.filter((s) => s.startsWith('alerts.')).length, 3, '三处非法应各报一条 alerts issue');
+
+  const c2 = { alerts: { lowBalance: 50, expiryDays: 14, expiryMinAmount: 1000 } };
+  const issues2 = validateConfig(c2);
+  assert.equal(c2.alerts.lowBalance, 50);
+  assert.equal(c2.alerts.expiryDays, 14);
+  assert.equal(c2.alerts.expiryMinAmount, 1000);
+  assert.equal(issues2.filter((s) => s.startsWith('alerts.')).length, 0, '合法值不该报 issue');
+
+  const c3 = {};
+  validateConfig(c3);
+  // alerts 是可选段：没配就不写进 cfg，由 console-api 的 alertThresholds 兜底成同样的默认值
+  // （与 budget/notify 缺省时的处理一致，不在这里硬塞一份）
+  assert.equal(c3.alerts, undefined, '未配置的 alerts 不应被凭空写进 config');
+});
+
+test('T34 config 校验：非法通知通道被丢弃并留下说明', () => {
+  const c = { notify: { channels: [
+    { type: 'webhook', url: 'https://a/h' },
+    { type: 'slack', url: 'https://s/x' },
+    { type: 'bark' },
+  ] } };
+  const issues = validateConfig(c);
+  assert.equal(c.notify.channels.length, 1, '只应保留合法的那一条');
+  assert.equal(c.notify.channels[0].type, 'webhook');
+  assert.equal(issues.filter((s) => s.startsWith('notify.channels')).length, 2, '未知类型与缺 url 各报一条');
+});
+
+test('T35 selectScanTargets：only 白名单 / onlyFree / 两者叠加 / 都不设', () => {
+  const targets = [
+    { id: 'hy3', mult: 0 },
+    { id: 'glm-5.3-flash', mult: 0.06 },
+    { id: 'kimi-k2', mult: 0.79 },
+    { id: 'gpt-5.5', mult: null },   // 目录没报倍率
+  ];
+  const ids = (cfg) => selectScanTargets(targets, cfg).map((t) => t.id);
+
+  assert.deepEqual(ids({}), ['hy3', 'glm-5.3-flash', 'kimi-k2', 'gpt-5.5'], '都不设 = 全量');
+  assert.deepEqual(ids({ healthCheck: { onlyFree: true } }), ['hy3'], '只探免费模型');
+  assert.deepEqual(ids({ healthCheck: { only: ['kimi-*'] } }), ['kimi-k2'], '前缀通配');
+  assert.deepEqual(ids({ healthCheck: { only: ['hy3', 'kimi-k2'] } }), ['hy3', 'kimi-k2'], '多条白名单');
+  assert.deepEqual(
+    ids({ healthCheck: { only: ['hy3', 'glm-5.3-flash'], onlyFree: true } }),
+    ['hy3'],
+    '叠加：白名单里再筛免费',
+  );
+  assert.deepEqual(ids({ healthCheck: { onlyFree: true } }), ['hy3'], '倍率未知(null)不算免费');
+  assert.deepEqual(ids({ healthCheck: { only: ['nonexistent'] } }), [], '白名单没命中应为空');
+});
+
+test('T36 CSV：特殊字符转义与行拼接', () => {
+  assert.equal(csvCell('普通'), '普通');
+  assert.equal(csvCell('有,逗号'), '"有,逗号"');
+  assert.equal(csvCell('说"引号"'), '"说""引号"""');
+  assert.equal(csvCell('换\n行'), '"换\n行"');
+  assert.equal(csvCell(null), '', 'null 应为空串');
+  assert.equal(csvCell(undefined), '');
+  assert.equal(csvCell(0), '0', '0 不能被当成空');
+  assert.equal(csvRow(['a', 'b,c', 1]), 'a,"b,c",1');
+});
+
+test('T36 CSV：usageCsv 三段齐全、带 BOM、含合计行', () => {
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-csv-'));
+  const restore = setConfigDir(iso);
+  try {
+    recordUsage({ site: 'cn-cli', model: 'glm-5.3-flash', mode: 'json', status: 200, promptTokens: 100, completionTokens: 50, credit: 1.5, account: 'acc_1' });
+    recordUsage({ site: 'cn-cli', model: 'hy3', mode: 'json', status: 200, promptTokens: 10, completionTokens: 5, credit: 0, account: 'acc_2' });
+    flushUsage();
+    const csv = usageCsv(7, { accountLabel: (site, id) => (id === 'acc_1' ? '周火火' : '公瑾') });
+    assert.ok(csv.startsWith('﻿'), '必须带 BOM，否则 Excel 打开是乱码');
+    assert.match(csv, /# 按模型（近 7 天）/);
+    assert.match(csv, /# 按账号（近 7 天）/);
+    assert.match(csv, /# 按日期（近 7 天）/);
+    assert.match(csv, /周火火/, '账号维度应显示用户起的名字而不是 acc_xxx');
+    assert.match(csv, /合计,2,0,110,55,1\.5/, '合计行应把 calls/积分加起来');
+    assert.ok(!csv.includes('acc_1'), '给了 accountLabel 就不该再出现原始 id');
+  } finally {
+    restore();
+  }
+});
+
+test('T37 预算 pause：只有 pause+超限才拦，其它模式照常放行', () => {
+  resetBudgetAnnounce();
+  const 超限 = { enabled: true, spent: 200, budget: 100, percent: 200, warn: true, exceeded: true };
+  // mode 取自 cfg（当前策略），st 只提供消耗状态——与 budgetRedirectActive 同一口径
+  assert.equal(budgetBlockActive({ budget: { mode: 'pause' } }, 超限), true, 'pause+超限应拦');
+  assert.equal(budgetBlockActive({ budget: { mode: 'warn' } }, 超限), false, 'warn 模式不拦');
+  assert.equal(budgetBlockActive({ budget: { mode: 'free' } }, 超限), false, 'free 模式不拦（走改道）');
+  assert.equal(budgetBlockActive({ budget: { mode: 'pause' } }, { ...超限, exceeded: false }), false, '没超限不拦');
+  assert.equal(budgetBlockActive({}, null), false, '未启用不拦');
+  // 注入的旧状态说 mode=pause 但配置已改成 warn 时，必须以配置为准
+  assert.equal(
+    budgetBlockActive({ budget: { mode: 'warn' } }, { ...超限, mode: 'pause' }),
+    false,
+    'mode 必须读当前配置，不能被注入的旧状态带偏',
+  );
+
+  const e = budgetBlockError({ ...超限, mode: 'pause' });
+  assert.equal(e.status, 429, 'HTTP 429');
+  assert.equal(e.type, 'budget_exceeded');
+  assert.match(e.message, /200\/100/, '错误信息要带上已用/预算，方便用户判断');
+});
+
+test('T37 budgetStatus：mode=pause 正确透出（老逻辑会把它降级成 warn）', () => {
+  const st = budgetStatus({ budget: { enabled: true, dailyCredits: 100, warnPercent: 80, mode: 'pause' } });
+  assert.equal(st.mode, 'pause', 'budgetStatus 必须原样透出 pause');
+  const st2 = budgetStatus({ budget: { enabled: true, dailyCredits: 100, mode: 'bogus' } });
+  assert.equal(st2.mode, 'warn', '未知 mode 降级为 warn');
+});
+

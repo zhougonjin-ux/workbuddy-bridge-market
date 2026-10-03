@@ -192,6 +192,7 @@ export async function handleMessages(ctx) {
       credit,
       ms: Date.now() - started,
       tools: agg.toolCallList.length,
+      account: up.accountId,
     });
     return sendJson(res, 200, {
       id: newId('msg'),
@@ -328,6 +329,7 @@ export async function handleMessages(ctx) {
       credit,
       ms: Date.now() - started,
       tools: toolBlocks.size,
+      account: up.accountId,
     });
   }
 }
