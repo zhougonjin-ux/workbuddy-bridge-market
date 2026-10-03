@@ -114,6 +114,29 @@ input[type=date]{color-scheme:dark}
 .kpi{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:11px 14px}
 .kpi b{font-size:20px;display:block}
 .kpi span{color:var(--muted);font-size:12px}
+
+/* ---------- 总览大屏（0.3.23）：KPI 横幅 + 四宫格，数据大屏式布局 ---------- */
+.kpis6{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:14px}
+.kpi2{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;min-width:0}
+.kpi2 b{font-size:25px;display:block;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kpi2 span{color:var(--muted);font-size:12px;display:block;margin-top:2px}
+.dash{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.dash>.card{margin-bottom:0;min-width:0}
+.panel-h{display:flex;align-items:baseline;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.panel-h b{font-size:13.5px}
+.panel-h .sub{color:var(--muted);font-size:12px;font-weight:400}
+.panel-h a{margin-left:auto;font-size:12px;color:var(--accent);cursor:pointer;white-space:nowrap}
+.panel-h a:hover{text-decoration:underline}
+.acctline{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--line)}
+.acctline:last-child{border-bottom:none}
+.expbar{height:6px;border-radius:3px;background:var(--chip);overflow:hidden;margin-bottom:3px}
+.expbar i{display:block;height:100%;border-radius:3px}
+.tile{flex:1;background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:10px 12px;text-align:center;min-width:0}
+.tile b{font-size:17px;display:block;margin-bottom:2px}
+.tile span{color:var(--muted);font-size:12px}
+.evline{display:flex;gap:8px;align-items:flex-start;padding:5px 0;border-bottom:1px solid var(--line)}
+.evline:last-child{border-bottom:none}
+.evline>span:last-child{min-width:0}
 .empty{color:var(--muted);text-align:center;padding:26px;border:1px dashed var(--line);border-radius:10px}
 .spin{display:inline-block;width:13px;height:13px;border:2px solid var(--muted);border-top-color:var(--accent);border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:6px}
 @keyframes sp{to{transform:rotate(360deg)}}
@@ -138,6 +161,13 @@ input[type=date]{color-scheme:dark}
   h2 .sub{flex-basis:100%;font-size:11.5px}
   /* 卡片单列；表格保持自身宽度由外层横滑（压缩列宽会把中文挤成竖条） */
   .accts,.policies,.kpis,.grid{grid-template-columns:1fr!important}
+  /* 大屏在窄屏降级：KPI 两列、四宫格单列 */
+  .kpis6{grid-template-columns:repeat(2,1fr)}
+  .kpis6 .kpi2 b{font-size:20px}
+  .dash{grid-template-columns:1fr}
+  /* 账号行窄屏换行，徽标不许被压成竖排字 */
+  .acctline{flex-wrap:wrap;row-gap:4px}
+  .acctline .badge{white-space:nowrap}
   .card{padding:12px;border-radius:10px}
   .row{gap:8px}
   /* 触摸目标 ≥40px（iOS HIG 建议 44，取折中值） */
@@ -171,7 +201,8 @@ input[type=date]{color-scheme:dark}
   <div id="alerts"></div>
 </header>
 <nav id="tabs">
-  <button data-tab="accounts" class="on">账号与积分</button>
+  <button data-tab="overview" class="on">总览</button>
+  <button data-tab="accounts">账号与积分</button>
   <button data-tab="models">模型</button>
   <button data-tab="guide">接入</button>
   <button data-tab="tasks">自动任务</button>
@@ -181,7 +212,8 @@ input[type=date]{color-scheme:dark}
   <button data-tab="logs">日志</button>
 </nav>
 <main>
-  <section id="tab-accounts"></section>
+  <section id="tab-overview"></section>
+  <section id="tab-accounts" hidden></section>
   <section id="tab-models" hidden></section>
   <section id="tab-guide" hidden></section>
   <section id="tab-tasks" hidden></section>
@@ -260,8 +292,8 @@ const dur = (ms) => {
 };
 
 /* ---------- 全局状态与 Tab ---------- */
-const TABS = ['accounts', 'models', 'guide', 'tasks', 'usage', 'events', 'health', 'logs'];
-let active = 'accounts';
+const TABS = ['overview', 'accounts', 'models', 'guide', 'tasks', 'usage', 'events', 'health', 'logs'];
+let active = 'overview';
 let refreshTimer = null, logTimer = null, logSeq = 0, logPaused = false, STATE = null;
 
 /* 仅当内容变化时才重建 DOM：页签轮询 / SSE 推送触发的重复渲染不再引发整页闪烁。
@@ -279,6 +311,7 @@ function switchTab(name) {
   for (const t of TABS) $('#tab-' + t).hidden = t !== name;
   for (const b of $('#tabs').children) b.classList.toggle('on', b.dataset.tab === name);
   clearInterval(refreshTimer); clearInterval(logTimer); logTimer = null;
+  if (name === 'overview') { loadOverview(); refreshTimer = setInterval(loadOverview, 30000); }
   if (name === 'accounts') { loadAccounts(); refreshTimer = setInterval(loadAccounts, 30000); }
   if (name === 'models') { loadModels(); refreshTimer = setInterval(loadModels, 60000); }
   if (name === 'guide') loadGuide();
@@ -317,6 +350,124 @@ async function loadHeader() {
       copy(text, '已复制 ZCode 接入配置');
     } catch (e) { toast('获取配置失败：' + e.message, 'bad'); }
   };
+}
+
+/* ---------- Tab 0：总览大屏（0.3.23，数据大屏式布局） ----------
+ * 设计目标：一屏看全局，不进子页签就能回答「还剩多少分 / 今天跑了什么 / 速率如何 / 出了什么事」。
+ * 数据全部复用现有接口（/bridge /usage /tasks /events /state），零后端改动；
+ * 30s 轮询 + SSE 推送都走 paint()，数据没变不动 DOM。每个面板右上角可跳对应子页签。 */
+async function loadOverview() {
+  const el = $('#tab-overview');
+  try {
+    const [bridge, usage, tasks, evts, state] = await Promise.all([
+      api('/bridge'),
+      api('/usage?days=7'),
+      api('/tasks'),
+      api('/events').catch(() => ({ events: [] })),
+      api('/state'),
+    ]);
+    STATE = state; // 顶栏的运行时长/状态随之保鲜
+    const accts = [];
+    for (const s of bridge.sites || []) for (const a of s.accounts || []) accts.push({ site: s, a });
+    const enabled = accts.filter((x) => x.a.enabled !== false);
+    const accNames = {};
+    for (const x of accts) accNames[x.a.id] = x.a.label || x.a.nickname || x.a.id;
+
+    const totalRemain = enabled.reduce((s, x) => s + (accountRemainOf(x.a) || 0), 0);
+    let weekExpiry = 0;
+    for (const x of enabled) for (const bt of x.a.creditDetail || []) {
+      const d = fmtDays(bt.expireAt);
+      if (d !== null && d >= 0 && d <= 7) weekExpiry += bt.remain || 0;
+    }
+    const today = usage.today || {};
+    const recent = usage.recent || [];
+    const maxCalls = Math.max(1, ...recent.map((d) => d.calls || 0));
+
+    // 今日自动任务完成度：每类按「启用账号中已完成的比例」
+    const taskState = (map) => {
+      const ok = Object.entries(map || {}).filter(([uid, e]) => e.ok && enabled.some((x) => (x.a.uid || x.a.id) === uid)).length;
+      return { ok, total: enabled.length || 1, done: enabled.length > 0 && ok >= enabled.length, some: ok > 0 };
+    };
+    const ck = taskState(tasks.checkin), gr = taskState(tasks.growth), tv = taskState(tasks.travel);
+
+    // ---- KPI 横幅 ----
+    const anyLogin = (state.sites || []).some((s) => s.logged_in);
+    const kpis = `
+      <div class="kpi2"><b class="ok">${fmtCredit(totalRemain)}</b><span>可用积分余额 · ${enabled.length} 个账号</span></div>
+      <div class="kpi2"><b class="warn">${fmtCredit(today.credit ?? 0)}</b><span>今日消耗积分</span></div>
+      <div class="kpi2"><b>${today.calls ?? 0}</b><span>今日调用 · 错误 ${today.errors ?? 0}</span></div>
+      <div class="kpi2"><b class="${weekExpiry > 0 ? 'warn' : ''}">${fmtCredit(weekExpiry)}</b><span>7 天内到期积分</span></div>
+      <div class="kpi2"><b>${enabled.filter((x) => !String(x.a.lastError || x.a.last_error || '').includes('401')).length}<span style="font-size:14px;color:var(--muted)">/${enabled.length}</span></b><span>健康账号（401 视为失效）</span></div>
+      <div class="kpi2"><b class="${anyLogin ? 'ok' : 'bad'}" style="font-size:18px;padding-top:5px">${anyLogin ? '● 运行中' : '○ 未登录'}</b><span>服务 · 已运行 ${dur(state.uptime_ms || 0)}</span></div>`;
+
+    // ---- 面板 1：积分与到期（每账号一行：名称 + 余额大字 + 最近到期批次条） ----
+    const accRows = enabled.map((x) => {
+      const remain = accountRemainOf(x.a);
+      const batches = (x.a.creditDetail || []).filter((bt) => (bt.remain || 0) > 0 && fmtDays(bt.expireAt) !== null)
+        .sort((p, q) => fmtDays(p.expireAt) - fmtDays(q.expireAt));
+      const soon = batches[0];
+      const d = soon ? fmtDays(soon.expireAt) : null;
+      const pct = d === null ? 0 : Math.max(4, Math.min(100, Math.round(d / 30 * 100)));
+      const col = d === null ? 'var(--chip)' : d <= 7 ? 'var(--bad)' : d <= 30 ? 'var(--warn)' : 'var(--ok)';
+      const active = x.site.active_account_id === x.a.id;
+      return `<div class="acctline">
+        <b style="min-width:104px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(accNames[x.a.id] || x.a.id)}</b>
+        ${active ? '<span class="badge ok">使用中</span>' : '<span class="badge" style="visibility:hidden">占位</span>'}
+        <b style="font-size:19px;min-width:76px;text-align:right" class="${d !== null && d <= 7 ? 'warn' : ''}">${remain != null ? fmtCredit(remain) : '—'}</b>
+        <div style="flex:1;min-width:130px">
+          <div class="expbar"><i style="width:${pct}%;background:${col}"></i></div>
+          <span class="muted" style="font-size:11px">${soon ? `最近批次 ${new Date(soon.expireAt).toLocaleDateString()}（${d === 0 ? '今天' : d + ' 天后'}）· 余 ${fmtCredit(soon.remain)}` : '无到期信息'}</span>
+        </div>
+      </div>`;
+    }).join('');
+
+    // ---- 面板 2：今日自动任务（三个状态块 + 快捷执行 + 待领提示） ----
+    const taskTile = (name, st) => `<div class="tile">
+      <b class="${st.done ? 'ok' : st.some ? 'warn' : ''}">${st.done ? '✓ 全部完成' : st.some ? st.ok + '/' + st.total : '— 未执行'}</b>
+      <span>${name}</span></div>`;
+    const claimable = lastTcData ? (lastTcData.tasks || []).filter((x) => x.claimable && !x.claimed).length : null;
+    const g = tasks.gainedTotal || { credit: 0, claims: 0 };
+
+    // ---- 面板 3：近 7 天消耗柱图 ----
+    const trend = recent.map((d) => {
+      const daySpeed = d.ms > 0 ? (d.completionTokens / (d.ms / 1000)).toFixed(1) + ' tok/s' : '';
+      return `<div class="col" title="${esc(d.date)}：${d.calls} 次调用，${fmtCredit(d.credit ?? 0)} 积分${daySpeed ? '，平均 ' + daySpeed : ''}"><span>${d.credit ? fmtCredit(d.credit) + '分' : ''}</span><i style="height:${Math.round((d.calls || 0) / maxCalls * 100)}%"></i><span>${esc(d.date.slice(5))}</span></div>`;
+    }).join('');
+
+    // ---- 面板 4：最新事件 ----
+    const evRows = (evts.events || []).slice(0, 9).map((e) => {
+      const kind = (EVENT_KINDS.find((k) => k.id === e.kind) || {}).name || e.kind;
+      const who = e.accountId && accNames[e.accountId] ? ` · ${esc(accNames[e.accountId])}` : '';
+      return `<div class="evline"><span class="muted" style="font-size:11.5px;white-space:nowrap">${esc(new Date(e.at).toLocaleTimeString())}</span><span class="badge ${EVENT_BADGE[e.kind] || ''}" style="flex:0 0 auto">${esc(kind)}</span><span style="font-size:12.5px;overflow:hidden">${esc(e.text)}${e.site ? ` · ${esc(e.site)}` : ''}${who}</span></div>`;
+    }).join('');
+
+    const changed = paint(el, `
+      <div class="kpis6">${kpis}</div>
+      <div class="dash">
+        <div class="card"><div class="panel-h"><b>积分与到期</b><span class="sub">策略 ${esc(bridge.policy || 'expiry-first')} · 到期优先自动换号</span><a data-go="accounts">账号详情 →</a></div>
+          ${accRows || '<div class="muted" style="padding:14px">还没有账号 —— 到「账号与积分」页添加</div>'}</div>
+        <div class="card"><div class="panel-h"><b>今日自动任务</b><span class="sub">${esc(tasks.today || '')}</span><a data-go="tasks">任务中心 →</a></div>
+          <div style="display:flex;gap:10px;margin-bottom:12px">${taskTile('每日签到', ck)}${taskTile('成长任务', gr)}${taskTile('猫猫旅行', tv)}</div>
+          <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center">
+            ${claimable ? `<span class="badge warn">任务中心有 ${claimable} 个奖励可领</span>` : ''}
+            <span class="spacer"></span>
+            <button class="btn mini" id="ovCheckin">立即签到</button>
+            <button class="btn mini" id="ovGrowth">扫描成长</button>
+            <button class="btn mini" id="ovTravel">🐾 巡逻</button>
+          </div>
+          <div class="muted" style="font-size:11.5px;margin-top:10px">累计白嫖 ${fmtCredit(g.credit ?? 0)} 积分 · ${g.claims ?? 0} 次领奖（列表数据每日 09:00/15:00/21:00 自动刷新，不实时拉取）</div>
+        </div>
+        <div class="card"><div class="panel-h"><b>近 7 天消耗</b><span class="sub">柱高 = 调用次数 · 标注 = 积分</span><a data-go="usage">用量明细 →</a></div>
+          <div class="bars" style="height:128px">${trend || '<span class="muted">暂无数据</span>'}</div></div>
+        <div class="card"><div class="panel-h"><b>最新事件</b><span class="sub">任务 / 账号 / 策略 / 登录</span><a data-go="events">全部事件 →</a></div>
+          ${evRows || '<div class="muted" style="padding:14px">暂无事件</div>'}</div>
+      </div>`);
+    if (changed) {
+      for (const a of el.querySelectorAll('[data-go]')) a.onclick = () => switchTab(a.dataset.go);
+      const bind = (id, kind) => { const b = $(id); if (b) b.onclick = () => runTask(kind); };
+      bind('#ovCheckin', 'checkin'); bind('#ovGrowth', 'growth'); bind('#ovTravel', 'travel');
+    }
+  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 
 /* ---------- 顶栏积分预警（所有页签常驻，60s 轮询；无命中不渲染） ---------- */
@@ -1906,6 +2057,10 @@ setInterval(loadAlerts, 60000); // 预警条独立于页签轮询，切页不被
     es.addEventListener('tasks', () => maybeRefresh('tasks'));
     es.addEventListener('usage', () => maybeRefresh('usage'));
     function maybeRefresh(kind) {
+      // 总览大屏：bridge/tasks/usage 任一推送都值得重算（数据没变时 paint() 自会跳过）
+      if (['bridge', 'tasks', 'usage'].includes(kind) && active === 'overview' && !busy.overview) {
+        busy.overview = true; loadOverview().finally(() => { busy.overview = false; });
+      }
       // 只有「推送所属页签正被看着」才重渲染；busy 防抖（用户手动触发的加载不重复）
       if (kind === 'bridge' && active === 'accounts' && !busy.bridge) {
         busy.bridge = true; loadAccounts().finally(() => { busy.bridge = false; });
@@ -1934,7 +2089,7 @@ setInterval(loadAlerts, 60000); // 预警条独立于页签轮询，切页不被
   } catch { /* 不支持就全靠轮询 */ }
 })();
 
-switchTab('accounts');
+switchTab('overview');
 </script>
 </body>
 </html>
