@@ -471,3 +471,66 @@ test('T24 validateConfig：consolePin 校验（4-12 位数字/空值关闭/非�
   validateConfig(long);
   assert.equal(long.consolePin, null, '超长回退关闭');
 });
+
+/* ---------------- B1/B2/B3：SSE 鉴权通道、停服保护、凭据脱敏 ---------------- */
+
+test('B2 doStop：有活跃请求时抛 409，force 可放行且仍等空闲', async () => {
+  const life = await import('../src/lifecycle-impl.mjs');
+  let active = 3;
+  let flushed = 0;
+  life.bootLifecycle({
+    activeRequestsRef: () => active,
+    stoppers: [() => { flushed++; }],
+    flushers: [],
+  });
+  // 活跃请求 >0 且未 force → 拒绝，并带上数量供 HTTP 层提示
+  assert.throws(
+    () => life.doStop(),
+    (e) => e.status === 409 && e.activeRequests === 3,
+  );
+  assert.equal(flushed, 0, '被拒绝时不得刷盘/停循环（什么都没发生）');
+  // force 放行：仍走 waitIdle —— 等在途请求跑完，不掐断
+  const r = life.doStop({ force: true });
+  assert.equal(r.waiting, true);
+  assert.equal(r.active, 3);
+  assert.equal(flushed, 0, '有在途请求时不得停循环/刷盘（否则等于半路掐断）');
+  // 请求全部跑完后，排队的退出函数才执行 —— 这才是「不掐断」的落点
+  active = 0;
+  life.drainWaiters();
+  assert.equal(flushed, 1, '请求清零后停止器才被调用一次');
+});
+
+test('B2 doStop：无活跃请求时立即退出（不等待）', async () => {
+  const life = await import('../src/lifecycle-impl.mjs');
+  let flushed = 0;
+  life.bootLifecycle({ activeRequestsRef: () => 0, stoppers: [() => { flushed++; }], flushers: [] });
+  const r = life.doStop();
+  assert.equal(r.waiting, false);
+  assert.equal(flushed, 1);
+});
+
+test('B3 bridgeStatus redact：抹掉两个 token 字段且不影响其余字段', async () => {
+  const { bridgeStatus } = await import('../src/scheduler.mjs');
+  const { savePool } = await import('../src/pool.mjs');
+  const cfg = { sites: { 'cn-cli': { label: '国内' } }, defaultSite: 'cn-cli', pool: {}, tasks: {}, models: {} };
+  savePool('cn-cli', {
+    accounts: [{
+      id: 'acc_test', label: '测试', accessToken: 'AT-SECRET', refreshToken: 'RT-SECRET',
+      creditDetail: [{ credit: 100, cycleEndTime: '2026-12-01' }], creditRemain: 100,
+    }],
+  });
+  const raw = bridgeStatus(cfg);
+  const acc0 = raw.sites[0].accounts[0];
+  assert.equal(acc0.accessToken, 'AT-SECRET', '默认不脱敏（/backup 等需要凭据的路径依赖它）');
+  const safe = bridgeStatus(cfg, { redact: true });
+  const acc1 = safe.sites[0].accounts[0];
+  assert.equal(acc1.accessToken, undefined, 'redact 必须抹掉 accessToken');
+  assert.equal(acc1.refreshToken, undefined, 'redact 必须抹掉 refreshToken');
+  assert.equal(JSON.stringify(safe).includes('SECRET'), false, '整份响应里不得残留凭据');
+  // 其余字段必须完好（前端全靠它们渲染）
+  assert.equal(acc1.id, 'acc_test');
+  assert.equal(acc1.label, '测试');
+  assert.equal(acc1.creditRemain, 100);
+  assert.equal(acc1.creditDetail[0].credit, 100);
+  assert.ok(safe.sites[0].plan, '建议消耗顺序仍应生成');
+});

@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { ROOT, paths } from './config.mjs';
-import { error, log } from './log.mjs';
+import { error, log, warn } from './log.mjs';
 import { recordEvent } from './events.mjs';
 import { flushUsage } from './usage.mjs';
 import { flushPool } from './pool.mjs';
@@ -107,4 +107,24 @@ export function doRestart() {
   log(`交棒重启：新实例 PID=${pid} 已拉起（排队等端口），本实例等空闲后退出`);
   const r = gracefulExit({ waitIdle: true, reason: '交棒重启' });
   return { pid, ...r };
+}
+
+/**
+ * 停止服务入口（B2：/console/api/service/stop 与 /admin/shutdown 共用）。
+ * 与旧的 process.exit(0) 相比多了两件事：
+ *   1. 走完整 gracefulExit —— 停后台循环 + 刷 usage/events/learned/账号池，不丢最后一次落盘；
+ *   2. 有活跃请求时默认拒绝（force=true 才放行）。本服务的模型流量承载着 ZCode 会话
+ *      自身的连接，停服时把在途请求掐断 = 用户会话直接断线。
+ * force 只跳过「拒绝」这一步，仍然等在途请求跑完再退（gracefulExit 尾部 5 秒强退
+ * 只兜底收尾卡死的情况）。
+ */
+export function doStop({ force = false } = {}) {
+  if (state.exiting) throw Object.assign(new Error('已在退出流程中'), { status: 409 });
+  const active = state.activeRequestsRef();
+  if (active > 0 && !force) {
+    warn(`拒绝停服：${active} 个请求进行中（掐断在途模型请求会连带断掉 ZCode 会话）`);
+    throw Object.assign(new Error(`有 ${active} 个请求进行中`), { status: 409, activeRequests: active });
+  }
+  log(`停止服务：${active} 个活跃请求${force ? '（强制模式，仍等在途请求跑完）' : ''}`);
+  return gracefulExit({ waitIdle: true, reason: force ? '强制停止' : '控制台停止' });
 }

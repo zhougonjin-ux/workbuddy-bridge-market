@@ -257,7 +257,11 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, r.ok ? 200 : 400, r);
   }
   if (p === '/bridge' && method === 'GET') {
-    const b = bridgeStatus(cfg);
+    // B3：轮询通道（20s 一次）同样脱敏。此前只有 SSE 通道 redact，这个接口每 20 秒
+    // 把两个账号的 accessToken/refreshToken 明文发给浏览器——前端对这两个字段零消费
+    // （接入页复制的是 apiKey，不是账号 token），直接抹掉不影响任何功能。
+    // /backup 保留明文：导出的用途本就是把账号整套搬走。
+    const b = bridgeStatus(cfg, { redact: true });
     b.budget = budgetCheckAndAnnounce(cfg); // T13：预警条数据源 + 每天一次的预算提醒
     return sendJson(res, 200, b);
   }
@@ -759,11 +763,33 @@ export async function handleConsoleApi(ctx) {
   }
 
   // ---- 服务控制 ----
+  // B2：原来这里直接 process.exit(0) —— 会掐断在途模型请求（可能正是发这个请求的
+  // 用户会话自己）并跳过 gracefulExit 的刷盘。现改走与 /admin/shutdown 同源的
+  // requestStop：完整刷盘 + 有活跃请求时 409 拒绝（force=1 放行）。
   if (p === '/service/stop' && method === 'POST') {
-    sendJson(res, 200, { ok: true, message: 'shutting down' });
-    flushUsage();
-    setTimeout(() => process.exit(0), 200);
-    return;
+    const { requestStop } = await import('./lifecycle.mjs');
+    const force = String(ctx.body?.force ?? url.searchParams.get('force') ?? '') === '1';
+    try {
+      const r = requestStop({ force });
+      return sendJson(res, 200, {
+        ok: true,
+        waiting: Boolean(r.waiting),
+        activeRequests: r.active || 0,
+        message: r.waiting
+          ? `已受理停止：等 ${r.active} 个在途请求完成后退出（数据已刷盘）`
+          : '正在保存数据并停止服务',
+      });
+    } catch (e) {
+      if (e.status === 409) {
+        return sendJson(res, 409, {
+          ok: false,
+          error: 'busy',
+          activeRequests: e.activeRequests || 0,
+          message: `有 ${e.activeRequests} 个请求进行中，已拒绝停止（掐断它们会连带断掉会话）。等它们跑完再停，或用 force=1 强制停止。`,
+        });
+      }
+      return sendJson(res, e.status || 500, { ok: false, error: String(e.message || e) });
+    }
   }
 
   // ---- T23：控制台访问 PIN（控制台里的设置卡片；PIN 值永远不回传，只回是否已启用）----

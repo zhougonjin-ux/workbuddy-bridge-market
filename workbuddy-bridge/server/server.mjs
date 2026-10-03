@@ -227,8 +227,8 @@ function authorized(req) {
 //      activeRequests 归零（完全空闲）后才退出交出端口 —— 进行中的请求不受影响。
 // 实现体在 lifecycle-impl.mjs（console-api 的 /service/restart 也要走同一条路径，
 // 拆出去避免 console-api → server.mjs 的循环 import）；这里只持有计数与依赖注入。
-import { bootLifecycle, drainWaiters, gracefulExit, doRestart } from './src/lifecycle-impl.mjs';
-import { setRestartHandler } from './src/lifecycle.mjs';
+import { bootLifecycle, drainWaiters, gracefulExit, doRestart, doStop } from './src/lifecycle-impl.mjs';
+import { setRestartHandler, setStopHandler } from './src/lifecycle.mjs';
 let activeRequests = 0;
 
 const server = http.createServer(async (req, res) => {
@@ -328,7 +328,17 @@ const server = http.createServer(async (req, res) => {
       if (!fs.existsSync(file)) return sendError(res, 500, '控制台文件缺失：console/index.html');
       let html = fs.readFileSync(file, 'utf8');
       html = html.replace('<head>', `<head>\n<script>window.__WB_TOKEN__=${JSON.stringify(CONSOLE_TOKEN)};</script>`);
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+      // B1：随真页面下发会话 cookie。这是 EventSource 唯一可用的鉴权通道——
+      // EventSource 不支持自定义请求头，而 consoleAuthorized 认的 cookie 只在 PIN
+      // 解锁时种，PIN 默认关闭 → 浏览器里的 SSE 永远 401，T29 推送从未真正生效。
+      // 安全性没有新增暴露面：cookie 值就是同一枚 CONSOLE_TOKEN，而它本来就
+      // 明文内联在刚下发的这份 HTML 里给前端用；HttpOnly + SameSite=Strict 让
+      // 脚本读不到、跨站请求不带，与 X-Console-Token 头同级。
+      res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Set-Cookie': `wbConsoleToken=${CONSOLE_TOKEN}; Path=/; SameSite=Strict; HttpOnly`,
+      });
       return res.end(html);
     }
 
@@ -492,17 +502,24 @@ const server = http.createServer(async (req, res) => {
     if (pathname === '/admin/shutdown' && req.method === 'POST') {
       const url2 = new URL(req.url, 'http://x');
       const force = url2.searchParams.get('force') === '1';
-      if (activeRequests > 0 && !force) {
-        warn(`拒绝停服：${activeRequests} 个请求进行中（模型流量断掉会连带断掉 ZCode 会话）。确认要强制停服请加 ?force=1`);
-        return sendJson(res, 409, {
+      // B2：与控制台的 /service/stop 共用 doStop，保证「停服」只有一条实现——
+      // 完整刷盘 + 活跃请求保护，不会再有某条路径裸 process.exit 掐断会话流量。
+      try {
+        const r = doStop({ force });
+        sendJson(res, 200, {
+          ok: true,
+          message: r.waiting ? `等 ${r.active} 个请求完成后退出` : '正在保存数据并停止服务',
+        });
+      } catch (e) {
+        sendJson(res, e.status || 500, {
           ok: false,
-          error: 'busy',
-          message: `${activeRequests} 个请求进行中，拒绝停服。强制请加 ?force=1，或改用 POST /admin/restart（等空闲后交棒重启，不断线）`,
-          activeRequests,
+          error: e.status === 409 ? 'busy' : 'shutdown failed',
+          message: e.status === 409
+            ? `${e.activeRequests} 个请求进行中，拒绝停服。强制请加 ?force=1，或改用 POST /admin/restart（等空闲后交棒重启，不断线）`
+            : String(e.message || e),
+          activeRequests: e.activeRequests || 0,
         });
       }
-      const r = gracefulExit({ reason: '收到停止指令' });
-      sendJson(res, 200, { ok: true, message: r.waiting ? `等 ${r.active} 个请求完成后退出` : 'shutting down' });
       return;
     }
 
@@ -698,6 +715,8 @@ server.listen(cfg.port, cfg.host, () => {
     flushers: [flushUsage, flushPool, flushLearned, flushEvents],
   });
   setRestartHandler(doRestart);
+  // B2：停止服务也走注册表，控制台的「停止」与 /admin/shutdown 落到同一条 gracefulExit 路径
+  setStopHandler(doStop);
   // 自动导入本机已登录客户端的账号（静默；客户端续期 token 后重启服务即自动跟进）
   importLocalAccounts(cfg, { silent: true }).catch((e) => warn('本机账号自动导入失败：', e.message));
 });

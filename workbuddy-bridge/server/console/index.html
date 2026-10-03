@@ -1605,7 +1605,20 @@ setInterval(loadAlerts, 60000); // 预警条独立于页签轮询，切页不被
         busy.usage = true; loadUsage().finally(() => { busy.usage = false; });
       }
     }
-    es.onerror = () => { /* 断线 EventSource 自动重连；轮询仍是兜底 */ };
+    es.onerror = () => {
+      /* 断线 EventSource 自动重连；轮询仍是兜底。
+       * B1：但有一种断线不是网络抖动——CONSOLE_TOKEN 每次服务启动都重新随机生成，
+       * 交棒重启后开着的老页签 token 立刻失效，服务端 401 关闭连接，EventSource 置
+       * CLOSED 且不再自愈（CLOSED 正是「服务端拒绝、重连也没用」的信号）。此时刷新页面
+       * 就能拿到新 token 并恢复推送；/health 守卫防止服务真挂了时无限刷新。 */
+      if (es.readyState !== EventSource.CLOSED || sessionStorage.getItem('wbAutoReloaded')) return;
+      sessionStorage.setItem('wbAutoReloaded', '1');
+      fetch('/health').then((r) => {
+        if (!r.ok) throw new Error('service down');
+        location.reload(); // 服务活着 → 是会话 token 过期，刷新拿新的
+      }).catch(() => { /* 服务真不在（正被交棒/看门狗拉起），等它起来刷新页面即自愈 */ })
+        .finally(() => sessionStorage.removeItem('wbAutoReloaded'));
+    };
   } catch { /* 不支持就全靠轮询 */ }
 })();
 
