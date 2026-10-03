@@ -16,15 +16,24 @@
 
 ## 1. 安装（ZCode 桌面端）
 
-1. **设置 → 插件市场（Plugin Marketplace）→ 添加 → 添加插件市场**，粘贴目录：
-   `E:\桌面\新建文件夹\plugins`
-2. 在该市场（`dev-workbuddy-bridge-local`）里找到 **WorkBuddy 积分桥** → **安装**
+### 方式 A：插件市场 UI（推荐）
+
+1. 打开 ZCode → 插件市场 → 添加 → 从 GitHub 添加，填入仓库：
+   `zhougonjin-ux/workbuddy-bridge-market`
+2. 在市场里找到 **WorkBuddy 积分桥** → **安装**
 3. 安装后到 **设置 → 插件** 确认处于启用状态
+
+### 方式 B：命令行
+
+```bash
+zcode plugins marketplace add zhougonjin-ux/workbuddy-bridge-market
+zcode plugins install workbuddy-bridge@workbuddy-bridge-market
+```
 
 ## 2. 启动代理
 
 - 安装后**每次打开 ZCode 会话会自动拉起代理**（SessionStart hook，幂等、不阻塞）；
-  也可在会话里运行 `/wb-start` 手动启动。
+  也可在会话里运行 `/wbp-start` 手动启动。
 - 验证：浏览器打开可视化管理台 http://127.0.0.1:8788/console
   （五个面板：**账号与积分**——策略切换/账号卡片/每批积分到期倒计时/微信扫码登录；**模型**——倍率、上下文容量、图片/工具/推理能力表；**自动任务**；**用量**；**日志**）
 - 数据目录：`%USERPROFILE%\.zcode\workbuddy-bridge\`（配置、账号池、用量、任务状态都在这，
@@ -34,11 +43,11 @@
 ## 3. 添加 WorkBuddy 账号（多账户）
 
 方式一（最省事）：**本机自动导入** —— 只要这台电脑上登录过 WorkBuddy / CodeBuddy 客户端，
-点控制台的「⬇ 导入本机账号」（或运行 `/wb-import`），登录态直接从
+点控制台的「⬇ 导入本机账号」（或运行 `/wbp-import`），登录态直接从
 `~/.codebuddy/settings.json` 提取并入池，免扫码。服务**每次启动也会自动重扫一次**，
 客户端续期 token 后自动跟进。
 
-方式二：会话里运行 **`/wb-login`**，agent 会发起设备授权登录、
+方式二：会话里运行 **`/wbp-login`**，agent 会发起设备授权登录、
 把授权链接给你、轮询到登录成功后自动刷新积分明细；控制台「＋添加账号」里也能
 **微信扫码**登录。
 
@@ -74,14 +83,14 @@ ZCode 自带 OpenAI 兼容探活的（`GET /v1/models`）无需鉴权也能同�
 ## 4.5 建议安装：开机自启（签到不漏）
 
 代理目前由 ZCode 会话拉起——哪天没开 ZCode，当天的自动签到就会漏。运行
-**`/wb-startup install`** 注册登录自启（Windows 计划任务，免管理员），之后代理常驻、
-ZCode 会话钩子检测到存活不会重复拉起。`/wb-startup remove` 卸载，`/wb-startup status` 查看状态。
+**`/wbp-startup install`** 注册登录自启（Windows 计划任务，免管理员），之后代理常驻、
+ZCode 会话钩子检测到存活不会重复拉起。`/wbp-startup remove` 卸载，`/wbp-startup status` 查看状态。
 
 ## 5. 积分到期优先调度（核心）
 
 - 后台每 30 分钟（`creditRefreshMinutes` 可调）刷新每个账号的积分批次明细，
   每批积分带**到期时间**（上游 `CycleEndTime` 字段）。
-- 调度策略（`config.json → pool.policy`，或用 `/wb-switch` 切换）：
+- 调度策略（`config.json → pool.policy`，或用 `/wbp-switch` 切换）：
 
 | 策略 | 行为 |
 |---|---|
@@ -105,16 +114,16 @@ ZCode 会话钩子检测到存活不会重复拉起。`/wb-startup remove` 卸�
 - 总开关：`config.json → tasks.enabled`；分类开关 `tasks.checkin` / `tasks.growth`。
 - 手动执行：`wb_tasks_run` 工具；查状态：`wb_tasks_status` 或 `/console`。
 
-## 7. 更新插件（客户端内操作）
+## 7. 更新插件（GitHub 市场）
 
-源码版本递增并同步进市场清单后（本次为 **0.2.0**），在客户端里：
+插件市场已发布到 **https://github.com/zhougonjin-ux/workbuddy-bridge-market**（public），
+在客户端里添加一次，之后随版本发布即可在客户端内更新：
 
-1. **插件市场 → 齿轮按钮 → 市场源** → 找到 `dev-workbuddy-bridge-local` → 点 **刷新该市场**
-2. 回到 **个人/已安装** → 打开 WorkBuddy 积分桥详情 → 出现 **更新** 按钮时点击
-3. 新建任务验证新能力（看插件详情里显示的版本号确认）
-
-> 想要「不点刷新自动拉取」的完全自动更新，需要把 `plugins/` 目录发布成 GitHub 仓库，
-> 市场改从 GitHub 仓库添加；本地目录市场用上面的「刷新 → 更新」两步即可。
+1. **插件市场 → 添加 → 从 GitHub 仓库添加**：`zhougonjin-ux/workbuddy-bridge-market`
+   （市场名：`workbuddy-bridge-market`；本地目录市场可删除，避免重复）
+2. 安装后，源码新版本发布时：**插件市场 → 齿轮 → 市场源 → 刷新该市场**，
+   回到插件详情点 **更新**（部分版本客户端会自动提示可更新）
+3. 命令行发布/更新工具：`.ref/publish-github.mjs`（走 GitHub API，无需本机 git）
 
 ## 8. MCP 工具与命令一览
 
@@ -123,7 +132,7 @@ MCP 服务器 `workbuddy-bridge`（装好插件自动连接）提供：
 `wb_status` · `wb_credit_plan` · `wb_switch` · `wb_models` · `wb_login_start` ·
 `wb_login_poll` · `wb_import_local` · `wb_refresh_credits` · `wb_tasks_run` · `wb_tasks_status`
 
-斜杠命令：`/wb`（会话内总览面板，免浏览器）· `/wb-start` · `/wb-status` · `/wb-switch` · `/wb-login` · `/wb-import` · `/wb-console`（客户端内置浏览器打开管理台）
+斜杠命令：`/wbp`（会话内总览面板，免浏览器）· `/wbp-start` · `/wbp-status` · `/wbp-switch` · `/wbp-login` · `/wbp-import` · `/wbp-console`（客户端内置浏览器打开管理台）
 
 管理 API（本机 + apiKey）：`GET /admin/bridge` · `POST /admin/policy` ·
 `POST /admin/credit/refresh` · `GET /admin/tasks` · `POST /admin/tasks/run`
