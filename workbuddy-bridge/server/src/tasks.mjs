@@ -455,6 +455,7 @@ export async function growthScanAccount(cfg, site, accountId) {
       warn(`[${site}] 领奖失败（${t.title}）：`, e.message);
     }
   }
+  invalidateTaskCenter(site, accountId); // 扫描可能报名/代打/领奖，缓存的进度视图已过期
   return { ok: true, accepted, autoChats, autoTasks, autoNotes, claimed, creditGained, tasks: tasks.length };
 }
 
@@ -597,7 +598,7 @@ export function taskStatus() {
   };
 }
 
-/* ---------------- 成长任务中心（T14）：实时视图 + 单任务代打/领奖 ---------------- */
+/* ---------------- 成长任务中心（T14）：视图 + 单任务代打/领奖 ---------------- */
 
 /**
  * 实时拉取某账号的成长任务列表，并标注「能否代打」（T16 规则判定）。
@@ -616,6 +617,52 @@ export async function growthTasksView(cfg, site, accountId) {
       remain: Math.max(0, t.target - t.current),
     };
   });
+}
+
+/* ---------------- 任务中心列表缓存（0.3.22）----------------
+ * 任务列表原先由控制台轮询实时拉上游（30s 轮询 + SSE 推送两条路都会触发），页面整页
+ * 重建导致明显闪烁，对上游也是无意义的重复请求。现在列表只在三处被真正拉取：
+ *   1) 调度循环在 tasks.listTimes（默认 09:00/15:00/21:00）各预取一次全部启用账号；
+ *   2) 打开任务页且缓存超过 TTL（6 小时）时按需拉一次；
+ *   3) 用户点「手动刷新」或代打/领奖完成后（refresh=1）。
+ * 缓存仅在内存（重启即清，首次打开按需拉取补上）；fetcher 参数仅供单测注入。
+ */
+const TC_TTL_MS = 6 * 3600_000;
+const tcCache = new Map(); // 'site|accountId' → { at, tasks }
+
+export async function taskCenterView(cfg, site, accountId, { force = false, fetcher = growthTasksView } = {}) {
+  const key = `${site}|${accountId}`;
+  const hit = tcCache.get(key);
+  if (!force && hit && Date.now() - hit.at < TC_TTL_MS) {
+    return { tasks: hit.tasks, cachedAt: hit.at, fromCache: true };
+  }
+  const tasks = await fetcher(cfg, site, accountId);
+  tcCache.set(key, { at: Date.now(), tasks });
+  return { tasks, cachedAt: Date.now(), fromCache: false };
+}
+
+/** 调度预取：所有已登录站点的启用账号各刷一次（已在 TTL 内的跳过）。返回实际拉取的账号数。 */
+export async function prewarmTaskCenter(cfg) {
+  let n = 0;
+  for (const sk of siteKeys(cfg)) {
+    if (!cfg.sites[sk]?.logged_in) continue;
+    for (const a of listAccounts(sk)) {
+      if (a.enabled === false) continue;
+      try {
+        const r = await taskCenterView(cfg, sk, a.id);
+        if (!r.fromCache) n++;
+      } catch (e) {
+        warn(`任务列表自动刷新失败（${a.label || a.id}）：`, String(e.message || e).slice(0, 120));
+      }
+    }
+  }
+  if (n) log(`任务中心列表已自动刷新（${n} 个账号）`);
+  return n;
+}
+
+/** 代打/领奖等改变上游进度的操作之后调用：丢弃该账号的缓存视图，下次查看时重新拉取。 */
+function invalidateTaskCenter(site, accountId) {
+  tcCache.delete(`${site}|${accountId}`);
 }
 
 /**
@@ -637,6 +684,7 @@ export async function runSingleTask(cfg, site, accountId, taskCode, { times = nu
   const r = await autoplayChats(cfg, site, accountId, t, attempts, j.model);
   // 打完重拉进度，前端立即看到新进度
   const fresh = (await listGrowthTasks(cfg, site, accountId)).find((x) => x.code === taskCode) || t;
+  invalidateTaskCenter(site, accountId); // 进度已变，丢弃缓存视图（前端随即 force 重拉）
   record('growth-manual', accountId, {
     ok: r.chats > 0, site,
     msg: `手动代打「${t.title}」${r.chats} 次${r.error ? `，失败：${r.error}` : ''}`,
@@ -658,6 +706,7 @@ export async function claimSingleTask(cfg, site, accountId, taskCode) {
   if (!t.claimable) return { ok: false, msg: t.claimed ? '奖励已领取过' : `进度未达标（${t.current}/${t.target}）`, task: t };
   const auth = getAuth(site);
   const r = await claimReward(cfg, site, auth, cfg.sites[site], t.code);
+  invalidateTaskCenter(site, accountId);
   record('growth-manual', accountId, { ok: true, site, msg: `手动领奖「${t.title}」+${r.credit} 积分`, credit: r.credit });
   if (r.credit > 0) await refreshAfterGain(cfg, site, accountId);
   return { ok: true, credit: r.credit, msg: `已领取「${t.title}」+${r.credit} 积分`, task: t };
@@ -673,17 +722,22 @@ function hoursHit(hours) {
 }
 
 /**
- * 判断此刻是否到点：优先用精确时点 ["HH:MM"]（checkinTimes/growthTimes），
- * 未配置时回落到旧的小时数组（checkinHours/growthHours，整点语义）。
+ * 判断此刻是否到点：优先用精确时点 ["HH:MM"]（checkinTimes/growthTimes/travelTimes/listTimes），
+ * 未配置时回落到旧的小时数组（checkinHours/growthHours，整点语义；仅签到/成长/旅行有旧语义）。
  */
 function scheduledNow(cfg, kind, d = new Date()) {
   const t = cfg.tasks || {};
-  const times = kind === 'checkin' ? t.checkinTimes : t.growthTimes;
+  const times = kind === 'checkin' ? t.checkinTimes
+    : kind === 'growth' ? t.growthTimes
+    : kind === 'travel' ? t.travelTimes
+    : t.listTimes;
   if (Array.isArray(times) && times.length) {
     const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
     return times.includes(hhmm);
   }
-  return hoursHit(kind === 'checkin' ? t.checkinHours : t.growthHours);
+  if (kind === 'checkin' || kind === 'growth') return hoursHit(kind === 'checkin' ? t.checkinHours : t.growthHours);
+  if (kind === 'travel') return hoursHit(t.growthHours); // 与旧行为一致：travelTimes 留空时回退成长任务整点
+  return false; // listTimes 留空 = 关闭任务列表自动预取，仅剩手动刷新与打开页面按需拉取
 }
 
 function summarize(result) {
@@ -707,9 +761,15 @@ export function startTaskLoop(cfg) {
     return;
   }
   let lastTravelMs = 0;
+  let lastListMs = 0;
   timers.tasks = setInterval(async () => {
     try {
       const today = todayKey();
+      // 0.3.22：任务中心列表每日 listTimes 各预取一次（与签到/成长/旅行互不影响、不占 kind 名额）
+      if (scheduledNow(cfg, 'list') && Date.now() - lastListMs > 10 * 60_000) {
+        lastListMs = Date.now();
+        void prewarmTaskCenter(cfg);
+      }
       let kind = scheduledNow(cfg, 'checkin') && firedDay.checkin !== today
         ? 'checkin'
         : scheduledNow(cfg, 'growth') && firedDay.growth !== today

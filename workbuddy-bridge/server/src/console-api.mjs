@@ -26,7 +26,7 @@ import { recentEvents } from './events.mjs';
 import { compressionStats } from './compress.mjs';
 import { sendJson } from './util.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
-import { runTasks, taskStatus, growthTasksView, runSingleTask, claimSingleTask } from './tasks.mjs';
+import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask } from './tasks.mjs';
 import { importLocalAccounts } from './localimport.mjs';
 import { budgetStatus, budgetCheckAndAnnounce } from './budget.mjs';
 import { testChannels } from './notify.mjs';
@@ -357,7 +357,7 @@ export async function handleConsoleApi(ctx) {
       .map((s) => s.trim())
       .filter(Boolean)
       .map((s) => s.padStart(5, '0'));
-    const norm = { checkinTimes: parseTimes(body.checkinTimes), growthTimes: parseTimes(body.growthTimes), travelTimes: parseTimes(body.travelTimes) };
+    const norm = { checkinTimes: parseTimes(body.checkinTimes), growthTimes: parseTimes(body.growthTimes), travelTimes: parseTimes(body.travelTimes), listTimes: parseTimes(body.listTimes) };
     for (const [k, arr] of Object.entries(norm)) {
       if (arr.some((s) => !/^([01]?\d|2[0-3]):[0-5]\d$/.test(s))) {
         return sendJson(res, 400, { ok: false, error: `${k} 里有非法时点（应为 HH:MM，如 09:30）：${arr.join(',')}` });
@@ -366,6 +366,7 @@ export async function handleConsoleApi(ctx) {
     cfg.tasks.checkinTimes = norm.checkinTimes;
     cfg.tasks.growthTimes = norm.growthTimes;
     if (norm.travelTimes) cfg.tasks.travelTimes = norm.travelTimes;
+    if (norm.listTimes) cfg.tasks.listTimes = norm.listTimes;
     if (body.travelLocationId !== undefined) {
       const loc = Number(body.travelLocationId);
       if (!Number.isInteger(loc) || loc < 1 || loc > 99) return sendJson(res, 400, { ok: false, error: 'travelLocationId 须为 1-99 整数' });
@@ -383,6 +384,8 @@ export async function handleConsoleApi(ctx) {
       saved: {
         checkinTimes: cfg.tasks.checkinTimes,
         growthTimes: cfg.tasks.growthTimes,
+        travelTimes: cfg.tasks.travelTimes,
+        listTimes: cfg.tasks.listTimes,
         autoComplete: cfg.tasks.autoComplete,
         maxChatsPerTask: cfg.tasks.maxChatsPerTask,
       },
@@ -390,16 +393,21 @@ export async function handleConsoleApi(ctx) {
   }
 
   // ---- workbuddy-bridge：成长任务中心（T14）----
-  // 实时任务视图（进度条 + 每任务代打/领奖按钮的数据源）
+  // 任务列表视图：默认读缓存（每日 listTimes 自动预取 + 打开页面 TTL 过期才拉），
+  // ?refresh=1 强制实时拉取（手动刷新按钮/代打领奖后）。响应带 cachedAt/fromCache 供前端标注数据时间。
   if (p === '/task-center' && method === 'GET') {
     const site = String(url.searchParams.get('site') || cfg.defaultSite);
     const accountId = String(url.searchParams.get('accountId') || '');
+    const force = url.searchParams.get('refresh') === '1';
     if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
     if (!accountId) return sendJson(res, 400, { error: '缺少 accountId' });
     if (!getAccount(site, accountId)) return sendJson(res, 404, { error: `账号不存在：${accountId}` });
     try {
-      const tasks = await growthTasksView(cfg, site, accountId);
-      return sendJson(res, 200, { ok: true, site, accountId, tasks });
+      const v = await taskCenterView(cfg, site, accountId, { force });
+      return sendJson(res, 200, {
+        ok: true, site, accountId, tasks: v.tasks,
+        cachedAt: v.cachedAt, fromCache: v.fromCache, listTimes: cfg.tasks?.listTimes || [],
+      });
     } catch (e) {
       return sendJson(res, 502, { error: `拉取任务列表失败：${String(e.message || e).slice(0, 160)}` });
     }

@@ -264,6 +264,16 @@ const TABS = ['accounts', 'models', 'guide', 'tasks', 'usage', 'events', 'health
 let active = 'accounts';
 let refreshTimer = null, logTimer = null, logSeq = 0, logPaused = false, STATE = null;
 
+/* 仅当内容变化时才重建 DOM：页签轮询 / SSE 推送触发的重复渲染不再引发整页闪烁。
+ * 返回 true 表示真的重建了（此时才需要重绑事件、重画子区域）。 */
+function paint(el, html) {
+  if (!el) return false;
+  if (el.__wbPaint === html) return false;
+  el.__wbPaint = html;
+  el.innerHTML = html;
+  return true;
+}
+
 function switchTab(name) {
   active = name;
   for (const t of TABS) $('#tab-' + t).hidden = t !== name;
@@ -272,7 +282,7 @@ function switchTab(name) {
   if (name === 'accounts') { loadAccounts(); refreshTimer = setInterval(loadAccounts, 30000); }
   if (name === 'models') { loadModels(); refreshTimer = setInterval(loadModels, 60000); }
   if (name === 'guide') loadGuide();
-  if (name === 'tasks') { loadTasks(); refreshTimer = setInterval(loadTasks, 30000); }
+  if (name === 'tasks') { loadTasks(); loadTaskCenter(); refreshTimer = setInterval(loadTasks, 30000); }
   if (name === 'usage') { loadUsage(); refreshTimer = setInterval(loadUsage, 60000); }
   if (name === 'events') { loadEvents(); refreshTimer = setInterval(loadEvents, 30000); }
   if (name === 'health') { loadHealth(); refreshTimer = setInterval(loadHealth, 30000); }
@@ -454,7 +464,7 @@ async function loadAccounts() {
       }
       html += `<div class="grid accts">${s2.plan.map((row) => acctCard(s2, row, acctRows[s.site + '/' + row.id] || {})).join('')}</div>`;
     }
-    el.innerHTML = html;
+    paint(el, html); // 内容没变就不重建 DOM：30s 轮询 + 20s SSE 推送不再引发账号页闪烁
 
     // 点卡片 = 固定使用该账号（再点一次取消，恢复自动调度）。
     // 只拦截点在卡片空白处；改名/启停/删除等按钮和下拉框照常工作。
@@ -514,7 +524,7 @@ async function loadAccounts() {
     }
     for (const b of el.querySelectorAll('[data-act]')) bindAcctAction(b, loadAccounts);
   } catch (e) {
-    el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`;
+    paint(el, `<div class="empty">加载失败：${esc(e.message)}</div>`);
   }
 }
 
@@ -743,7 +753,7 @@ async function loadModels() {
       <td>${r.mult === 0 ? '<b class="ok">免费</b>' : r.mult != null ? '<b>x' + r.mult + '</b>' : '—'}</td>
       <td>${r.ok ? `<b class="ok">${r.ms} ms</b>` : `<span class="bad" title="${esc(r.msg || '')}">✗ ${esc((r.msg || '不可用').slice(0, 50))}</span>`}</td>
     </tr>`).join('');
-    el.innerHTML = `
+    paint(el, `
       <h2>模型清单 <span class="sub">来自上游目录 · 倍率越低越省积分 · 修改默认模型即时生效</span></h2>
       <div style="display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap">
         <button class="btn" id="btnPoolSync">⟳ 手动同步到选择器</button>
@@ -777,7 +787,7 @@ async function loadModels() {
           <span class="muted" id="hcOnlyNow" style="font-size:12px">${(hcfg.only || []).length || hcfg.onlyFree ? '当前：' + esc(((hcfg.only || []).length ? (hcfg.only || []).join('、') : '全部') + (hcfg.onlyFree ? '（且仅免费）' : '')) : '当前：全量巡检'}</span>
         </div>
         <div style="overflow:auto">${hrows ? `<table><thead><tr><th>模型</th><th>站点</th><th>倍率</th><th>状态 / 延迟</th></tr></thead><tbody>${hrows}</tbody></table>` : '<div class="muted" style="padding:16px;text-align:center">还没有巡检结果 —— 点「▶ 全量巡检」实测所有模型（约 10~30 秒）</div>'}</div>
-      </div>`;
+      </div>`);
     $('#btnPoolSync').onclick = async () => {
       const b = $('#btnPoolSync');
       b.disabled = true; b.textContent = '同步中…';
@@ -897,7 +907,7 @@ async function loadGuide() {
       },
     ];
 
-    el.innerHTML = `
+    paint(el, `
       <h2>本机接入参数 <span class="sub">本代理同时提供 OpenAI 与 Anthropic 两种兼容端点，API Key 即 config.json 的 apiKey</span></h2>
       <div class="card" style="margin-bottom:14px">
         <div class="row" style="gap:14px">
@@ -912,7 +922,7 @@ async function loadGuide() {
       <div class="card" style="margin-bottom:12px">
         <div class="row" style="margin-bottom:8px"><b>${esc(s.title)}</b><span class="muted" style="font-size:12px">${esc(s.note)}</span><span class="spacer"></span><button class="btn mini" data-gsnippet="${s.id}">⧉ 复制整段配置</button></div>
         <pre id="g-${s.id}">${esc(s.text)}</pre>
-      </div>`).join('')}`;
+      </div>`).join('')}`);
 
     for (const b of el.querySelectorAll('[data-gcopy]')) {
       b.onclick = () => navigator.clipboard?.writeText(b.dataset.gcopy).then(() => toast('已复制：' + b.dataset.gcopy, 'ok')).catch(() => {});
@@ -943,71 +953,10 @@ async function loadTasks() {
           <div class="muted" style="font-size:12px;margin-top:4px">${esc(e.msg || (e.claimed != null ? `报名 ${e.accepted} · 代打 ${e.autoChats ?? 0} · 领奖 ${e.claimed} · +${e.creditGained} 积分${(e.autoTasks || []).length ? '（' + e.autoTasks.join('、') + '）' : ''}${(e.autoNotes || []).length ? '。' + e.autoNotes.join('；') : ''}` : ''))}</div>
         </div>`).join('')}</div>`;
     };
-    el.innerHTML = `
-      <h2>任务中心 <span class="sub">实时拉取每个账号的任务进度 · 单任务可手动代打/领奖（走 T16 活动规则判定）</span></h2>
-      <div class="card" style="margin-bottom:14px">
-        <div class="row" style="flex-wrap:wrap;gap:10px">
-          <select id="tcAccount" style="min-width:220px"></select>
-          <button class="btn" id="tcReload">↻ 刷新任务列表</button>
-          <span class="muted" id="tcStatus" style="font-size:12px"></span>
-        </div>
-        <div id="tcList" style="margin-top:12px"></div>
-      </div>
-      <h2>签到日历 <span class="sub">最近 8 周 · 绿格 = 当天全部账号签到成功（半绿 = 部分账号）</span></h2>
-      <div class="card" id="checkinCal" style="margin-bottom:14px"></div>
-      <h2>累计白嫖统计 <span class="sub">自动任务从上游领到的积分合计（不含签到本身的积分，签到积分由上游直接发放）</span></h2>
-      <div class="grid kpis" id="gainedKpis" style="margin-bottom:14px"></div>
-      <h2>自动任务 <span class="sub">时点可自定义（HH:MM，逗号分隔多个）；不填则回退到整点小时</span></h2>
-      <div class="card" style="margin-bottom:14px">
-        <div class="row" style="flex-wrap:wrap;gap:10px">
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px">签到时点
-            <input id="tkCheckinTimes" value="${esc((cfg.checkinTimes || []).join(', '))}" placeholder="09:00, 21:30" style="width:170px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px">成长任务时点
-            <input id="tkGrowthTimes" value="${esc((cfg.growthTimes || []).join(', '))}" placeholder="01:00, 13:20" style="width:170px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="派猫猫旅行巡逻时点：到站自动领奖、空闲自动派出（每日 1 次上限由上游控制）、旅行中跳过；状态机幂等，一天可巡逻多次">
-            旅行巡逻时点
-            <input id="tkTravelTimes" value="${esc((cfg.travelTimes || []).join(', '))}" placeholder="09:00, 15:00, 21:00" style="width:190px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px">旅行地点 ID
-            <input id="tkTravelLoc" type="number" min="1" max="99" value="${cfg.travelLocationId ?? 4}" style="width:64px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-          </label>
-          <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="成长任务里的「体验指定模型 / 聊天N次」类任务，由桥接代打极小请求点亮进度（单任务每次最多代打次数见下方数字）；公众号关注等人工任务无法代打">
-            <input type="checkbox" id="tkAuto" ${cfg.autoComplete === false ? '' : 'checked'}> 自动完成对话体验类任务
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px">单任务代打上限
-            <input id="tkMaxChats" type="number" min="1" max="20" value="${cfg.maxChatsPerTask ?? 5}" style="width:64px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-          </label>
-          <button class="btn" id="tkSaveCfg">保存设置</button>
-        </div>
-        <div class="muted" style="font-size:12px;margin-top:8px">旧配置里的整点小时（checkinHours/growthHours）在时点留空时仍然生效。每天每类任务最多执行一次；抖动 ±${cfg.jitterMinutes ?? 0} 分钟。</div>
-      </div>
-      <div class="card" style="margin-bottom:14px">
-        <div class="row" style="flex-wrap:wrap;gap:10px">
-          <b style="font-size:13px">每日积分预算</b>
-          <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="按用量页同源的估算口径累计今日消耗；超过预警线提醒，超限且模式为「自动切免费」时 default/auto 改道免费模型">
-            <input type="checkbox" id="bdEnabled" ${cfg.budget?.enabled ? 'checked' : ''}> 启用
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px">每日预算（积分）
-            <input id="bdDaily" type="number" min="1" step="1" value="${cfg.budget?.dailyCredits ?? 100}" style="width:90px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="达到该比例时顶栏预警 + 桌面通知（每天最多一次）">预警线（%）
-            <input id="bdWarn" type="number" min="1" max="99" value="${cfg.budget?.warnPercent ?? 80}" style="width:70px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-          </label>
-          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="warn=只提醒；free=超预算后 default/auto 自动改道到免费模型（不拦显式指定的模型）；pause=超预算后直接拒绝所有新模型请求（429），防失控烧积分">超限动作
-            <select id="bdMode" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-              <option value="warn" ${cfg.budget?.mode === 'warn' || !cfg.budget?.mode ? 'selected' : ''}>仅提醒</option>
-              <option value="free" ${cfg.budget?.mode === 'free' ? 'selected' : ''}>自动切免费模型</option>
-              <option value="pause" ${cfg.budget?.mode === 'pause' ? 'selected' : ''}>暂停新请求（429）</option>
-            </select>
-          </label>
-          <button class="btn" id="bdSave">保存预算</button>
-          <span class="muted" id="bdNow" style="font-size:12px"></span>
-        </div>
-        <div class="muted" style="font-size:12px;margin-top:8px">预算口径与「用量」页一致（上游没报积分时按倍率×tokens 估算）；「自动切免费」不影响显式指定的模型，「暂停新请求」则会拦下所有模型请求（含显式指定）。</div>
-      </div>
-      <div class="row" style="margin-bottom:14px">
+    // 0.3.22 布局：操作行置顶 → 任务中心 → 今日执行（三合一）→ 日历+白嫖统计并排 → 最近记录 → 配置折叠
+    const listTimesTxt = (cfg.listTimes || []).join(' / ') || '未设置';
+    const html = `
+      <div class="row" style="flex-wrap:wrap;gap:8px;margin-bottom:14px">
         <span class="badge ${cfg.enabled === false ? '' : 'ok'}">总开关：${cfg.enabled === false ? '关' : '开'}</span>
         <span class="badge">签到：${cfg.checkin === false ? '关' : '开'}</span>
         <span class="badge">成长任务：${cfg.growth === false ? '关' : '开'}</span>
@@ -1016,16 +965,93 @@ async function loadTasks() {
         <button class="btn" id="tkGrowth">扫描成长任务</button>
         <button class="btn" id="tkTravel">🐾 猫猫旅行巡逻</button>
       </div>
-      <h2>今日签到 <span class="sub">${esc(t.today)}</span></h2>${one('签到', t.checkin)}
-      <h2>今日成长任务 <span class="sub">自动报名 + 对话类代打 + 达标领奖</span></h2>${one('成长任务', t.growth)}
-      <h2>今日猫猫旅行 <span class="sub">到站领奖 / 空闲派出 / 旅行中跳过</span></h2>${one('猫猫旅行', t.travel)}
+      <h2>任务中心 <span class="sub">列表不再实时轮询：每日 ${esc(listTimesTxt)} 自动刷新（下方设置可改时点），平时显示缓存数据，需要最新点「手动刷新」</span></h2>
+      <div class="card" style="margin-bottom:14px">
+        <div class="row" style="flex-wrap:wrap;gap:10px">
+          <select id="tcAccount" style="min-width:220px"></select>
+          <button class="btn" id="tcReload">↻ 手动刷新</button>
+          <span class="muted" id="tcStatus" style="font-size:12px"></span>
+        </div>
+        <div id="tcList" style="margin-top:12px"></div>
+      </div>
+      <h2>今日执行 <span class="sub">${esc(t.today)} · 自动报名 + 对话类代打 + 达标领奖 + 猫猫到站领奖</span></h2>
+      <div class="card" style="margin-bottom:14px;display:flex;flex-wrap:wrap;gap:20px;align-items:flex-start">
+        <div style="flex:1;min-width:280px"><div style="font-weight:600;font-size:13px;margin-bottom:8px">签到</div>${one('签到', t.checkin)}</div>
+        <div style="flex:1;min-width:280px"><div style="font-weight:600;font-size:13px;margin-bottom:8px">成长任务</div>${one('成长任务', t.growth)}</div>
+        <div style="flex:1;min-width:280px"><div style="font-weight:600;font-size:13px;margin-bottom:8px">猫猫旅行</div>${one('猫猫旅行', t.travel)}</div>
+      </div>
+      <div class="row" style="flex-wrap:wrap;gap:14px;align-items:stretch;margin-bottom:14px">
+        <div class="card" id="checkinCal" style="margin-bottom:0"></div>
+        <div style="flex:1;min-width:320px">
+          <div style="font-weight:600;font-size:13px;margin-bottom:8px">累计白嫖统计 <span class="sub">自动任务领到的积分合计（不含签到积分）</span></div>
+          <div class="grid kpis" id="gainedKpis"></div>
+        </div>
+      </div>
       <h2>最近记录</h2>
       <div class="card" style="padding:0">${(t.history || []).length ? `<table><tbody>${t.history.slice(0, 15).map((h) => `
         <tr><td style="width:120px" class="muted">${esc(new Date(h.at).toLocaleString())}</td>
         <td style="width:70px"><span class="badge ${h.kind === 'checkin' ? 'acc' : h.kind === 'travel' ? 'warn' : 'ok'}">${{ checkin: '签到', growth: '成长', travel: '旅行' }[h.kind] || h.kind}</span></td>
         <td><span class="${h.ok ? 'ok' : 'bad'}">${h.ok ? '✓' : '✗'}</span> ${esc(h.msg || `报名${h.accepted ?? 0} 代打${h.autoChats ?? 0} 领奖${h.claimed ?? 0} +${h.creditGained ?? 0}分${(h.autoNotes || []).length ? '。' + h.autoNotes.join('；') : ''}`)}</td></tr>`).join('')}</tbody></table>`
-        : '<div class="muted" style="padding:18px;text-align:center">还没有运行记录</div>'}</div>`;
-    // ---- T15：签到日历（最近 8 周热力格）----
+        : '<div class="muted" style="padding:18px;text-align:center">还没有运行记录</div>'}</div>
+      <details style="margin-top:14px">
+        <summary style="cursor:pointer;user-select:none;font-weight:600;font-size:14px;padding:6px 0">⚙ 任务与预算设置 <span class="sub">签到 / 成长 / 旅行 / 列表刷新时点 · 代打 · 每日预算</span></summary>
+        <div class="card" style="margin-top:10px;margin-bottom:14px">
+          <div class="row" style="flex-wrap:wrap;gap:10px">
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px">签到时点
+              <input id="tkCheckinTimes" value="${esc((cfg.checkinTimes || []).join(', '))}" placeholder="09:00, 21:30" style="width:170px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px">成长任务时点
+              <input id="tkGrowthTimes" value="${esc((cfg.growthTimes || []).join(', '))}" placeholder="01:00, 13:20" style="width:170px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="派猫猫旅行巡逻时点：到站自动领奖、空闲自动派出（每日 1 次上限由上游控制）、旅行中跳过；状态机幂等，一天可巡逻多次">
+              旅行巡逻时点
+              <input id="tkTravelTimes" value="${esc((cfg.travelTimes || []).join(', '))}" placeholder="09:00, 15:00, 21:00" style="width:190px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="任务中心列表每天在这些时点从上游预取一次（服务端缓存）；留空则关闭自动预取，仅剩手动刷新与打开页面按需拉取">
+              列表刷新时点
+              <input id="tkListTimes" value="${esc((cfg.listTimes || []).join(', '))}" placeholder="09:00, 15:00, 21:00" style="width:190px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px">旅行地点 ID
+              <input id="tkTravelLoc" type="number" min="1" max="99" value="${cfg.travelLocationId ?? 4}" style="width:64px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            </label>
+            <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="成长任务里的「体验指定模型 / 聊天N次」类任务，由桥接代打极小请求点亮进度（单任务每次最多代打次数见右侧数字）；公众号关注等人工任务无法代打">
+              <input type="checkbox" id="tkAuto" ${cfg.autoComplete === false ? '' : 'checked'}> 自动完成对话体验类任务
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px">单任务代打上限
+              <input id="tkMaxChats" type="number" min="1" max="20" value="${cfg.maxChatsPerTask ?? 5}" style="width:64px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            </label>
+            <button class="btn" id="tkSaveCfg">保存设置</button>
+          </div>
+          <div class="muted" style="font-size:12px;margin-top:8px">旧配置里的整点小时（checkinHours/growthHours）在时点留空时仍然生效。每天每类任务最多执行一次；抖动 ±${cfg.jitterMinutes ?? 0} 分钟。</div>
+        </div>
+        <div class="card" style="margin-bottom:0">
+          <div class="row" style="flex-wrap:wrap;gap:10px">
+            <b style="font-size:13px">每日积分预算</b>
+            <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="按用量页同源的估算口径累计今日消耗；超过预警线提醒，超限且模式为「自动切免费」时 default/auto 改道免费模型">
+              <input type="checkbox" id="bdEnabled" ${cfg.budget?.enabled ? 'checked' : ''}> 启用
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px">每日预算（积分）
+              <input id="bdDaily" type="number" min="1" step="1" value="${cfg.budget?.dailyCredits ?? 100}" style="width:90px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="达到该比例时顶栏预警 + 桌面通知（每天最多一次）">预警线（%）
+              <input id="bdWarn" type="number" min="1" max="99" value="${cfg.budget?.warnPercent ?? 80}" style="width:70px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            </label>
+            <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="warn=只提醒；free=超预算后 default/auto 自动改道到免费模型（不拦显式指定的模型）；pause=超预算后直接拒绝所有新模型请求（429），防失控烧积分">超限动作
+              <select id="bdMode" style="padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+                <option value="warn" ${cfg.budget?.mode === 'warn' || !cfg.budget?.mode ? 'selected' : ''}>仅提醒</option>
+                <option value="free" ${cfg.budget?.mode === 'free' ? 'selected' : ''}>自动切免费模型</option>
+                <option value="pause" ${cfg.budget?.mode === 'pause' ? 'selected' : ''}>暂停新请求（429）</option>
+              </select>
+            </label>
+            <button class="btn" id="bdSave">保存预算</button>
+            <span class="muted" id="bdNow" style="font-size:12px"></span>
+          </div>
+          <div class="muted" style="font-size:12px;margin-top:8px">预算口径与「用量」页一致（上游没报积分时按倍率×tokens 估算）；「自动切免费」不影响显式指定的模型，「暂停新请求」则会拦下所有模型请求（含显式指定）。</div>
+        </div>
+      </details>`;
+    const changed = paint(el, html);
+    // ---- T15：签到日历（最近 8 周热力格）——只在页面真的重建时重画 ----
+    if (changed) {
     const calEl = $('#checkinCal');
     {
       const days = t.checkinDays || {};
@@ -1053,11 +1079,13 @@ async function loadTasks() {
         const title = future ? '' : `${k}：${n ? n + '/' + accCount + ' 个账号已签到' : '未签到'}`;
         cells.push(`<i title="${esc(title)}" style="width:13px;height:13px;border-radius:3px;background:${color};${future ? 'visibility:hidden' : ''}"></i>`);
       }
-      calEl.innerHTML = `<div style="display:flex;flex-wrap:wrap;gap:3px;max-width:220px">${cells.join('')}</div>
+      calEl.innerHTML = `<div style="font-weight:600;font-size:13px;margin-bottom:8px">签到日历 <span class="sub">最近 8 周 · 绿格 = 全部账号已签到</span></div>
+        <div style="display:flex;flex-wrap:wrap;gap:3px;max-width:220px">${cells.join('')}</div>
         <div class="muted" style="font-size:11.5px;margin-top:8px">深绿 = 当天全部账号签到 · 浅绿 = 部分账号 · 灰 = 未签到 · 最多保留 120 天记录</div>`;
     }
-    // ---- T15：累计白嫖 KPI ----
-    {
+    }
+    // ---- T15：累计白嫖 KPI（同上，仅重建时重画）----
+    if (changed) {
       const g = t.gainedTotal || { credit: 0, checkins: 0, claims: 0, travels: 0 };
       $('#gainedKpis').innerHTML = `
         <div class="kpi"><b class="ok">${fmtCredit(g.credit ?? 0)}</b><span>成长任务+旅行领回积分</span></div>
@@ -1065,21 +1093,24 @@ async function loadTasks() {
         <div class="kpi"><b>${g.claims ?? 0}</b><span>累计领奖次数</span></div>
         <div class="kpi"><b>${g.travels ?? 0}</b><span>猫猫旅行归来次数</span></div>`;
     }
-    // ---- T14：任务中心（账号下拉 + 实时进度条 + 单任务代打/领奖）----
-    const tcSel = $('#tcAccount');
-    const accOptions = [];
-    for (const s of bridge.sites || []) for (const a of s.accounts || []) {
-      if (a.enabled === false) continue;
-      accOptions.push({ site: s.site, id: a.id, label: `${a.label || a.id}（${esc(s.label)}）` });
+    // ---- T14：任务中心 —— 账号下拉只在页面重建时重排；列表渲染走 renderTcList（缓存数据，不在轮询路径）----
+    if (changed) {
+      const tcSel = $('#tcAccount');
+      const accOptions = [];
+      for (const s of bridge.sites || []) for (const a of s.accounts || []) {
+        if (a.enabled === false) continue;
+        accOptions.push({ site: s.site, id: a.id, label: `${a.label || a.id}（${esc(s.label)}）` });
+      }
+      tcSel.innerHTML = accOptions.map((o) => `<option value="${esc(o.site)}|${esc(o.id)}">${o.label}</option>`).join('') || '<option value="">（没有账号）</option>';
+      const lastTc = localStorage.getItem('wbTcAccount');
+      if (lastTc && accOptions.some((o) => o.site + '|' + o.id === lastTc)) tcSel.value = lastTc;
+      tcSel.onchange = () => { localStorage.setItem('wbTcAccount', tcSel.value); loadTaskCenter({ spinner: true }); };
+      $('#tcReload').onclick = () => loadTaskCenter({ force: true, spinner: true });
+      if (accOptions.length) renderTcList(); // 回填最近一次数据（switchTab 的按需拉取稍后自动覆盖）
+      else $('#tcList').innerHTML = '<div class="empty" style="padding:14px">没有可用账号</div>';
     }
-    tcSel.innerHTML = accOptions.map((o) => `<option value="${esc(o.site)}|${esc(o.id)}">${o.label}</option>`).join('') || '<option value="">（没有账号）</option>';
-    const lastTc = localStorage.getItem('wbTcAccount');
-    if (lastTc && accOptions.some((o) => o.site + '|' + o.id === lastTc)) tcSel.value = lastTc;
-    tcSel.onchange = () => { localStorage.setItem('wbTcAccount', tcSel.value); loadTaskCenter(); };
-    $('#tcReload').onclick = loadTaskCenter;
-    if (accOptions.length) loadTaskCenter();
-    else $('#tcList').innerHTML = '<div class="empty" style="padding:14px">没有可用账号</div>';
 
+    if (changed) {
     $('#tkCheckin').onclick = () => runTask('checkin');
     $('#tkGrowth').onclick = () => runTask('growth');
     $('#tkTravel').onclick = () => runTask('travel');
@@ -1106,76 +1137,100 @@ async function loadTasks() {
           checkinTimes: $('#tkCheckinTimes').value,
           growthTimes: $('#tkGrowthTimes').value,
           travelTimes: $('#tkTravelTimes').value,
+          listTimes: $('#tkListTimes').value,
           travelLocationId: Number($('#tkTravelLoc').value) || 4,
           autoComplete: $('#tkAuto').checked,
           maxChatsPerTask: Number($('#tkMaxChats').value) || 5,
         } });
-        toast('任务设置已保存：签到 ' + (r.saved.checkinTimes.join(', ') || '(整点回退)') + ' · 旅行巡逻 ' + (r.saved.travelTimes.join(', ') || '(关)'), 'ok');
+        toast('任务设置已保存：签到 ' + (r.saved.checkinTimes.join(', ') || '(整点回退)') + ' · 列表刷新 ' + (r.saved.listTimes.join(', ') || '(关)'), 'ok');
       } catch (e) { toast('保存失败：' + e.message, 'bad'); }
     };
+    } // end if (changed)
+
+    // 任务中心列表不属于轮询/SSE 刷新路径：只有页面真的重建时才用最近一次数据即时回填（不重新拉上游）
+    if (changed && lastTcData) renderTcList();
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
-/* ---------- T14：任务中心（实时任务列表 + 单任务代打/领奖） ---------- */
-async function loadTaskCenter() {
+/* ---------- T14：任务中心（缓存视图 + 手动刷新 + 单任务代打/领奖） ----------
+ * 0.3.22：列表不再跟随 30s 轮询 / SSE 实时拉取。调用时机只剩：
+ *   进入任务页（读服务端缓存，过期才拉上游）/ 切换账号 / 手动刷新(force) / 代打领奖后(force)。
+ * lastTcData 保存最近一次响应，页面因数据变化重建后用它即时回填，不产生新的上游请求。 */
+let lastTcData = null;
+
+async function loadTaskCenter({ force = false, spinner = false } = {}) {
   const sel = $('#tcAccount');
+  if (!sel) return;
   const v = sel.value || '';
   const [site, accountId] = v.split('|');
   const listEl = $('#tcList'), st = $('#tcStatus');
-  if (!site || !accountId) { listEl.innerHTML = ''; return; }
+  if (!site || !accountId) { if (listEl) listEl.innerHTML = ''; return; }
   localStorage.setItem('wbTcAccount', v);
-  st.innerHTML = '<span class="spin"></span>拉取中…';
+  if (spinner && st) st.innerHTML = '<span class="spin"></span>读取中…';
   try {
-    const r = await api('/task-center?site=' + encodeURIComponent(site) + '&accountId=' + encodeURIComponent(accountId));
-    const tasks = r.tasks || [];
-    if (!tasks.length) { listEl.innerHTML = '<div class="empty" style="padding:14px">上游没有返回任务（可能活动未开放）</div>'; st.textContent = ''; return; }
-    const done = tasks.filter((x) => x.claimed).length;
-    const claimable = tasks.filter((x) => x.claimable).length;
-    st.textContent = `${tasks.length} 个任务 · 达标待领 ${claimable} · 已领 ${done}`;
-    listEl.innerHTML = tasks.map((x) => {
-      const pct = x.target > 0 ? Math.min(100, Math.round(x.current / x.target * 100)) : 0;
-      const state = x.claimed ? '<span class="badge ok">已领奖</span>'
-        : x.claimable ? '<span class="badge warn">可领奖</span>'
-        : x.locked ? '<span class="badge">未解锁</span>'
-        : x.acceptStatus !== 'accepted' ? '<span class="badge">未报名</span>'
-        : '<span class="badge acc">进行中</span>';
-      return `<div style="padding:9px 0;border-bottom:1px solid var(--line)">
-        <div class="row" style="margin-bottom:5px">
-          <b style="font-size:13px">${esc(x.title)}</b>${state}
-          ${x.credit ? `<span class="badge ok">+${x.credit} 积分</span>` : ''}
-          ${x.autoplayable ? `<span class="badge" title="可由桥接代打（模型 ${esc(x.autoplayModel || 'default')}）">🤖 可代打</span>` : (x.autoplayBlockedReason ? `<span class="badge" title="${esc(x.autoplayBlockedReason)}">🤖 ${esc(x.autoplayBlockedReason.slice(0, 18))}</span>` : '')}
-          <span class="spacer"></span>
-          <span class="muted" style="font-size:12px">${x.target ? `${x.current}/${x.target}` : ''}</span>
-          ${x.autoplayable && !x.claimable ? `<button class="btn mini" data-tcplay="${esc(x.code)}" data-need="${x.remain}">代打</button>` : ''}
-          ${x.claimable ? `<button class="btn mini primary" data-tcclaim="${esc(x.code)}">领奖</button>` : ''}
-        </div>
-        ${x.target ? `<div style="height:6px;border-radius:3px;background:var(--chip);overflow:hidden"><i style="display:block;height:100%;width:${pct}%;background:${pct >= 100 ? 'var(--ok)' : 'var(--accent)'}"></i></div>` : ''}
-      </div>`;
-    }).join('');
-    for (const b of listEl.querySelectorAll('[data-tcplay]')) {
-      b.onclick = async () => {
-        b.disabled = true; b.textContent = '代打中…';
-        try {
-          const r2 = await api('/task-center/play', { method: 'POST', body: { site, accountId, code: b.dataset.tcplay } });
-          toast(r2.msg || (r2.ok ? '代打完成' : '代打未执行'), r2.ok ? 'ok' : 'bad');
-        } catch (e) { toast('代打失败：' + e.message, 'bad'); }
-        b.disabled = false; b.textContent = '代打';
-        loadTaskCenter();
-      };
-    }
-    for (const b of listEl.querySelectorAll('[data-tcclaim]')) {
-      b.onclick = async () => {
-        b.disabled = true; b.textContent = '领奖中…';
-        try {
-          const r2 = await api('/task-center/claim', { method: 'POST', body: { site, accountId, code: b.dataset.tcclaim } });
-          toast(r2.msg || '已领奖', r2.ok ? 'ok' : 'bad');
-        } catch (e) { toast('领奖失败：' + e.message, 'bad'); }
-        b.disabled = false; b.textContent = '领奖';
-        loadTaskCenter();
-      };
-    }
+    const r = await api('/task-center?site=' + encodeURIComponent(site) + '&accountId=' + encodeURIComponent(accountId) + (force ? '&refresh=1' : ''));
+    lastTcData = r;
+    renderTcList();
   } catch (e) {
-    st.textContent = '';
-    listEl.innerHTML = `<div class="empty" style="padding:14px">加载失败：${esc(e.message)}</div>`;
+    if (st) st.textContent = '';
+    if (listEl) listEl.innerHTML = `<div class="empty" style="padding:14px">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
+function renderTcList() {
+  const listEl = $('#tcList'), st = $('#tcStatus');
+  if (!listEl || !lastTcData) return;
+  const v = ($('#tcAccount') || {}).value || '';
+  const [site, accountId] = v.split('|');
+  const tasks = lastTcData.tasks || [];
+  if (st) {
+    const at = lastTcData.cachedAt ? new Date(lastTcData.cachedAt).toLocaleTimeString() : '';
+    const times = (lastTcData.listTimes || []).join(' / ');
+    st.textContent = `${tasks.length} 个任务 · 达标待领 ${tasks.filter((x) => x.claimable).length} · 已领 ${tasks.filter((x) => x.claimed).length}`
+      + (at ? ` · 数据 ${at}${lastTcData.fromCache ? '（缓存）' : ''}` : '')
+      + (times ? ` · 每日自动刷新 ${times}` : '');
+  }
+  if (!tasks.length) { listEl.innerHTML = '<div class="empty" style="padding:14px">上游没有返回任务（可能活动未开放）</div>'; return; }
+  listEl.innerHTML = tasks.map((x) => {
+    const pct = x.target > 0 ? Math.min(100, Math.round(x.current / x.target * 100)) : 0;
+    const state = x.claimed ? '<span class="badge ok">已领奖</span>'
+      : x.claimable ? '<span class="badge warn">可领奖</span>'
+      : x.locked ? '<span class="badge">未解锁</span>'
+      : x.acceptStatus !== 'accepted' ? '<span class="badge">未报名</span>'
+      : '<span class="badge acc">进行中</span>';
+    return `<div style="padding:9px 0;border-bottom:1px solid var(--line)">
+      <div class="row" style="margin-bottom:5px">
+        <b style="font-size:13px">${esc(x.title)}</b>${state}
+        ${x.credit ? `<span class="badge ok">+${x.credit} 积分</span>` : ''}
+        ${x.autoplayable ? `<span class="badge" title="可由桥接代打（模型 ${esc(x.autoplayModel || 'default')}）">🤖 可代打</span>` : (x.autoplayBlockedReason ? `<span class="badge" title="${esc(x.autoplayBlockedReason)}">🤖 ${esc(x.autoplayBlockedReason.slice(0, 18))}</span>` : '')}
+        <span class="spacer"></span>
+        <span class="muted" style="font-size:12px">${x.target ? `${x.current}/${x.target}` : ''}</span>
+        ${x.autoplayable && !x.claimable ? `<button class="btn mini" data-tcplay="${esc(x.code)}" data-need="${x.remain}">代打</button>` : ''}
+        ${x.claimable ? `<button class="btn mini primary" data-tcclaim="${esc(x.code)}">领奖</button>` : ''}
+      </div>
+      ${x.target ? `<div style="height:6px;border-radius:3px;background:var(--chip);overflow:hidden"><i style="display:block;height:100%;width:${pct}%;background:${pct >= 100 ? 'var(--ok)' : 'var(--accent)'}"></i></div>` : ''}
+    </div>`;
+  }).join('');
+  for (const b of listEl.querySelectorAll('[data-tcplay]')) {
+    b.onclick = async () => {
+      b.disabled = true; b.textContent = '代打中…';
+      try {
+        const r2 = await api('/task-center/play', { method: 'POST', body: { site, accountId, code: b.dataset.tcplay } });
+        toast(r2.msg || (r2.ok ? '代打完成' : '代打未执行'), r2.ok ? 'ok' : 'bad');
+      } catch (e) { toast('代打失败：' + e.message, 'bad'); }
+      b.disabled = false; b.textContent = '代打';
+      loadTaskCenter({ force: true });
+    };
+  }
+  for (const b of listEl.querySelectorAll('[data-tcclaim]')) {
+    b.onclick = async () => {
+      b.disabled = true; b.textContent = '领奖中…';
+      try {
+        const r2 = await api('/task-center/claim', { method: 'POST', body: { site, accountId, code: b.dataset.tcclaim } });
+        toast(r2.msg || '已领奖', r2.ok ? 'ok' : 'bad');
+      } catch (e) { toast('领奖失败：' + e.message, 'bad'); }
+      b.disabled = false; b.textContent = '领奖';
+      loadTaskCenter({ force: true });
+    };
   }
 }
 
@@ -1187,6 +1242,7 @@ async function runTask(kind) {
     for (const [k, list] of Object.entries(r.results || {})) parts.push(`${k}: 成功${list.filter((x) => x.ok && !x.skipped).length} 跳过${list.filter((x) => x.skipped).length} 失败${list.filter((x) => x.ok === false).length}`);
     toast('执行完成 —— ' + parts.join('；'), 'ok');
     loadTasks();
+    loadTaskCenter({ force: true }); // 手动执行会改变上游任务进度，强制刷一次当前账号的列表
   } catch (e) { toast('执行失败：' + e.message, 'bad'); }
 }
 
@@ -1253,7 +1309,7 @@ async function loadUsage() {
       <td>${e.phase === 'retry' ? '<span class="badge warn">重试收缩</span>' : '<span class="badge acc">预压缩</span>'}</td>
       <td>${e.dropped || 0}</td><td>${e.truncated || 0}</td>
       <td>${(e.before || 0).toLocaleString()} → ${(e.after || 0).toLocaleString()}</td></tr>`).join('');
-    el.innerHTML = `
+    paint(el, `
       <h2>今日 <span class="sub">自 ${esc(u.since || '')} 起累计统计 · 数据在数据目录 usage.json</span></h2>
       <div class="row" style="margin:-4px 0 12px">
         <span class="muted" style="font-size:12px">导出报表（T36）：按模型 / 按账号 / 按日期三个维度分段，直接用 Excel 打开</span>
@@ -1286,7 +1342,7 @@ async function loadUsage() {
       </div>
       ${compBars ? `<div class="card" style="margin-top:12px"><div class="bars">${compBars}</div><div class="muted" style="font-size:11.5px;margin-top:6px;text-align:center">近 14 天压缩次数（来自最近 100 条事件）</div></div>` : ''}
       <div class="card" style="padding:0;margin-top:12px">${compRows ? `<table><thead><tr><th style="width:140px">时间</th><th>模型</th><th style="width:90px">阶段</th><th>丢弃</th><th>截断</th><th>tokens（前 → 后）</th></tr></thead><tbody>${compRows}</tbody></table>` : '<div class="muted" style="padding:18px;text-align:center">还没有压缩记录 —— 会话变长触发「上下文超限」时会自动压缩并记到这里</div>'}</div>
-      <div class="row" style="margin-top:14px"><span class="spacer"></span><button class="btn danger" id="uReset">重置统计</button></div>`;
+      <div class="row" style="margin-top:14px"><span class="spacer"></span><button class="btn danger" id="uReset">重置统计</button></div>`);
     $('#uReset').onclick = async () => {
       if (!confirm('清空全部用量统计？')) return;
       await api('/usage/reset', { method: 'POST' });
@@ -1349,14 +1405,14 @@ async function loadEvents() {
         <td>${esc(e.text)}${e.site ? ` <span class="badge">${esc(e.site)}</span>` : ''}${who}</td>
       </tr>`;
     }).join('');
-    el.innerHTML = `
+    paint(el, `
       <h2>事件时间线 <span class="sub">任务 / 账号 / 策略 / 登录 / 巡检等关键事件 · 落盘 events.json 重启不丢（最多 300 条）</span></h2>
       <div class="row" style="margin-bottom:12px">
         ${EVENT_KINDS.map((k) => `<button class="btn mini ${eventKindFilter === k.id ? 'primary' : ''}" data-evkind="${k.id}">${k.name}</button>`).join('')}
         <span class="spacer"></span>
         <span class="muted" style="font-size:12px">共 ${all.length} 条${eventKindFilter ? ` · 筛选后 ${list.length} 条` : ''}</span>
       </div>
-      <div class="card" style="padding:0">${rows ? `<table><thead><tr><th style="width:150px">时间</th><th style="width:74px">类型</th><th>事件</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted" style="padding:22px;text-align:center">暂无事件</div>'}</div>`;
+      <div class="card" style="padding:0">${rows ? `<table><thead><tr><th style="width:150px">时间</th><th style="width:74px">类型</th><th>事件</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted" style="padding:22px;text-align:center">暂无事件</div>'}</div>`);
     for (const b of el.querySelectorAll('[data-evkind]')) {
       b.onclick = () => { eventKindFilter = b.dataset.evkind; localStorage.setItem('wbEventKind', eventKindFilter); loadEvents(); };
     }
@@ -1432,7 +1488,7 @@ function healthState(a) {
       const inDay = d == null || n == null ? true : (d <= n ? h >= d && h < n : h >= d || h < n);
       return inDay ? (sr.dayModel || '不改道（走默认模型）') : (sr.nightModel || '不改道（走默认模型）');
     })() : null;
-    el.innerHTML = `
+    paint(el, `
       <h2>账号健康 <span class="sub">T17 · 全站点账号的状态、连续失败与最近事件时间线（冷却/耗尽自动进入，恢复自动解除）</span></h2>
       <div class="grid kpis" style="margin-bottom:12px">
         <div class="kpi"><b class="ok">${counts.ok}</b><span>健康</span></div>
@@ -1572,7 +1628,7 @@ function healthState(a) {
           <span class="muted" id="docSummary" style="font-size:12.5px"></span>
         </div>
         <div id="docBox"><div class="muted" style="padding:8px 2px;text-align:center">点「运行诊断」开始体检（只读，不消耗积分）</div></div>
-      </div>`;
+      </div>`);
 
     // ---- T18 行为绑定 ----
     $('#keyAdd').onclick = async () => {
