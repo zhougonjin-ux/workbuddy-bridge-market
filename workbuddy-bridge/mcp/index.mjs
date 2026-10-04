@@ -208,10 +208,10 @@ const TOOLS = [
   },
   {
     name: 'wb_tasks_run',
-    description: '立即执行自动任务：kind=checkin（每日签到）/ growth（成长任务报名+领奖）/ all。',
+    description: '立即执行自动任务：kind=checkin（每日签到+连登管家）/ growth（成长任务报名+领奖）/ travel（猫猫巡逻）/ streak（仅连登管家：补签+兑换+抽奖）/ all。',
     inputSchema: {
       type: 'object',
-      properties: { kind: { type: 'string', enum: ['checkin', 'growth', 'all'], description: '任务类型，默认 all' } },
+      properties: { kind: { type: 'string', enum: ['checkin', 'growth', 'travel', 'streak', 'all'], description: '任务类型，默认 all' } },
     },
     run: async (cfg, args) => {
       const r = await callLocal(cfg, '/admin/tasks/run', { method: 'POST', body: { kind: args?.kind || 'all' } });

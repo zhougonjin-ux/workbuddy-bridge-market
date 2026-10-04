@@ -12,8 +12,9 @@
 // 所以重复触发是幂等的。所有失败只记日志与状态，不影响对话主链路。
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { siteKeys, getConfigDir } from './config.mjs';
-import { listAccounts, updateCreditDetail, markExhausted } from './pool.mjs';
+import { listAccounts, getAccount, setAccountLabel, updateCreditDetail, markExhausted } from './pool.mjs';
 import { queryCredit, openChat, aggregateFrames, upstreamErrorMessage, reportChatActivity } from './upstream.mjs';
 import { billingHeaders } from './headers.mjs';
 import { getAuth, ensureToken } from './auth.mjs';
@@ -42,9 +43,11 @@ function loadState() {
   if (!state.checkin) state.checkin = {}; // uid → { date, ok, msg }
   if (!state.growth) state.growth = {};   // uid → { date, ok, accepted, claimed, msg }
   if (!state.travel) state.travel = {};   // uid → { date, ok, action, msg }
+  if (!state.streak) state.streak = {};   // T50 连登管家：uid → { date, ok, days, redeemed, draws, msg, ... }
   if (!state.history) state.history = []; // 最近 200 条运行记录
   if (!state.checkinDays) state.checkinDays = {}; // T15 签到日历：'YYYY-MM-DD' → [uid,...]
   if (!state.gainedTotal) state.gainedTotal = { credit: 0, checkins: 0, claims: 0, travels: 0 }; // T15 累计白嫖
+  if (state.gainedTotal.streaks == null) state.gainedTotal.streaks = 0; // T50 连登收益次数（旧文件兼容）
   return state;
 }
 
@@ -56,7 +59,7 @@ function saveState() {
   }
 }
 
-const KIND_LABEL = { checkin: '每日签到', growth: '成长任务', travel: '猫猫旅行', 'growth-manual': '任务操作' };
+const KIND_LABEL = { checkin: '每日签到', growth: '成长任务', travel: '猫猫旅行', streak: '连登管家', 'growth-manual': '任务操作' };
 
 function record(kind, uid, entry) {
   const s = loadState();
@@ -78,6 +81,12 @@ function record(kind, uid, entry) {
     } else if (kind === 'travel' && (entry.credit || 0) > 0) {
       s.gainedTotal.credit += entry.credit;
       s.gainedTotal.travels += 1;
+    } else if (kind === 'streak') {
+      // T50 连登管家：领到的积分（礼包/补偿/兑换档位/抽奖奖品）进白嫖统计；
+      // streaks 计数只记「有实际收益」的扫描（补签/兑换/礼包/补偿/抽奖任一命中），
+      // 空跑（三档全 locked、无 chances）不算，否则一天多跑会把计数吹起来。
+      if ((entry.creditGained || 0) > 0) s.gainedTotal.credit += entry.creditGained;
+      if (entry.actions > 0) s.gainedTotal.streaks += 1;
     }
     // 签到日历最多留 120 天（约 4 个月，一屏放得下）
     const days = Object.keys(s.checkinDays).sort();
@@ -482,10 +491,17 @@ async function refreshAfterGain(cfg, site, accountId) {
 // 巡逻状态机幂等：每次巡逻最多一个动作（领奖 / 派出 / 跳过），所以一天可以巡逻多次。
 // 无猫时的领养链路（上报对话 → agreement → buddy/first）依赖客户端行为，这里只提示不代养。
 
-async function growthJSON(cfg, site, auth, siteCfg, method, path, body) {
+async function growthJSON(cfg, site, auth, siteCfg, method, path, body, what = '猫猫旅行') {
   const headers = billingHeaders(siteCfg, auth);
-  const { json } = await callJSON(cfg, siteCfg.apiBase + path, { method, body, headers, what: '猫猫旅行' });
-  return unwrap(json, '猫猫旅行');
+  const { json } = await callJSON(cfg, siteCfg.apiBase + path, { method, body, headers, what });
+  return unwrap(json, what);
+}
+
+/** billing 域请求（T51 礼包/补偿等 www.codebuddy.cn 端点；与 growth 域同款鉴权头）。 */
+async function billingJSON(cfg, site, auth, siteCfg, path, body, what) {
+  const headers = billingHeaders(siteCfg, auth);
+  const { json } = await callJSON(cfg, siteCfg.billingBase + path, { method: 'POST', body, headers, what });
+  return unwrap(json, what);
 }
 
 export async function travelScanAccount(cfg, site, accountId) {
@@ -520,14 +536,282 @@ export async function travelScanAccount(cfg, site, accountId) {
   return { ok: true, action: 'unknown', msg: `未知旅行状态：${state || '(空)'}` };
 }
 
+/* ---------------- 连登管家（T50+T51） ----------------
+ *
+ * 成长中心连登体系（协议同 .ref/workbuddy2api-panel 的 streak.go / blackcat.go，
+ * 端点组 2026-10-05 已用真实账号只读实测 200）：
+ *   GET  {apiBase}/activity/growth/streak        → 连登天数/三档状态/补签卡
+ *   POST {apiBase}/activity/growth/redeem        {tier,client_token}  未解锁 403「连续登录天数不足」
+ *   GET  {apiBase}/activity/growth/lottery/summary → {chances, module.enabled}
+ *   POST {apiBase}/activity/growth/lottery/draw  {client_token}      每次耗 1 chance
+ *   GET  {apiBase}/activity/growth/heatmap       → cells[] {date,score,has_new_buddy}
+ *   POST {apiBase}/activity/growth/makeup-cards/use {target_date}   补签保连登
+ *   POST {billingBase}/billing/meter/claim-gift         {} 新手礼包（每号一次）
+ *   POST {billingBase}/billing/meter/claim-compensation {} 活动补偿（有则领）
+ *
+ * client_token 是前端 randomUUID 同款幂等令牌。流程照抄参考实现 scheduler/streak.go：
+ * 补签保连登 → 礼包/补偿 → 逐档兑换（locked/claimed 跳过）→ 按 chances 抽完。
+ * 全程幂等，一天可多跑（挂在签到扫描同轮，也可手动触发）。
+ *
+ * ⚠️ 验收纪律（0.3.20/0.3.21 血泪）：不能只看请求 200——兑换要看 redemption_status
+ * 从可兑变 claimed、抽奖要看 chances 递减、补签要看 heatmap/makeup 变化。
+ */
+
+/** 幂等令牌（前端 randomUUID 同款语义）。 */
+function clientToken() {
+  return crypto.randomUUID();
+}
+
+/** 昨天 'YYYY-MM-DD'（本地时区；补签口径与 heatmap cell date 一致）。 */
+function yesterdayKey(d = new Date()) {
+  const y = new Date(d);
+  y.setDate(y.getDate() - 1);
+  return todayKey(y);
+}
+
+/**
+ * 从 streak 完整响应里挑出可兑换的档位（纯函数，单测用）。
+ * status ∈ locked/可兑/claimed；locked 与 claimed 跳过，其余（可兑/未知值）尝试兑换——
+ * 未知值尝试是刻意的：上游新增状态时宁可多发一次幂等请求（403 静默），也不漏兑。
+ */
+export function redeemableTiers(full) {
+  const rs = full?.redemption_status || {};
+  const statusOf = {
+    '7d': rs.tier_7d_status,
+    '14d': rs.tier_14d_status,
+    '28d': rs.tier_28d_status,
+  };
+  const tiers = Array.isArray(rs.tiers) ? rs.tiers : [];
+  return tiers.filter((t) => {
+    const st = statusOf[t?.tier];
+    return st !== 'locked' && st !== 'claimed';
+  });
+}
+
+/** 官方热力图 cells 的宽松解析（纯函数，单测用）：date 截前 10 位，score 归一为数字。 */
+export function parseHeatmapCells(data) {
+  const cells = Array.isArray(data?.cells) ? data.cells : [];
+  return cells
+    .map((c) => ({ date: String(c?.date || '').slice(0, 10), score: Number(c?.score) || 0, hasNewBuddy: Boolean(c?.has_new_buddy) }))
+    .filter((c) => /^\d{4}-\d{2}-\d{2}$/.test(c.date));
+}
+
+/**
+ * T52：官方打卡热力图（权威全历史，从账号注册日起算；本地 checkinDays 只从插件启用日起）。
+ * 6h 内存缓存（同 taskCenterView 模式）；补签成功后失效。
+ */
+const HEATMAP_TTL_MS = 6 * 3600_000;
+const hmCache = new Map(); // 'site|accountId' → { at, cells }
+
+export async function heatmapView(cfg, site, accountId, { force = false } = {}) {
+  const key = `${site}|${accountId}`;
+  const hit = hmCache.get(key);
+  if (!force && hit && Date.now() - hit.at < HEATMAP_TTL_MS) {
+    return { cells: hit.cells, cachedAt: hit.at, fromCache: true };
+  }
+  await ensureToken(cfg, site, { accountId });
+  const auth = getAuth(site);
+  const data = await growthJSON(cfg, site, auth, cfg.sites[site], 'GET', '/activity/growth/heatmap', null, '官方热力图');
+  const cells = parseHeatmapCells(data);
+  hmCache.set(key, { at: Date.now(), cells });
+  return { cells, cachedAt: Date.now(), fromCache: false };
+}
+
+/**
+ * T50+T51 连登管家单账号扫描。返回 { ok, actions, makeupUsed, makeupDate, giftCredit,
+ * compCredit, redeemed, draws, creditGained, prizes, notes, days, nextTier, ... }。
+ * 礼包/补偿/兑换/抽奖失败都只记 notes 不中断——一次扫描里能拿的尽量拿。
+ */
+export async function streakScanAccount(cfg, site, accountId) {
+  await ensureToken(cfg, site, { accountId });
+  const auth = getAuth(site);
+  const siteCfg = cfg.sites[site];
+  const notes = [];
+  let creditGained = 0;
+  let actions = 0;
+
+  // 0. 补签保连登：昨日漏签且有补签卡则补上（连登一断要重攒 7 天）。
+  let makeupUsed = 0;
+  let makeupDate = null;
+  try {
+    const hm = await growthJSON(cfg, site, auth, siteCfg, 'GET', '/activity/growth/heatmap', null, '连登管家');
+    const cells = parseHeatmapCells(hm);
+    const yKey = yesterdayKey();
+    const missed = cells.some((c) => c.date === yKey && c.score === 0);
+    if (missed) {
+      const full0 = await growthJSON(cfg, site, auth, siteCfg, 'GET', '/activity/growth/streak', null, '连登管家');
+      if ((Number(full0?.makeup_cards?.balance) || 0) > 0) {
+        try {
+          await growthJSON(cfg, site, auth, siteCfg, 'POST', '/activity/growth/makeup-cards/use', { target_date: yKey }, '连登管家');
+          makeupUsed = 1;
+          makeupDate = yKey;
+          actions += 1;
+          notes.push(`已用补签卡补签 ${yKey}（保连登）`);
+          hmCache.delete(`${site}|${accountId}`); // 补签改变了热力图，缓存已过期
+        } catch (e) {
+          notes.push(`补签 ${yKey} 失败：${String(e.message || e).slice(0, 80)}`);
+        }
+      } else {
+        notes.push(`昨日（${yKey}）漏签且补签卡为 0，连登将中断`);
+      }
+    }
+  } catch (e) {
+    notes.push(`连登状态查询失败：${String(e.message || e).slice(0, 80)}`);
+  }
+
+  // 0.5 T51 新手礼包/活动补偿（billing 域，每号一次；无则业务错误静默跳过）。
+  let giftCredit = 0;
+  let compCredit = 0;
+  try {
+    const d = await billingJSON(cfg, site, auth, siteCfg, '/billing/meter/claim-gift', {}, '新手礼包');
+    giftCredit = Number(d?.credit) || 0;
+    creditGained += giftCredit;
+    actions += 1;
+    notifyTask(cfg, '🎊 新手礼包', `${site}：领到 ${giftCredit} 积分`, accountId);
+  } catch { /* 已领过/活动未开放——预期路径，静默 */ }
+  try {
+    const d = await billingJSON(cfg, site, auth, siteCfg, '/billing/meter/claim-compensation', {}, '活动补偿');
+    compCredit = Number(d?.credit) || 0;
+    creditGained += compCredit;
+    actions += 1;
+    notifyTask(cfg, '🎊 活动补偿', `${site}：领到 ${compCredit} 积分`, accountId);
+  } catch { /* 没有补偿——预期路径，静默 */ }
+
+  // 1. 拉连登完整状态（上面补签时若已查过一次也无妨，再查一次拿最新档位状态）。
+  let full = null;
+  try {
+    full = await growthJSON(cfg, site, auth, siteCfg, 'GET', '/activity/growth/streak', null, '连登管家');
+  } catch (e) {
+    notes.push(`连登档位查询失败：${String(e.message || e).slice(0, 80)}`);
+  }
+
+  // 2. 逐档兑换（status 非 locked/claimed 就 redeem；未解锁 403 属预期，静默）。
+  const redeemed = [];
+  if (full) {
+    for (const tier of redeemableTiers(full)) {
+      try {
+        await growthJSON(cfg, site, auth, siteCfg, 'POST', '/activity/growth/redeem',
+          { tier: tier.tier, client_token: clientToken() }, '连登兑换');
+        redeemed.push(tier.tier);
+        creditGained += Number(tier.credit) || 0;
+        actions += 1;
+      } catch (e) {
+        const msg = String(e.message || e);
+        if (!/403|连续登录/.test(msg)) notes.push(`兑换 ${tier.tier} 档失败：${msg.slice(0, 80)}`);
+      }
+    }
+    if (redeemed.length) {
+      notifyTask(cfg, '★ 连登兑换', `${site}：${redeemed.join('/')} 档已兑换（+${creditGained - giftCredit - compCredit} 积分）`, accountId);
+    }
+  }
+
+  // 3. 抽奖：按当前 chances 全抽完（兑换刚发的次数已在服务端累加）。上限 20 防异常值。
+  let chances = 0;
+  let draws = 0;
+  const prizes = [];
+  try {
+    const ls = await growthJSON(cfg, site, auth, siteCfg, 'GET', '/activity/growth/lottery/summary', null, '抽奖次数');
+    chances = Number(ls?.chances) || 0;
+    if (ls?.module && ls.module.enabled === false) chances = 0; // 活动下线时不打 draw
+    for (let i = 0; i < Math.min(chances, 20); i++) {
+      try {
+        const p = await growthJSON(cfg, site, auth, siteCfg, 'POST', '/activity/growth/lottery/draw',
+          { client_token: clientToken() }, '抽奖');
+        draws += 1;
+        actions += 1;
+        // prize 形状由活动期决定，宽松取 credit；原始载荷裁剪进 prizes 供记录/展示
+        const pc = Number(p?.credit ?? p?.prize?.credit) || 0;
+        creditGained += pc;
+        prizes.push(JSON.stringify(p).slice(0, 160));
+      } catch (e) {
+        notes.push(`第 ${i + 1} 抽失败：${String(e.message || e).slice(0, 80)}`);
+        break;
+      }
+    }
+  } catch (e) {
+    notes.push(`抽奖次数查询失败：${String(e.message || e).slice(0, 80)}`);
+  }
+
+  // 4. 给 UI 的状态快照（兑换/抽奖后的最新值；consoles 从 tasks-state.streak 读）。
+  const s = full?.streak || {};
+  const mc = full?.makeup_cards || {};
+  const rs = full?.redemption_status || {};
+  return {
+    ok: true,
+    actions,
+    makeupUsed,
+    makeupDate,
+    giftCredit,
+    compCredit,
+    redeemed,
+    draws,
+    chances,
+    chancesLeft: Math.max(0, chances - draws),
+    prizes,
+    creditGained,
+    notes,
+    days: Number(s.days) || 0,
+    nextTier: String(s.next_tier || ''),
+    nextTierRemaining: Number(s.next_tier_remaining) || 0,
+    makeupBalance: Number(mc.balance) || 0,
+    makeupMax: Number(mc.max) || 0,
+    tier7d: String(rs.tier_7d_status || ''),
+    tier14d: String(rs.tier_14d_status || ''),
+    tier28d: String(rs.tier_28d_status || ''),
+  };
+}
+
+/**
+ * T53 账号昵称同步（只在用户手动触发时调用，绝不进定时轮询）。
+ *
+ * GET {billingBase}/console/account（Bearer + x-client-platform: web + Origin/Referer
+ * www.workbuddy.cn，profile.go 同款，实测 200）。
+ *
+ * ⚠️ 隐私边界（强制）：响应含 phoneNumber/wechatOpenId 等敏感字段——只解析 uid 与
+ * nickname 两个字段，其余不解析、不落日志、不透传。uid 与池内账号不一致报错防串号。
+ * 成功用官方昵称更新显示名并落池。
+ */
+export function parseAccountProfile(json) {
+  // 响应可能带 {code,data} 信封（Go 参考的 doJSON 就是剥信封后解析）；两种形态都兼容。
+  // 唯一的解析出口：敏感字段在这里就被丢弃，调用方拿不到。
+  const d = json && typeof json === 'object' && json.data && typeof json.data === 'object' ? json.data : json;
+  return { uid: String(d?.uid || ''), nickname: String(d?.nickname || '') };
+}
+
+export async function syncAccountNickname(cfg, site, accountId) {
+  const acct = getAccount(site, accountId);
+  if (!acct) throw Object.assign(new Error(`账号不存在：${accountId}`), { status: 404 });
+  await ensureToken(cfg, site, { accountId });
+  const auth = getAuth(site);
+  const siteCfg = cfg.sites[site];
+  const headers = billingHeaders(siteCfg, auth);
+  headers['x-client-platform'] = 'web';
+  headers.Origin = 'https://www.workbuddy.cn';
+  headers.Referer = 'https://www.workbuddy.cn/profile/account-settings';
+  const { json } = await callJSON(cfg, siteCfg.billingBase + '/console/account', {
+    headers,
+    what: '账号资料',
+  });
+  const { uid, nickname } = parseAccountProfile(json);
+  if (!nickname) throw new Error('上游没有返回昵称');
+  if (uid && acct.uid && uid !== acct.uid) {
+    throw new Error(`uid 不一致（上游 ${uid.slice(0, 6)}… ≠ 池内 ${String(acct.uid).slice(0, 6)}…），已中止防串号`);
+  }
+  const old = acct.label || '';
+  if (old === nickname) return { ok: true, nickname, changed: false, msg: `显示名已是「${nickname}」，无需更新` };
+  setAccountLabel(site, accountId, nickname);
+  recordEvent('account', `账号「${old || accountId}」显示名已同步为官方昵称「${nickname}」`, { site, accountId: uid || accountId });
+  return { ok: true, nickname, changed: true, msg: `显示名已更新为「${nickname}」` };
+}
+
 /* ---------------- 批量执行 ---------------- */
 
-/** 对一个站点的所有账号跑一类任务。travel 是巡逻（幂等，一天可多次），其余每天一次。 */
+/** 对一个站点的所有账号跑一类任务。travel/streak 是幂等扫描（一天可多次），checkin/growth 每天一次。 */
 async function runForSite(cfg, site, kind) {
   const out = [];
   for (const a of listAccounts(site)) {
     if (a.enabled === false || !a.accessToken) continue;
-    if (kind !== 'travel' && doneToday(kind, a.uid || a.id)) {
+    if (kind !== 'travel' && kind !== 'streak' && doneToday(kind, a.uid || a.id)) {
       out.push({ id: a.id, label: a.label || a.id, skipped: true, ok: true });
       continue;
     }
@@ -545,6 +829,21 @@ async function runForSite(cfg, site, kind) {
         if (result.action === 'claimed') {
           notifyTask(cfg, '猫猫归来 🐾', `${a.label || a.id}：${result.msg}`, a.id);
         }
+      } else if (kind === 'streak') {
+        // T50 连登管家：补签 → 礼包/补偿 → 兑换 → 抽奖，全程幂等（dayStreak 可一天多跑）
+        result = await withRetryOnce(() => streakScanAccount(cfg, site, a.id));
+        // 主摘要 + 连登天数快照；notes（补签失败/兑换异常等）拼在后面
+        const bits = [
+          result.makeupUsed ? `补签 ${result.makeupDate}` : null,
+          result.giftCredit ? `新手礼包 +${result.giftCredit}` : null,
+          result.compCredit ? `补偿 +${result.compCredit}` : null,
+          (result.redeemed || []).length ? `兑换 ${(result.redeemed).join('/')}` : null,
+          result.draws ? `抽奖 ${result.draws} 次` : null,
+        ].filter(Boolean);
+        const msg = `连登 ${result.days ?? 0} 天${bits.length ? '：' + bits.join(' · ') : '，无待处理项（档位未解锁/无抽奖次数）'}`
+          + (result.notes?.length ? '。' + result.notes.join('；') : '');
+        record('streak', uid, { ok: true, site, msg, ...result });
+        if ((result.creditGained || 0) > 0) await refreshAfterGain(cfg, site, a.id);
       } else {
         result = await withRetryOnce(() => growthScanAccount(cfg, site, a.id));
         const { tasks, ...rest } = result;
@@ -563,14 +862,21 @@ async function runForSite(cfg, site, kind) {
   return out;
 }
 
-/** 手动/调度共用的任务入口。kind: 'checkin' | 'growth' | 'travel' | 'all' */
+/** 手动/调度共用的任务入口。kind: 'checkin' | 'growth' | 'travel' | 'streak' | 'all' */
 export async function runTasks(cfg, kind = 'all', site = null) {
   const sites = site ? [site] : siteKeys(cfg);
   const result = {};
+  const wantStreak = kind === 'streak' || kind === 'all';
+  const wantCheckin = kind === 'checkin' || kind === 'all';
   for (const s of sites) {
     if (!cfg.sites[s]) continue;
-    if ((kind === 'checkin' || kind === 'all') && cfg.tasks?.checkin !== false) {
+    if (wantCheckin && cfg.tasks?.checkin !== false) {
       result[`checkin:${s}`] = await runForSite(cfg, s, 'checkin');
+    }
+    // T50 连登管家搭签到同一轮（签到可能补上连登链），也支持 kind='streak' 单独触发。
+    // 一天内跟每次 checkin/all 触发重跑一遍（幂等），不设独立时点配置。
+    if ((wantStreak || (kind === 'checkin' && cfg.tasks?.checkin !== false)) && cfg.tasks?.enabled !== false) {
+      result[`streak:${s}`] = await runForSite(cfg, s, 'streak');
     }
     if ((kind === 'growth' || kind === 'all') && cfg.tasks?.growth !== false) {
       result[`growth:${s}`] = await runForSite(cfg, s, 'growth');
@@ -590,10 +896,11 @@ export function taskStatus() {
     checkin: s.checkin,
     growth: s.growth,
     travel: s.travel,
+    streak: s.streak, // T50 连登管家（含给 UI 用的 days/makeup/chances 快照）
     history: s.history.slice(0, 30),
     // T15：签到日历（'YYYY-MM-DD' → 当天签到的 uid 数组）与累计白嫖统计
     checkinDays: s.checkinDays || {},
-    gainedTotal: s.gainedTotal || { credit: 0, checkins: 0, claims: 0, travels: 0 },
+    gainedTotal: s.gainedTotal || { credit: 0, checkins: 0, claims: 0, travels: 0, streaks: 0 },
     stateFile: statePath(),
   };
 }
@@ -790,7 +1097,7 @@ export function startTaskLoop(cfg) {
     }
   }, 60_000);
   timers.tasks.unref?.();
-  log('自动任务调度已启动（签到/成长/猫猫旅行巡逻，支持 HH:MM 精确时点）');
+  log('自动任务调度已启动（签到/连登/成长/猫猫旅行巡逻，支持 HH:MM 精确时点）');
 }
 
 async function runAndLog(cfg, kind) {

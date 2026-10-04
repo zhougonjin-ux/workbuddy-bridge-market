@@ -535,7 +535,7 @@ const server = http.createServer(async (req, res) => {
     }
     if (pathname === '/admin/tasks/run' && req.method === 'POST') {
       const body = await readJsonBody(req);
-      const kind = ['checkin', 'growth', 'all'].includes(body.kind) ? body.kind : 'all';
+      const kind = ['checkin', 'growth', 'travel', 'streak', 'all'].includes(body.kind) ? body.kind : 'all';
       const site = body.site ? String(body.site) : null;
       const results = await runTasks(cfg, kind, site);
       return sendJson(res, 200, { ok: true, kind, results });

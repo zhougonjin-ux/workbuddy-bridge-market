@@ -102,6 +102,30 @@ export const PROTOCOL_SIGNATURES = [
       return { ok: true, detail: `到期时间可读（${JSON.stringify(String(v).slice(0, 24))}）` };
     },
   },
+  {
+    key: 'v3config.cli.models',
+    probe: 'v3config',
+    path: '/v3/config',
+    what: 'v3/config 的 cli agent 模型清单（与企业端点并行的目录来源，迁移先兆）',
+    sample: (j) => {
+      const agents = Array.isArray(j?.data?.agents) ? j.data.agents : null;
+      if (!agents) return null;
+      const cli = agents.find((a) => a?.name === 'cli') || null;
+      if (!cli) return null;
+      return { models: cli.models, want: j?.__wantModel };
+    },
+    check: (v) => {
+      // sample 返回 null 有两种可能（data.agents 消失 / cli 条目消失），都算漂移
+      if (v === null || v === undefined) return { ok: false, detail: 'v3/config 里找不到 data.agents 的 cli 条目——目录结构变了或端点已废弃' };
+      if (!Array.isArray(v.models) || !v.models.length) {
+        return { ok: false, detail: `cli.models 不再是非空数组（实际 ${describeType(v.models)}）` };
+      }
+      if (v.want && !v.models.includes(v.want)) {
+        return { ok: false, detail: `cli 目录（${v.models.length} 个模型）已不含当前默认模型 ${v.want}——defaultModel 可能失效` };
+      }
+      return { ok: true, detail: `cli models 仍是数组（${v.models.length} 个）${v.want && v.models.includes(v.want) ? '，含默认模型 ' + v.want : ''}` };
+    },
+  },
 ];
 
 function describeType(v) {
@@ -178,6 +202,13 @@ async function probeSite(cfg, site) {
       responses.creditError = e.message;
     }
   }
+  // T54：v3/config 探针（独立目录家族）。探测失败不算漂移（端点可能只是该站不可用），
+  // 留空由签名判成「取不到样」；doctor 的登录态检查负责报网络问题。
+  try {
+    responses.v3config = await rawV3Config(cfg, site);
+  } catch (e) {
+    responses.v3configError = e.message;
+  }
   return { ok: true, responses };
 }
 
@@ -191,6 +222,12 @@ async function rawModels(cfg, site) {
 async function rawCredit(cfg, site) {
   const { fetchCreditRaw } = await import('./upstream.mjs');
   return fetchCreditRaw(cfg, site);
+}
+
+/** 原始 /v3/config 响应（T54）。 */
+async function rawV3Config(cfg, site) {
+  const { fetchV3ConfigRaw } = await import('./upstream.mjs');
+  return fetchV3ConfigRaw(cfg, site);
 }
 
 /**
@@ -221,6 +258,7 @@ export async function runProtocolCheck(cfg, { force = false } = {}) {
           checkedAt: new Date().toISOString(),
           skipped: false,
           ...(r.responses.creditError ? { creditError: r.responses.creditError } : {}),
+          ...(r.responses.v3configError ? { v3configError: r.responses.v3configError } : {}),
           results: ev.results,
           drifted: ev.drifted,
           total: ev.total,

@@ -722,12 +722,55 @@ export async function fetchModelsRaw(cfg, site) {
   }
 }
 
-/** 拉取站点可用模型清单（含积分倍率）。 */
+/**
+ * T54：/v3/config 端点的**原始** JSON 响应（不做结构解析）。
+ * 与企业端点家族（/console/enterprises/personal/models）并行的模型目录来源，
+ * 上游若把目录迁移过去，企业端点签名不会告警——这条探针就是盯它的。
+ * 只读端点，不消耗积分。返回体额外带 __wantModel（当前默认模型，签名用它检查
+ * cli 目录是否仍包含用户正在用的模型）；该字段以 _ 开头，与上游字段天然不冲突。
+ */
+export async function fetchV3ConfigRaw(cfg, site) {
+  const siteCfg = cfg.sites[site];
+  await ensureToken(cfg, site);
+  const auth = getAuth(site);
+  const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
+  let res, text;
+  try {
+    const r = await fetchWithTimeout(siteCfg.apiBase + '/v3/config', {
+      timeoutMs,
+      headers: { ...chatHeaders(siteCfg, auth), Accept: 'application/json' },
+    });
+    res = r.res;
+    text = await r.text();
+  } catch (e) {
+    throw new UpstreamError(`[${site}] v3/config 请求失败（${describeFetchFailure(e, timeoutMs)}）`, { status: 504, transport: true, site });
+  }
+  try {
+    const json = JSON.parse(text);
+    json.__wantModel = cfg.defaultModel || '';
+    return json;
+  } catch {
+    throw new UpstreamError(`[${site}] v3/config 返回无法解析（HTTP ${res.status}）`, { status: 502, site });
+  }
+}
+
+/** 拉取站点可用模型清单（含积分倍率）。
+ *  T54：企业目录为主，/v3/config 补缺——实测（2026-10-05）CN 域 hy4-preview-f /
+ *  minimax-m2.7 只从 v3 下发。v3 探测失败/结构异常不拖累主目录（静默降级）。 */
 export async function fetchModels(cfg, site) {
   const siteCfg = cfg.sites[site];
   await ensureToken(cfg, site);
   const auth = getAuth(site);
   const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
+  // v3/config 只做补缺：非 200 / 解析失败 / agents 空都当「没有增量」处理。
+  let v3 = null;
+  try {
+    const r = await fetchWithTimeout(siteCfg.apiBase + '/v3/config', {
+      timeoutMs,
+      headers: { ...chatHeaders(siteCfg, auth), Accept: 'application/json' },
+    });
+    if (r.res.status === 200) v3 = JSON.parse(await r.text());
+  } catch { /* 降级为企业目录 */ }
   let res, text;
   try {
     const r = await fetchWithTimeout(siteCfg.apiBase + '/console/enterprises/personal/models', {
@@ -751,7 +794,7 @@ export async function fetchModels(cfg, site) {
   const agents = json.data?.agents || [];
   const cli = agents.find((a) => a.name === 'cli');
   const cliIds = cli?.models?.length ? new Set(cli.models) : null;
-  return models
+  const merged = models
     .filter((m) => !m.disabled && (!cliIds || cliIds.has(m.id)))
     .map((m) => ({
       id: m.id,
@@ -763,6 +806,30 @@ export async function fetchModels(cfg, site) {
       supportsToolCall: Boolean(m.supportsToolCall),
       supportsReasoning: Boolean(m.supportsReasoning),
     }));
+  // T54 并集补缺：v3/cli 列出而企业目录没有的 id，从 v3/data.models 取同构详情补进目录。
+  // 只在有完整详情时补（裸 id 会变成不可调用的占位条目，宁缺毋滥）。
+  const v3Cli = (v3?.data?.agents || []).find((a) => a?.name === 'cli');
+  if (v3Cli?.models?.length) {
+    const known = new Set(merged.map((m) => m.id));
+    const v3Detail = new Map((Array.isArray(v3?.data?.models) ? v3.data.models : []).map((m) => [m?.id, m]));
+    for (const id of v3Cli.models) {
+      if (known.has(id)) continue;
+      const d = v3Detail.get(id);
+      if (!d || d.disabled) continue;
+      merged.push({
+        id: d.id,
+        name: d.name || d.id,
+        credits: d.credits || null,
+        contextWindow: d.maxInputTokens || null,
+        maxTokens: d.maxOutputTokens || null,
+        supportsImages: Boolean(d.supportsImages),
+        supportsToolCall: Boolean(d.supportsToolCall),
+        supportsReasoning: Boolean(d.supportsReasoning),
+        v3only: true, // 仅供展示层标注来源（企业端点看不到该模型）
+      });
+    }
+  }
+  return merged;
 }
 
 /**

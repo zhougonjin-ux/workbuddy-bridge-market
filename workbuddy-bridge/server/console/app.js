@@ -87,7 +87,26 @@ function toast(msg, cls = '') {
   $('#toast').appendChild(el);
   setTimeout(() => el.remove(), 4000);
 }
-const copy = (text, tip) => navigator.clipboard?.writeText(text).then(() => toast((tip || '已复制') + '：' + text, 'ok')).catch(() => {});
+/* 复制到剪贴板：clipboard 失败（IAB 后台 tab 的 Document not focused）时兜底
+ * textarea+execCommand，成败都 toast——失败静默吞掉就是用户眼中的「点了没反应」。
+ * 带 tip 时只显示 tip：复制对象可能是完整 apiKey / 整段配置，打到 toast 里既难看又可能被截屏泄漏。 */
+const copy = (text, tip) => {
+  const ok = () => toast(tip || '已复制：' + String(text).slice(0, 40), 'ok');
+  const fallback = () => {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.cssText = 'position:fixed;opacity:0';
+      document.body.appendChild(ta);
+      ta.select();
+      const done = document.execCommand('copy');
+      ta.remove();
+      done ? ok() : toast('复制失败：请手动选中复制', 'bad');
+    } catch { toast('复制失败：请手动选中复制', 'bad'); }
+  };
+  if (!navigator.clipboard?.writeText) { fallback(); return; }
+  navigator.clipboard.writeText(text).then(ok).catch(fallback);
+};
 
 /* HUD 壳层（shell.js/fx.js）复用的钩子：api 函数、toast、当前视图。
  * 只暴露引用，不改任何原有逻辑。 */
@@ -259,7 +278,7 @@ async function loadTcSummary() {
     const list = [];
     for (const s of b.sites || []) for (const a of s.accounts || []) {
       if (a.enabled === false) continue;
-      list.push({ site: s.site, id: a.id, label: a.label || a.nickname || a.id, claimable: 0, playable: 0, total: 0, at: null, error: null });
+      list.push({ site: s.site, id: a.id, uid: a.uid || null, label: a.label || a.nickname || a.id, claimable: 0, playable: 0, total: 0, at: null, error: null });
     }
     tcSummary = { at: Date.now(), rows: list };
     await Promise.all(list.map(async (x) => {
@@ -282,17 +301,26 @@ async function loadTcSummary() {
 function renderTcOverview() {
   const box = $('#tcOverview');
   if (!box) return;
+  // T50：连登快照按 uid 索引（tasks-state.streak 的键是 uid）
+  const streakByUid = (lastTasksData && lastTasksData.streak) || {};
   let rows = '';
   if (!tcSummary || tcSummary.loading) rows = '<div class="muted" style="padding:10px 2px"><span class="spin"></span>正在读取各账号任务进度…</div>';
   else if (tcSummary.error) rows = `<div class="bad" style="font-size:12.5px;padding:8px 2px">读取失败：${esc(tcSummary.error)}</div>`;
   else if (!tcSummary.rows.length) rows = '<div class="muted" style="padding:10px 2px">还没有启用中的账号</div>';
-  else rows = tcSummary.rows.map((r) => `<div class="acctline" data-tcrow="${esc(r.site)}|${esc(r.id)}" style="cursor:pointer" title="点行在下方展开该账号的任务详情">
+  else rows = tcSummary.rows.map((r) => {
+    const st = streakByUid[r.uid];
+    const stBit = st
+      ? `<span class="tag ${st.tier7d === 'claimed' || st.tier14d === 'claimed' || st.tier28d === 'claimed' ? 'ok' : ''}" title="连登管家快照（${esc(st.date || '')}）：连登 ${st.days ?? '?'} 天 · 下一档 ${esc(st.nextTier || '—')} 差 ${st.nextTierRemaining ?? '?'} 天 · 补签卡 ${st.makeupBalance ?? '?'}/${st.makeupMax ?? '?'} · 抽奖 ${st.chancesLeft ?? 0} 次">🔗 ${st.days ?? '?'}天 · 补签 ${st.makeupBalance ?? '?'}/${st.makeupMax ?? '?'} · 抽奖 ${st.chancesLeft ?? 0}</span>`
+      : '<span class="tag" title="还没有连登扫描记录，点上方「立即签到」或「连登巡检」后出现">🔗 未巡</span>';
+    return `<div class="acctline" data-tcrow="${esc(r.site)}|${esc(r.id)}" style="cursor:pointer" title="点行在下方展开该账号的任务详情">
       <b style="font-size:13px;min-width:104px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.label)}</b>
       <span class="badge">${esc(r.site)}</span>
       ${r.error ? '<span class="badge bad">读取失败</span>'
         : `<span style="font-size:12.5px">任务 <b>${r.total ?? 0}</b> · 待领 <b class="${r.claimable ? 'warn' : ''}">${r.claimable ?? 0}</b> · 可代打 <b>${r.playable ?? 0}</b></span>
+           ${stBit}
            <span class="muted" style="font-size:11px;margin-left:auto">数据 ${r.at ? esc(new Date(r.at).toLocaleTimeString()) : '—'} ↙</span>`}
-    </div>`).join('');
+    </div>`;
+  }).join('');
   const changed = paint(box, rows);
   if (changed) {
     for (const line of box.querySelectorAll('[data-tcrow]')) {
@@ -518,8 +546,16 @@ async function loadOverview() {
       const ok = Object.entries(map || {}).filter(([uid, e]) => e.ok && enabled.some((x) => (x.a.uid || x.a.id) === uid)).length;
       return { ok, total: enabled.length || 1 };
     };
-    const ck = doneOf(tasks.checkin), gr = doneOf(tasks.growth), tv = doneOf(tasks.travel);
-    const taskDone = [ck, gr, tv].filter((x) => x.ok >= x.total && x.total > 0).length;
+    const ck = doneOf(tasks.checkin), gr = doneOf(tasks.growth), tv = doneOf(tasks.travel), st = doneOf(tasks.streak);
+    const taskDone = [ck, gr, tv, st].filter((x) => x.ok >= x.total && x.total > 0).length;
+    // T50 连登摘要：取启用账号里有连登记录的（可能多账号，取天数最多的一条展示，title 带全部）
+    const streakEntries = Object.entries(tasks.streak || {})
+      .filter(([uid, e]) => e.ok && enabled.some((x) => (x.a.uid || x.a.id) === uid))
+      .sort((a, b) => (b[1].days || 0) - (a[1].days || 0));
+    const stTop = streakEntries[0] ? streakEntries[0][1] : null;
+    const streakTip = streakEntries.length
+      ? streakEntries.map(([uid, e]) => `${accNames[uid] || uid.slice(0, 8)}：连登 ${e.days ?? '?'} 天 · 下一档${e.nextTier || '—'}差 ${e.nextTierRemaining ?? '?'} 天 · 补签卡 ${e.makeupBalance ?? '?'}/${e.makeupMax ?? '?'} · 抽奖 ${e.chancesLeft ?? e.chances ?? 0} 次 · 快照 ${e.date || ''}`).join('\n')
+      : '还没有连登扫描记录（签到/连登巡检后出现）';
     const dsum = (doctor && doctor.summary) || { pass: '—', warn: '—', fail: 0 };
     const concerns = [];
     for (const x of enabled) {
@@ -552,7 +588,7 @@ async function loadOverview() {
       </div>`).join('');
     const taskFlow = (tasks.history || []).slice(0, 5).map((h) => `<div class="row" style="grid-template-columns:56px minmax(0,1fr) auto">
         <u class="mono muted" style="text-decoration:none">${new Date(h.at).toTimeString().slice(0, 5)}</u>
-        <span class="ell">${esc(h.msg || ({ checkin: '每日签到', growth: '成长任务扫描', travel: '猫猫旅行巡逻' }[h.kind] || h.kind))}</span>
+        <span class="ell">${esc(h.msg || ({ checkin: '每日签到', growth: '成长任务扫描', travel: '猫猫旅行巡逻', streak: '连登管家巡检' }[h.kind] || h.kind))}</span>
         <span class="tag ${h.ok ? 'ok' : 'bd'}">${h.ok ? '✓' : '✗'}${h.creditGained ? ' +' + h.creditGained : ''}</span>
       </div>`).join('');
     const wideRow = `
@@ -603,9 +639,11 @@ async function loadOverview() {
       <div class="k4b">
         <div class="card hv tilt an" style="--c:#34D399;animation-delay:360ms">
           <div class="k">自动任务 · 今日</div>
-          <div style="display:flex;gap:10px;align-items:baseline;margin:4px 0 6px"><span class="mono" style="font-size:22px">${taskDone}/3</span>
+          <div style="display:flex;gap:10px;align-items:baseline;margin:4px 0 6px"><span class="mono" style="font-size:22px">${taskDone}/4</span>
             <span class="tag ${ck.ok >= ck.total ? 'ok' : ''}" data-go="tasks" title="今日签到进度 · 点击查看任务详情与手动签到" style="cursor:pointer">签到 ${ck.ok}/${ck.total}</span>
-            <span class="tag ${gr.ok >= gr.total ? 'ok' : ''}" data-go="tasks" title="今日成长任务进度 · 点击查看任务详情与手动扫描" style="cursor:pointer">成长 ${gr.ok}/${gr.total}</span></div>
+            <span class="tag ${gr.ok >= gr.total ? 'ok' : ''}" data-go="tasks" title="今日成长任务进度 · 点击查看任务详情与手动扫描" style="cursor:pointer">成长 ${gr.ok}/${gr.total}</span>
+            <span class="tag ${st.ok >= st.total ? 'ok' : ''}" data-go="tasks" title="${esc(streakTip)}" style="cursor:pointer">🔗 ${stTop ? '连登 ' + stTop.days + ' 天' : '连登未巡'}</span></div>
+          <div class="muted">${stTop ? `下一档 ${esc(stTop.nextTier || '—')} 差 ${stTop.nextTierRemaining ?? '—'} 天 · 补签卡 ${stTop.makeupBalance ?? '—'}/${stTop.makeupMax ?? '—'} · 抽奖 ${stTop.chancesLeft ?? 0} 次` : '连登巡检跑过后这里显示档位/补签卡/抽奖次数'}</div>
           <div class="muted">时点：签到 ${esc(((bridge.tasks || {}).checkinTimes || []).join(' ') || '09/21 点')} · 成长 ${esc(((bridge.tasks || {}).growthTimes || []).join(' ') || '01/13 点')}</div>
         </div>
         <div class="card hv tilt an" style="--c:#4F8CFF;animation-delay:420ms">
@@ -967,6 +1005,7 @@ function acctCard(site, row, raw) {
       <button class="btn mini" data-act="enable" data-site="${esc(site.site)}" data-id="${esc(a.id)}" data-v="${a.enabled ? '0' : '1'}">${a.enabled ? '禁用' : '启用'}</button>
       <button class="btn mini" data-act="manual" data-site="${esc(site.site)}" data-id="${esc(a.id)}">到期兜底</button>
       <button class="btn mini" data-act="reset" data-site="${esc(site.site)}" data-id="${esc(a.id)}">重置状态</button>
+      <button class="btn mini" data-act="syncnick" data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="从官方控制台拉取最新昵称并更新显示名（改了上游昵称后不用手动改备注；手动触发，不进定时轮询）">同步昵称</button>
       <span class="spacer"></span>
       <button class="btn mini danger" data-act="remove" data-site="${esc(site.site)}" data-id="${esc(a.id)}">删除</button>
     </div>
@@ -999,6 +1038,15 @@ function bindAcctAction(btn, done) {
         // T32：点「预计用不完」标记复制建议文案，方便贴到别处或照着安排任务
         copy(btn.dataset.advice || '', '已复制建议');
         return; // 纯前端操作，不触发重渲染
+      } else if (act === 'syncnick') {
+        // T53：手动同步官方昵称到显示名（上游响应含手机号等敏感字段，服务端只解析 uid/nickname）
+        btn.disabled = true; btn.textContent = '同步中…';
+        try {
+          const r = await api('/sync-nickname', { method: 'POST', body: { site, id } });
+          toast(r.msg || (r.changed ? `已更新为「${r.nickname}」` : '昵称未变化'), 'ok');
+        } finally {
+          btn.disabled = false; btn.textContent = '同步昵称';
+        }
       }
       done();
     } catch (e) { toast('操作失败：' + e.message, 'bad'); }
@@ -1357,13 +1405,16 @@ async function loadGuide() {
         <pre id="g-${s.id}">${esc(s.text)}</pre>
       </div>`).join('')}`, true));
 
+    // 复制走 copy()（带 execCommand 兜底 + 失败也 toast）——不能用裸 clipboard：
+    // IAB 后台 tab 里 clipboard.writeText 因 Document not focused 拒绝，.catch(() => {})
+    // 会把失败静默吞掉，用户看到的就是「点了没反应」（round-7 只修了 copy() 本体，这里漏改）。
     for (const b of el.querySelectorAll('[data-gcopy]')) {
-      b.onclick = () => navigator.clipboard?.writeText(b.dataset.gcopy).then(() => toast('已复制：' + b.dataset.gcopy, 'ok')).catch(() => {});
+      b.onclick = () => copy(b.dataset.gcopy, '已复制');
     }
     for (const b of el.querySelectorAll('[data-gsnippet]')) {
       b.onclick = () => {
         const s = snippets.find((x) => x.id === b.dataset.gsnippet);
-        navigator.clipboard?.writeText(s.text).then(() => toast('已复制 ' + s.title + ' 配置', 'ok')).catch(() => {});
+        if (s) copy(s.text, '已复制 ' + s.title + ' 配置');
       };
     }
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
@@ -1374,6 +1425,7 @@ async function loadTasks() {
   const el = $('#view-tasks');
   try {
     const [t, bridge] = await Promise.all([api('/tasks'), api('/bridge')]);
+    lastTasksData = t; // T50：renderTcOverview 的连登块从这里取（与大屏摘要解耦）
     const cfg = bridge.tasks || {};
     const labelOf = {};
     for (const s of bridge.sites || []) for (const a of s.accounts || []) labelOf[a.uid || a.id] = a.label || a.id;
@@ -1401,6 +1453,7 @@ async function loadTasks() {
         </label>
         <span class="spacer"></span>
         <button class="btn" id="tkCheckin">立即签到</button>
+        <button class="btn" id="tkStreak" title="连登管家：补签保连登 → 新手礼包/补偿 → 连登档位兑换 → 抽奖（幂等，可一天多跑）">🔗 连登巡检</button>
         <button class="btn" id="tkGrowth">扫描成长任务</button>
         <button class="btn" id="tkTravel">🐾 猫猫旅行巡逻</button>
       </div>
@@ -1415,14 +1468,16 @@ async function loadTasks() {
         </div>
         <div id="tcList" style="margin-top:12px"></div>
       </div>
-      <h2>今日执行 <span class="sub">${esc(t.today)} · 自动报名 + 对话类代打 + 达标领奖 + 猫猫到站领奖</span></h2>
+      <h2>今日执行 <span class="sub">${esc(t.today)} · 自动报名 + 对话类代打 + 达标领奖 + 连登管家 + 猫猫到站领奖</span></h2>
       <div class="card" style="margin-bottom:14px;display:flex;flex-wrap:wrap;gap:20px;align-items:flex-start">
         <div style="flex:1;min-width:280px"><div style="font-weight:600;font-size:13px;margin-bottom:8px">签到</div>${one('签到', t.checkin)}</div>
+        <div style="flex:1;min-width:280px"><div style="font-weight:600;font-size:13px;margin-bottom:8px">连登管家 <span class="sub">补签/兑换/抽奖快照</span></div>${one('连登管家', t.streak)}</div>
         <div style="flex:1;min-width:280px"><div style="font-weight:600;font-size:13px;margin-bottom:8px">成长任务</div>${one('成长任务', t.growth)}</div>
         <div style="flex:1;min-width:280px"><div style="font-weight:600;font-size:13px;margin-bottom:8px">猫猫旅行</div>${one('猫猫旅行', t.travel)}</div>
       </div>
       <div class="row" style="flex-wrap:wrap;gap:14px;align-items:stretch;margin-bottom:14px">
         <div class="card" id="checkinCal" style="margin-bottom:0"></div>
+        <div class="card" id="officialHeat" style="margin-bottom:0"></div>
         <div style="flex:1;min-width:320px">
           <div style="font-weight:600;font-size:13px;margin-bottom:8px">累计白嫖统计 <span class="sub">自动任务领到的积分合计（不含签到积分）</span></div>
           <div class="grid kpis" id="gainedKpis"></div>
@@ -1431,7 +1486,7 @@ async function loadTasks() {
       <h2>最近记录</h2>
       <div class="card" style="padding:0">${(t.history || []).length ? `<table><tbody>${t.history.slice(0, 15).map((h) => `
         <tr><td style="width:120px" class="muted">${esc(new Date(h.at).toLocaleString())}</td>
-        <td style="width:70px"><span class="badge ${h.kind === 'checkin' ? 'acc' : h.kind === 'travel' ? 'warn' : 'ok'}">${{ checkin: '签到', growth: '成长', travel: '旅行' }[h.kind] || h.kind}</span></td>
+        <td style="width:70px"><span class="badge ${h.kind === 'checkin' ? 'acc' : h.kind === 'travel' ? 'warn' : h.kind === 'streak' ? 'acc' : 'ok'}">${{ checkin: '签到', growth: '成长', travel: '旅行', streak: '连登' }[h.kind] || h.kind}</span></td>
         <td><span class="${h.ok ? 'ok' : 'bad'}">${h.ok ? '✓' : '✗'}</span> ${esc(h.msg || `报名${h.accepted ?? 0} 代打${h.autoChats ?? 0} 领奖${h.claimed ?? 0} +${h.creditGained ?? 0}分${(h.autoNotes || []).length ? '。' + h.autoNotes.join('；') : ''}`)}</td></tr>`).join('')}</tbody></table>`
         : '<div class="muted" style="padding:18px;text-align:center">还没有运行记录</div>'}</div>
       <details style="margin-top:14px">
@@ -1530,12 +1585,13 @@ async function loadTasks() {
     }
     // ---- T15：累计白嫖 KPI（同上，仅重建时重画）----
     if (changed) {
-      const g = t.gainedTotal || { credit: 0, checkins: 0, claims: 0, travels: 0 };
+      const g = t.gainedTotal || { credit: 0, checkins: 0, claims: 0, travels: 0, streaks: 0 };
       $('#gainedKpis').innerHTML = `
-        <div class="kpi"><b class="ok">${fmtCredit(g.credit ?? 0)}</b><span>成长任务+旅行领回积分</span></div>
+        <div class="kpi"><b class="ok">${fmtCredit(g.credit ?? 0)}</b><span>成长任务+旅行+连登领回积分</span></div>
         <div class="kpi"><b>${g.checkins ?? 0}</b><span>累计签到（账号·天）</span></div>
         <div class="kpi"><b>${g.claims ?? 0}</b><span>累计领奖次数</span></div>
-        <div class="kpi"><b>${g.travels ?? 0}</b><span>猫猫旅行归来次数</span></div>`;
+        <div class="kpi"><b>${g.travels ?? 0}</b><span>猫猫旅行归来次数</span></div>
+        <div class="kpi"><b>${g.streaks ?? 0}</b><span>连登收益次数（补签/兑换/抽奖）</span></div>`;
     }
     // ---- T14：任务中心 —— 账号下拉只在页面重建时重排；列表渲染走 renderTcList（缓存数据，不在轮询路径）----
     if (changed) {
@@ -1548,10 +1604,11 @@ async function loadTasks() {
       tcSel.innerHTML = accOptions.map((o) => `<option value="${esc(o.site)}|${esc(o.id)}">${o.label}</option>`).join('') || '<option value="">（没有账号）</option>';
       const lastTc = localStorage.getItem('wbTcAccount');
       if (lastTc && accOptions.some((o) => o.site + '|' + o.id === lastTc)) tcSel.value = lastTc;
-      tcSel.onchange = () => { localStorage.setItem('wbTcAccount', tcSel.value); loadTaskCenter({ spinner: true }); };
+      tcSel.onchange = () => { localStorage.setItem('wbTcAccount', tcSel.value); loadTaskCenter({ spinner: true }); loadOfficialHeat(); };
       $('#tcReload').onclick = () => loadTaskCenter({ force: true, spinner: true });
       if (accOptions.length) renderTcList(); // 回填最近一次数据（showView 的按需拉取稍后自动覆盖）
       else $('#tcList').innerHTML = '<div class="empty" style="padding:14px">没有可用账号</div>';
+      loadOfficialHeat(); // T52：官方热力图跟随当前选中账号（tcAccount 就绪后）
     }
 
     if (changed) {
@@ -1560,6 +1617,7 @@ async function loadTasks() {
       bindTaskSwitch(id, key, () => { if (active === 'home') loadOverview(); });
     }
     $('#tkCheckin').onclick = () => runTask('checkin');
+    $('#tkStreak').onclick = () => runTask('streak');
     $('#tkGrowth').onclick = () => runTask('growth');
     $('#tkTravel').onclick = () => runTask('travel');
     $('#bdSave').onclick = async () => {
@@ -1599,6 +1657,47 @@ async function loadTasks() {
     if (changed && lastTcData) renderTcList();
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
+/* ---------- T50：renderTcOverview 的连登块从这里取快照（loadTasks 拉过后填充） ---------- */
+let lastTasksData = null;
+
+/* ---------- T52：官方打卡热力图（权威全历史，从账号注册日起算；6h 服务端缓存） ----------
+ * 与本地「签到日历」并排：本地口径 = 插件启用日起算，官方口径 = 注册日起算，注明差异。
+ * 列布局（grid-auto-flow:column, 7 行）对齐 GitHub 热力图；列 = 一周，第一列按周几补位。 */
+async function loadOfficialHeat({ force = false } = {}) {
+  const box = $('#officialHeat');
+  if (!box) return;
+  const v = ($('#tcAccount') || {}).value || '';
+  const [site, accountId] = v.split('|');
+  if (!site || !accountId) {
+    box.innerHTML = '<div style="font-weight:600;font-size:13px;margin-bottom:8px">官方热力图</div><div class="muted" style="font-size:12px;padding:6px 0">没有可选账号</div>';
+    return;
+  }
+  box.innerHTML = '<div style="font-weight:600;font-size:13px;margin-bottom:8px">官方热力图 <span class="sub">最近 12 个月</span></div><div class="muted" style="font-size:12px;padding:6px 0"><span class="spin"></span>读取官方打卡数据…</div>';
+  try {
+    const r = await api('/heatmap?site=' + encodeURIComponent(site) + '&accountId=' + encodeURIComponent(accountId) + (force ? '&refresh=1' : ''));
+    const cells = r.cells || [];
+    if (!cells.length) {
+      box.innerHTML = '<div style="font-weight:600;font-size:13px;margin-bottom:8px">官方热力图</div><div class="muted" style="font-size:12px;padding:6px 0">上游没有返回打卡数据（账号太新或活动未开放）</div>';
+      return;
+    }
+    const first = new Date(cells[0].date + 'T00:00:00');
+    const lead = (first.getDay() === 0 ? 6 : first.getDay() - 1); // 周一开头，不满一周前置补位
+    const color = (c) => c.score <= 0 ? 'var(--chip)' : c.score <= 2 ? 'rgba(63,185,111,.35)' : c.score <= 5 ? 'rgba(63,185,111,.65)' : 'var(--ok)';
+    const grid = [...Array(lead).fill(null), ...cells].map((c) => c
+      ? `<i title="${esc(c.date)} · 活跃分 ${c.score}${c.hasNewBuddy ? ' · 新猫猫' : ''}" style="width:11px;height:11px;border-radius:2.5px;background:${color(c)};cursor:default"></i>`
+      : '<i style="width:11px;height:11px;background:transparent"></i>').join('');
+    const at = r.cachedAt ? new Date(r.cachedAt).toLocaleTimeString() : '';
+    box.innerHTML = `<div style="font-weight:600;font-size:13px;margin-bottom:8px">官方热力图 <span class="sub">${cells.length} 天${at ? ' · 数据 ' + at + (r.fromCache ? '（缓存）' : '') : ''}</span>
+        <button class="btn mini" id="ohReload" title="忽略 6 小时缓存，强制从上游拉一次">↻</button></div>
+      <div style="display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,11px);gap:2.5px;max-width:430px;overflow-x:auto;padding-bottom:4px">${grid}</div>
+      <div class="muted" style="font-size:11.5px;margin-top:6px">官方打卡全历史（自账号注册日起） · 绿越深活跃分越高 · 本地「签到日历」自插件启用日起算，口径不同，并排对照</div>`;
+    const rb = $('#ohReload');
+    if (rb) rb.onclick = () => loadOfficialHeat({ force: true });
+  } catch (e) {
+    box.innerHTML = `<div style="font-weight:600;font-size:13px;margin-bottom:8px">官方热力图</div><div class="bad" style="font-size:12px;padding:6px 0">加载失败：${esc(e.message)}</div>`;
+  }
+}
+
 /* ---------- T14：任务中心（缓存视图 + 手动刷新 + 单任务代打/领奖） ----------
  * 0.3.22：列表不再跟随 30s 轮询 / SSE 实时拉取。调用时机只剩：
  *   进入任务页（读服务端缓存，过期才拉上游）/ 切换账号 / 手动刷新(force) / 代打领奖后(force)。
@@ -1683,7 +1782,7 @@ function renderTcList() {
 }
 
 async function runTask(kind) {
-  toast('正在执行：' + ({ checkin: '签到', growth: '成长任务扫描', travel: '猫猫旅行巡逻' }[kind] || kind) + ' …');
+  toast('正在执行：' + ({ checkin: '签到+连登巡检', streak: '连登巡检', growth: '成长任务扫描', travel: '猫猫旅行巡逻' }[kind] || kind) + ' …');
   try {
     const r = await api('/tasks/run', { method: 'POST', body: { kind } });
     const parts = [];
@@ -2116,7 +2215,7 @@ function healthState(a) {
             <div class="muted" style="font-size:12px;margin:10px 0">完整值只在这一次显示，关掉弹窗后只能看掩码。先复制再关闭。</div>
             <div class="row"><button class="btn primary" id="copyNewKey">⧉ 复制</button><span class="spacer"></span><button class="btn" id="closeNewKey">我已保存，关闭</button></div>
           </div></div>`;
-          $('#copyNewKey').onclick = () => navigator.clipboard?.writeText(r.key).then(() => toast('已复制新密钥', 'ok')).catch(() => {});
+          $('#copyNewKey').onclick = () => copy(r.key, '已复制新密钥');
           $('#closeNewKey').onclick = () => $('#mWrapK').remove();
         }
       } catch (e) { toast('添加失败：' + e.message, 'bad'); }

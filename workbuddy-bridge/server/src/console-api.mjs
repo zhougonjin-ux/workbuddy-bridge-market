@@ -26,7 +26,7 @@ import { recentEvents } from './events.mjs';
 import { compressionStats } from './compress.mjs';
 import { sendJson } from './util.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
-import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask, startTaskLoop, stopTaskLoop } from './tasks.mjs';
+import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask, startTaskLoop, stopTaskLoop, heatmapView, syncAccountNickname } from './tasks.mjs';
 import { importLocalAccounts } from './localimport.mjs';
 import { budgetStatus, budgetCheckAndAnnounce } from './budget.mjs';
 import { testChannels } from './notify.mjs';
@@ -343,7 +343,7 @@ export async function handleConsoleApi(ctx) {
   }
   if (p === '/tasks/run' && method === 'POST') {
     const body = ctx.body || {};
-    const kind = ['checkin', 'growth', 'travel', 'all'].includes(body.kind) ? body.kind : 'all';
+    const kind = ['checkin', 'growth', 'travel', 'streak', 'all'].includes(body.kind) ? body.kind : 'all';
     const site = body.site ? String(body.site) : null;
     const results = await runTasks(cfg, kind, site);
     return sendJson(res, 200, { ok: true, kind, results });
@@ -463,6 +463,41 @@ export async function handleConsoleApi(ctx) {
       return sendJson(res, 200, r);
     } catch (e) {
       return sendJson(res, 502, { error: String(e.message || e).slice(0, 160) });
+    }
+  }
+
+  // ---- T52：官方打卡热力图（权威全历史，从账号注册日起算；6h 服务端缓存）----
+  // ?refresh=1 强拉；与本地 checkinDays 日历（插件启用日起算）并存，前端注明口径差异。
+  if (p === '/heatmap' && method === 'GET') {
+    const site = String(url.searchParams.get('site') || cfg.defaultSite);
+    const accountId = String(url.searchParams.get('accountId') || '');
+    const force = url.searchParams.get('refresh') === '1';
+    if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
+    if (!accountId) return sendJson(res, 400, { error: '缺少 accountId' });
+    if (!getAccount(site, accountId)) return sendJson(res, 404, { error: `账号不存在：${accountId}` });
+    try {
+      const v = await heatmapView(cfg, site, accountId, { force });
+      return sendJson(res, 200, { ok: true, site, accountId, cells: v.cells, cachedAt: v.cachedAt, fromCache: v.fromCache });
+    } catch (e) {
+      return sendJson(res, 502, { error: `拉取热力图失败：${String(e.message || e).slice(0, 160)}` });
+    }
+  }
+
+  // ---- T53：账号昵称同步（只在用户手动点「同步昵称」时调用，绝不进定时轮询）----
+  // 上游响应含手机号等敏感字段，服务端只解析 uid/nickname 两个字段（见 tasks.mjs），
+  // uid 与池内账号不一致直接报错防串号。
+  if (p === '/sync-nickname' && method === 'POST') {
+    const body = ctx.body || {};
+    const site = String(body.site || cfg.defaultSite);
+    // 前端账号卡按钮统一带 data-id，这里 id/accountId 都认（与 /pool/account、/task-center 两种形参对齐）
+    const accountId = String(body.accountId || body.id || '');
+    if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
+    if (!getAccount(site, accountId)) return sendJson(res, 404, { error: `账号不存在：${accountId}` });
+    try {
+      const r = await syncAccountNickname(cfg, site, accountId);
+      return sendJson(res, 200, r);
+    } catch (e) {
+      return sendJson(res, e.status === 404 ? 404 : 502, { error: String(e.message || e).slice(0, 160) });
     }
   }
 
