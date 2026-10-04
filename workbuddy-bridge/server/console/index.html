@@ -11,7 +11,8 @@
 (function () {
   var t = null;
   try { t = localStorage.getItem('wbTheme'); } catch (e) { /* 隐私模式等 */ }
-  if (t !== 'light' && t !== 'dark') {
+  var SEVEN = ['dark','light','midnight','sand','guofeng','cyber','sakura'];
+  if (SEVEN.indexOf(t) < 0) {
     t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
   }
   document.documentElement.dataset.theme = t;
@@ -20,40 +21,113 @@
 <link rel="stylesheet" href="/console/style.css">
 </head>
 <body>
-<header>
-  <div class="brand"><span class="logo">WB</span>WorkBuddy 积分桥 <span class="ver" id="ver"></span></div>
-  <div id="srvMeta"></div>
-  <div id="alerts"></div>
-</header>
-<main>
-  <!-- 0.3.24：无页签架构 —— 大屏是控制台本体，子页面只从大屏面板下钻进入，返回条/浏览器历史负责回退 -->
-  <div id="backBar" hidden>
-    <button class="btn mini" id="btnHome">← 返回大屏</button>
-    <b id="viewTitle"></b>
-    <span class="muted" id="viewHint" style="font-size:12px"></span>
-  </div>
-  <section id="view-home"></section>
-  <section id="view-accounts" hidden></section>
-  <section id="view-models" hidden></section>
-  <section id="view-tasks" hidden></section>
-  <section id="view-usage" hidden></section>
-  <section id="view-events" hidden></section>
-  <section id="view-settings" hidden>
-    <div id="sec-guide"></div>
-    <div id="sec-health" style="margin-top:22px"></div>
-    <div style="margin-top:22px">
-      <div class="row" style="margin-bottom:10px">
-        <button class="btn mini" id="logPause">暂停滚动</button>
-        <button class="btn mini" id="logClear">清屏</button>
-        <span class="muted" style="font-size:12px">实时日志（长轮询，仅本机内存最近 500 条）</span>
+<!-- ===== 环境光层（HUD 重设计）：粒子 canvas / 透视网格 / 聚光灯 / 扫描线 / 暗角 ===== -->
+<canvas id="fx" aria-hidden="true"></canvas>
+<div class="floor" aria-hidden="true"></div>
+<div id="glow" aria-hidden="true"></div>
+<div class="scan" aria-hidden="true"></div>
+<div class="vig" aria-hidden="true"></div>
+
+<div class="app">
+  <aside class="side">
+    <div class="brand2">
+      <div class="logo">WB</div>
+      <div>
+        <div class="btitle">WorkBuddy 积分桥</div>
+        <div class="bsub mono" id="sideVer">v… · :…</div>
       </div>
-      <div id="logBox"></div>
     </div>
-  </section>
-</main>
+
+    <nav class="nav" id="nav">
+      <button class="on" data-v="home"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg><span>总控台</span></button>
+      <button data-v="res" title="资源池：账号健康与模型清单（页内可切）"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.6 14c0-2.9 2.4-4.4 5.4-4.4s5.4 1.5 5.4 4.4"/></svg><span>资源池</span><i class="n2">2</i></button>
+      <button data-v="ops" title="运维中心：任务 / 用量 / 事件（页内可切）"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 13.5h11"/><rect x="3.5" y="8" width="2.4" height="4" rx=".6"/><rect x="7" y="5" width="2.4" height="7" rx=".6"/><rect x="10.5" y="2.5" width="2.4" height="9.5" rx=".6"/></svg><span>运维中心</span><i class="n2">3</i></button>
+      <button data-v="sys"><svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 5h11M2.5 8h11M2.5 11h11"/><circle cx="6" cy="5" r="1.4" fill="currentColor" stroke="none"/><circle cx="10" cy="8" r="1.4" fill="currentColor" stroke="none"/><circle cx="5.5" cy="11" r="1.4" fill="currentColor" stroke="none"/></svg><span>系统设置</span></button>
+    <div id="themePanel" hidden></div>
+    </nav>
+
+    <div class="grow"></div>
+
+    <div class="sidenote">
+      <div class="sn" id="sideStats"></div>
+    </div>
+
+    <div class="srv" id="sideSrv">
+      <div><span class="dot"></span> <span id="sideSrvState">检测中…</span></div>
+      <div id="sideSrvMeta" class="mono">—</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="legacy-header">
+      <div class="brand"><span class="logo">WB</span>WorkBuddy 积分桥 <span class="ver" id="ver"></span></div>
+      <div id="srvMeta"></div>
+      <div id="alerts"></div>
+    </header>
+    <!-- HUD 顶栏：面包屑 + 主机信息 + 关键 chip（数据由 shell.js/app.js 填充） -->
+    <div class="topbar">
+      <div class="crumb"><b class="glitch" id="crumb" data-t="总控台">总控台</b> <span id="crumbSub">双协议代理</span></div>
+      <div class="sp"></div>
+      <div class="chip mono" id="chipEndpoint">—</div>
+      <div class="chip" id="chipRun"><span class="dot"></span>—</div>
+      <div class="chip mono" id="chipModel" style="cursor:pointer" title="点击到模型库修改默认模型">默认 <b>—</b></div>
+      <div class="chip" id="chipDoctor"><span class="p ok"></span>诊断 —</div>
+      <button class="btn" id="navTheme" title="主题切换：暗色 / 亮色 / 墨蓝 / 暖沙 / 古风 / 科技 / 樱花">🎨 主题</button>
+      <button class="btn pri" id="btnCopyCfg" title="复制 ZCode 模型供应商接入配置（Base URL + API Key + 模型 ID）">复制配置</button>
+    </div>
+    <div id="backBar" hidden>
+      <button class="btn mini" id="btnHome">← 返回大屏</button>
+      <b id="viewTitle"></b>
+      <span class="muted" id="viewHint" style="font-size:12px"></span>
+    </div>
+    <section id="view-home" class="hudview"></section>
+    <section id="view-accounts" hidden></section>
+    <section id="view-models" hidden></section>
+    <section id="view-tasks" hidden></section>
+    <section id="view-usage" hidden></section>
+    <section id="view-events" hidden></section>
+    <section id="view-settings" hidden>
+      <div id="sec-guide"></div>
+      <div id="sec-health" style="margin-top:22px"></div>
+      <div style="margin-top:22px">
+        <div class="row" style="margin-bottom:10px">
+          <button class="btn mini" id="logPause">暂停滚动</button>
+          <button class="btn mini" id="logClear">清屏</button>
+          <span class="muted" style="font-size:12px">实时日志（长轮询，仅本机内存最近 500 条）</span>
+        </div>
+        <div id="logBox"></div>
+      </div>
+    </section>
+    <footer class="foot" id="foot">
+      <span class="sb"><span class="dot"></span><span id="footState">服务检测中</span></span>
+      <span class="sbsep"></span>
+      <span>端点 <b id="footEndpoint">—</b></span>
+      <span class="opt">账号 <b id="footAcc">—</b></span>
+      <span>今日 <b id="footCalls">—</b> 次 · <b id="footCredit">—</b> 积分</span>
+      <span class="opt">默认模型 <b id="footModel">—</b></span>
+      <span class="opt2" id="footUptime">运行 —</span>
+      <span style="flex:1"></span>
+      <span class="opt fnote" id="footNote">WorkBuddy 积分桥 · 数据取自本机实时接口</span>
+    </footer>
+  </main>
+</div>
+
+<div class="dock" id="dock">
+  <div class="fab" id="fab" title="快捷操作：复制配置 / 执行任务 / 诊断 / 刷新积分 / 导出 CSV">⌘</div>
+  <div class="items">
+    <button data-dock="copycfg">复制 ZCode 配置</button>
+    <button data-dock="tasks">立即执行一轮任务</button>
+    <button data-dock="doctor">重新诊断</button>
+    <button data-dock="refresh">刷新全部积分</button>
+    <button data-dock="csv">导出用量 CSV</button>
+  </div>
+</div>
+
 <div id="modalRoot"></div>
 <div id="toast"></div>
 <script src="/console/qrcode.min.js"></script>
+<script src="/console/fx.js"></script>
+<script src="/console/shell.js"></script>
 <script src="/console/app.js"></script>
 </body>
 </html>

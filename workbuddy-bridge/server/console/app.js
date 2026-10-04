@@ -3,7 +3,33 @@ const TOKEN = window.__WB_TOKEN__ || '';
 const $ = (s, el = document) => (el || document).querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
+/* T50 api 微缓存：GET 请求 3.5s 内复用上次结果（stale-while-revalidate：先回缓存再后台刷新）。
+ * 切 tab 连点多个分段时不再每次全量等接口——首个渲染立即出，网络慢也有内容。 */
+const __apiCache = new Map(); // path -> { t, p }
 async function api(path, opts = {}) {
+  const isGet = !(opts && opts.body) && (!opts || !opts.method || opts.method === 'GET');
+  if (isGet) {
+    const c = __apiCache.get(path);
+    if (c && Date.now() - c.t < 3500) return c.p;
+    const p = (async () => {
+      const res = await fetch('/console/api' + path, {
+        ...opts,
+        headers: { 'X-Console-Token': TOKEN, 'Content-Type': 'application/json', ...(opts.headers || {}) },
+      });
+      const text = await res.text();
+      let json = null;
+      try { json = JSON.parse(text); } catch { json = { raw: text }; }
+      if (!res.ok) {
+        const info = json.error;
+        const msg = typeof info === 'string' ? info : (info && info.message) || ('HTTP ' + res.status);
+        throw new Error(msg);
+      }
+      return json;
+    })();
+    __apiCache.set(path, { t: Date.now(), p });
+    p.catch(() => __apiCache.delete(path)); // 失败不缓存，下次重拉
+    return p;
+  }
   const res = await fetch('/console/api' + path, {
     ...opts,
     headers: { 'X-Console-Token': TOKEN, 'Content-Type': 'application/json', ...(opts.headers || {}) },
@@ -28,6 +54,12 @@ function toast(msg, cls = '') {
   setTimeout(() => el.remove(), 4000);
 }
 const copy = (text, tip) => navigator.clipboard?.writeText(text).then(() => toast((tip || '已复制') + '：' + text, 'ok')).catch(() => {});
+
+/* HUD 壳层（shell.js/fx.js）复用的钩子：api 函数、toast、当前视图。
+ * 只暴露引用，不改任何原有逻辑。 */
+window.__wbApi = api;
+window.toast = toast;
+window.__WB_TOKEN_REF = TOKEN;
 
 /* ---------- 时间/格式化 ---------- */
 const fmtDays = (t) => {
@@ -90,14 +122,23 @@ function parseHash() {
 
 function showView(name, focus = null) {
   active = name;
+  window.__wbActiveView = name; // HUD 壳层同步导航高亮用（shell.js 轮询读取）
   for (const v of VIEWS) { const el = $('#view-' + v); if (el) el.hidden = v !== name; }
   $('#backBar').hidden = name === 'home';
   const meta = VIEW_META[name];
   if (meta) { $('#viewTitle').textContent = meta[0]; $('#viewHint').textContent = meta[1]; }
   const want = name === 'home' ? '' : '#/' + name;
   if ((location.hash || '') !== want) location.hash = want; // 触发 hashchange（同值时浏览器不触发）
+  enterView(name, focus);
+}
+
+/* HUD 壳层（shell.js）的页内分段复用：只做「进入视图」的加载与定时器，不写 hash、
+ * 不动返回条。showView = 切 hidden/hash + enterView；分段 = 切 hidden + enterView。 */
+function enterView(name, focus = null) {
   clearInterval(refreshTimer); clearInterval(logTimer); logTimer = null;
-  window.scrollTo(0, 0); // 子页面从顶部开始看
+  // shell.js 分段切换置 __wbSegKeepScroll：同页就地换段保滚动；正常 showView（含返回大屏）回顶
+  if (window.__wbSegKeepScroll != null) window.scrollTo(0, window.__wbSegKeepScroll);
+  else window.scrollTo(0, 0); // 子页面从顶部开始看
   if (name === 'home') { loadOverview(); void loadTcSummary(); refreshTimer = setInterval(loadOverview, 30000); }
   if (name === 'accounts') { loadAccounts().then(() => focusAcct(focus)).catch(() => {}); refreshTimer = setInterval(loadAccounts, 30000); }
   if (name === 'models') { loadModels(); refreshTimer = setInterval(loadModels, 60000); }
@@ -106,6 +147,8 @@ function showView(name, focus = null) {
   if (name === 'events') { loadEvents(); refreshTimer = setInterval(loadEvents, 30000); }
   if (name === 'settings') { loadGuide(); loadHealth(); startLogs(); refreshTimer = setInterval(loadHealth, 30000); }
 }
+window.__wbViews = () => VIEWS;
+window.__wbEnterView = enterView;
 
 /* T49 下钻精定位：大屏账号行 → 账号页定位到对应账号卡。render 完成后调用；
  * 找不到目标（账号不在/还没加载）就安静返回，不做任何滚动。 */
@@ -237,7 +280,7 @@ function renderTcOverview() {
 async function loadOverview() {
   const el = $('#view-home');
   try {
-    const [bridge, usage, tasks, evts, state, modelsResp, health] = await Promise.all([
+    const [bridge, usage, tasks, evts, state, modelsResp, health, burnout, doctor] = await Promise.all([
       api('/bridge'),
       api('/usage?days=7'),
       api('/tasks'),
@@ -245,6 +288,8 @@ async function loadOverview() {
       api('/state'),
       api('/models').catch(() => null),
       api('/health').catch(() => null),
+      api('/burnout').catch(() => null),
+      api('/doctor').catch(() => null),
     ]);
     STATE = state; // 顶栏的运行时长/状态随之保鲜
     const accts = [];
@@ -253,192 +298,334 @@ async function loadOverview() {
     const accNames = {};
     for (const x of accts) accNames[x.a.id] = x.a.label || x.a.nickname || x.a.id;
 
+    /* ---- 汇总数字 ---- */
     const totalRemain = enabled.reduce((s, x) => s + (accountRemainOf(x.a) || 0), 0);
-    let weekExpiry = 0;
-    for (const x of enabled) for (const bt of x.a.creditDetail || []) {
-      const d = fmtDays(bt.expireAt);
-      if (d !== null && d >= 0 && d <= 7) weekExpiry += bt.remain || 0;
-    }
+    const totalBatches = enabled.reduce((s, x) => s + (x.a.creditDetail || []).filter((b) => (b.remain || 0) > 0).length, 0);
     const today = usage.today || {};
     const recent = usage.recent || [];
-    const maxCalls = Math.max(1, ...recent.map((d) => d.calls || 0));
-
-    // 今日自动任务完成度：每类按「启用账号中已完成的比例」
-    const taskState = (map) => {
-      const ok = Object.entries(map || {}).filter(([uid, e]) => e.ok && enabled.some((x) => (x.a.uid || x.a.id) === uid)).length;
-      return { ok, total: enabled.length || 1, done: enabled.length > 0 && ok >= enabled.length, some: ok > 0 };
-    };
-    const ck = taskState(tasks.checkin), gr = taskState(tasks.growth), tv = taskState(tasks.travel);
-
-    // ---- KPI 横幅（全部可点下钻） ----
-    const anyLogin = (state.sites || []).some((s) => s.logged_in);
-    // T44：全账号合计余额 ÷ 近 7 日日均 = 按当前速率还能用多少天（/bridge 的 burnout.dailyAvg 下发）
-    const dailyAvg = (bridge.burnout && bridge.burnout.dailyAvg) || 0;
+    const dailyAvg = (burnout && burnout.dailyAvg) || 0;
     const totalDays = daysLeftOf(totalRemain, dailyAvg);
-    const kpis = `
-      <div class="kpi2" data-go="accounts"><b class="ok">${fmtCredit(totalRemain)}</b><span>可用积分余额 · ${enabled.length} 个账号${totalDays !== null ? ` · 按速率 ≈${totalDays} 天` : ''}</span></div>
-      <div class="kpi2" data-go="usage"><b class="warn">${fmtCredit(today.credit ?? 0)}</b><span>今日消耗积分</span></div>
-      <div class="kpi2" data-go="usage"><b>${today.calls ?? 0}</b><span>今日调用 · 错误 ${today.errors ?? 0}</span></div>
-      <div class="kpi2" data-go="accounts"><b class="${weekExpiry > 0 ? 'warn' : ''}">${fmtCredit(weekExpiry)}</b><span>7 天内到期积分</span></div>
-      <div class="kpi2" data-go="accounts"><b>${enabled.filter((x) => !String(x.a.lastError || '').includes('401')).length}<span style="font-size:14px;color:var(--muted)">/${enabled.length}</span></b><span>健康账号（401 视为失效）</span></div>
-      <div class="kpi2" data-go="settings"><b class="${anyLogin ? 'ok' : 'bad'}" style="font-size:18px;padding-top:5px">${anyLogin ? '● 运行中' : '○ 未登录'}</b><span>服务 · 已运行 ${dur(state.uptime_ms || 0)}</span></div>`;
+    const successRate = today.calls ? Math.round((today.calls - (today.errors || 0)) / today.calls * 100) : 100;
+    let earliest = null;
+    for (const x of enabled) for (const bt of (x.a.creditDetail || [])) {
+      if ((bt.remain || 0) > 0 && bt.expireAt && (earliest === null || bt.expireAt < earliest)) earliest = bt.expireAt;
+    }
+    const healthAcc = enabled.filter((x) => healthState(x.a).cls === 'ok').length;
 
-    // ---- 面板 1：积分与到期（每账号一行：名称 + 余额大字 + 最近到期批次条） ----
+    /* ---- sparkline（近 7 天调用 / 积分，占位平线兜底） ---- */
+    const spark = (vals, color, gid) => {
+      const vs = vals.length ? vals : [1, 1];
+      const max = Math.max(1, ...vs);
+      const pts = vs.map((v, i) => [`M${Math.round(i / Math.max(1, vs.length - 1) * 120)} ${Math.round(24 - (v / max) * 21)}`].join(''));
+      const d = pts.length ? 'M' + vs.map((v, i) => `${Math.round(i / Math.max(1, vs.length - 1) * 120)} ${Math.round(24 - (v / max) * 21)}`).join(' L') : 'M0 24 L120 24';
+      const last = d.split(' ').pop().split('L').pop();
+      return `<svg class="spark" viewBox="0 0 120 26" preserveAspectRatio="none" aria-hidden="true">
+        <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${color}" stop-opacity=".35"/><stop offset="100%" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
+        <path d="${d} L120 26 L0 26Z" fill="url(#${gid})"/>
+        <path class="l" d="${d}" fill="none" stroke="${color}" stroke-width="1.4"/>
+      </svg>`;
+    };
+
+    /* ---- KPI 4 卡 ---- */
+    const kpis = `
+      <div class="card hv tilt an" data-go="usage" title="今日调用与错误统计 · 点击查看用量明细" style="--c:#4F8CFF;animation-delay:0ms;cursor:pointer">
+        <div class="k">今日调用</div>
+        <div class="v glow"><span data-count="${today.calls ?? 0}">0</span></div>
+        <div class="muted">错误 ${today.errors ?? 0} · 成功率 ${successRate}%</div>
+        ${spark(recent.map((d) => d.calls || 0), '#4F8CFF', 'spk1')}
+      </div>
+      <div class="card hv tilt an" data-go="usage" title="今日消耗积分与 token 统计 · 点击查看用量明细" style="--c:#22D3EE;animation-delay:60ms;cursor:pointer">
+        <div class="k">今日消耗积分</div>
+        <div class="v"><span data-count="${today.credit ?? 0}" data-dec="2">0</span></div>
+        <div class="muted">输入 ${fmtK(today.promptTokens ?? 0)} · 输出 ${fmtK(today.completionTokens ?? 0)} tok</div>
+        ${spark(recent.map((d) => d.credit || 0), '#22D3EE', 'spk2')}
+      </div>
+      <div class="card hv tilt an" data-go="accounts" title="各账号健康状态（冷却/失效/耗尽）· 点击进入账号管理" style="--c:#34D399;animation-delay:120ms;cursor:pointer">
+        <div class="k">可用账号</div>
+        <div class="v">${healthAcc} <span style="font-size:14px;color:var(--mu)">/ ${enabled.length}</span></div>
+        <div class="muted">${enabled.length - healthAcc ? (enabled.length - healthAcc) + ' 个冷却/失效' : '全部健康'} · 站点 ${(state.sites || []).filter((s) => s.logged_in).map((s) => s.site).join(' ') || '—'}</div>
+        ${spark(enabled.map((x) => 1), '#34D399', 'spk3')}
+      </div>
+      <div class="card hv tilt an" data-go="accounts" title="全部启用账号的可用积分合计 · 点击查看账号与批次明细" style="--c:#7B5CFF;animation-delay:180ms;cursor:pointer">
+        <div class="k">积分总量${totalDays !== null ? ' · ≈' + totalDays + ' 天' : ''}</div>
+        <div class="v"><span data-count="${Math.round(totalRemain)}">0</span></div>
+        <div class="muted">${totalBatches} 个有效批次${earliest ? ' · 最早 ' + new Date(earliest).toLocaleDateString().slice(5) + ' 到期' : ''}${dailyAvg > 0 ? ' · 日均 ' + fmtCredit(dailyAvg) : ''}</div>
+        ${spark(recent.map((d) => d.credit || 0).reverse(), '#7B5CFF', 'spk4')}
+      </div>`;
+
+    /* ---- 积分池环形（双层：旋转刻度环 + 进度环 + 光子） ---- */
+    const maxSeen = Math.max(totalRemain, 1); // 环形图进度：无历史峰值参考时以满环展示余量占比 1（纯装饰）
+    const ringPct = Math.max(0.04, Math.min(1, totalRemain / maxSeen));
+    const C = 2 * Math.PI * 58;
+    const ringSvg = `<svg viewBox="0 0 140 140" style="width:132px;height:132px;flex:none" aria-label="积分池环形仪表">
+      <defs><linearGradient id="rg" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="var(--cy)"/><stop offset="55%" stop-color="var(--ac)"/><stop offset="100%" stop-color="var(--vi)"/></linearGradient></defs>
+      <circle cx="70" cy="70" r="58" fill="none" stroke="rgba(120,150,220,.16)" stroke-width="9"/>
+      <circle cx="70" cy="70" r="58" fill="none" stroke="url(#rg)" stroke-width="9" stroke-linecap="round"
+              stroke-dasharray="${C.toFixed(0)}" stroke-dashoffset="${(C * (1 - ringPct)).toFixed(0)}" transform="rotate(-90 70 70)"
+              style="filter:drop-shadow(0 0 8px rgba(79,140,255,.6))"/>
+      <circle cx="70" cy="70" r="66" fill="none" stroke="rgba(120,150,220,.35)" stroke-width="1" stroke-dasharray="1 9" style="animation:spin 6s linear infinite;transform-origin:70px 70px"/>
+      <circle cx="70" cy="70" r="58" fill="none" stroke="#EAF9FF" stroke-width="2.4" stroke-dasharray="4 360" transform="rotate(-90 70 70)" style="animation:spin 3.4s linear infinite;transform-origin:70px 70px"/>
+      <circle cx="70" cy="70" r="50" fill="var(--ring-core)" stroke="rgba(140,170,230,.28)" stroke-width="1"/>
+      <text x="70" y="64" text-anchor="middle" fill="var(--tx)" font-size="25" font-weight="700" font-family="monospace">${fmtCredit(Math.round(totalRemain))}</text>
+      <text x="70" y="81" text-anchor="middle" fill="#B9C6DE" font-size="9.5" font-family="monospace">${enabled.length} 账号 · ${totalBatches} 批</text>
+      ${earliest ? `<text x="70" y="95" text-anchor="middle" fill="#F5A524" font-size="9.5" font-family="monospace">最早到期 ${new Date(earliest).toLocaleDateString().slice(5)}</text>` : ''}
+    </svg>`;
+
+    /* ---- 账号余额条 ---- */
     const accRows = enabled.map((x) => {
       const remain = accountRemainOf(x.a);
-      const batches = (x.a.creditDetail || []).filter((bt) => (bt.remain || 0) > 0 && fmtDays(bt.expireAt) !== null)
-        .sort((p, q) => fmtDays(p.expireAt) - fmtDays(q.expireAt));
-      const soon = batches[0];
-      const d = soon ? fmtDays(soon.expireAt) : null;
-      const pct = d === null ? 0 : Math.max(4, Math.min(100, Math.round(d / 30 * 100)));
-      const col = d === null ? 'var(--chip)' : d <= 7 ? 'var(--bad)' : d <= 30 ? 'var(--warn)' : 'var(--ok)';
       const active = x.site.active_account_id === x.a.id;
-      const dl = daysLeftOf(remain, dailyAvg); // T44：该账号按速率还能用几天
-      return `<div class="acctline" data-go="accounts" data-focus="${esc(x.a.id)}" title="点开管理该账号（自动定位到卡片）">
-        <b style="min-width:104px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(accNames[x.a.id] || x.a.id)}</b>
-        ${active ? '<span class="badge ok">使用中</span>' : '<span class="badge" style="visibility:hidden">占位</span>'}
-        <b style="font-size:19px;min-width:76px;text-align:right" class="${d !== null && d <= 7 ? 'warn' : ''}">${remain != null ? fmtCredit(remain) : '—'}</b>
-        ${dl !== null ? `<span class="dltag" title="按近 7 日日均 ${fmtCredit(dailyAvg)} 积分估算">≈${dl} 天</span>` : ''}
-        <div style="flex:1;min-width:130px">
-          <div class="expbar"><i style="width:${pct}%;background:${col}"></i></div>
-          <span class="muted" style="font-size:11px">${soon ? `最近批次 ${new Date(soon.expireAt).toLocaleDateString()}（${d === 0 ? '今天' : d + ' 天后'}）· 余 ${fmtCredit(soon.remain)}` : '无到期信息'}</span>
-        </div>
+      const bo = x.a.burnout || {};
+      const dl = daysLeftOf(remain, dailyAvg);
+      const hs = healthState(x.a);
+      const pct = Math.max(3, Math.min(100, Math.round((remain || 0) / Math.max(1, totalRemain) * 100)));
+      return `<div class="row" data-go="accounts" data-focus="${esc(x.a.id)}" style="grid-template-columns:6px minmax(0,1fr) auto;cursor:pointer">
+        <span class="p ${hs.cls === 'ok' ? 'ok' : hs.cls === 'warn' ? 'wn' : 'bd'}"></span>
+        <span><b style="font-weight:500">${esc(accNames[x.a.id] || x.a.id)}</b> ${active ? '<span class="tag ac">使用中</span>' : ''}
+          <div class="muted">${(x.a.creditDetail || []).filter((b) => (b.remain || 0) > 0).length} 批次${dl !== null ? ' · ≈' + dl + ' 天' : ''}${bo.riskCount > 0 ? ' · <span style="color:var(--wn)">预计浪费 ' + fmtCredit(bo.totalWaste) + '</span>' : ''}</div></span>
+        <span class="mono" style="font-size:19px">${remain != null ? fmtCredit(remain) : '—'}</span>
+      </div>
+      <div class="bar live" style="margin:2px 0 8px"><i style="width:${pct}%;background:linear-gradient(90deg,var(--ac),var(--cy))"></i></div>`;
+    }).join('');
+
+    /* ---- 批次到期分布时间轴（未来 90 天 8 段，段色按远近/风险） ---- */
+    const seg = [
+      { label: '≤7天', cls: 'd', w: 0 }, { label: '15天', cls: 'w', w: 0 },
+      { label: '31天', cls: '', w: 0 }, { label: '45天', cls: 'v', w: 0 },
+      { label: '60天', cls: '', w: 0 }, { label: '75天', cls: '', w: 0 },
+      { label: '90天', cls: 'w', w: 0 }, { label: '更远', cls: '', w: 0 },
+    ];
+    const bounds = [7, 15, 31, 45, 60, 75, 90, 36500];
+    for (const x of enabled) for (const bt of (x.a.creditDetail || [])) {
+      if ((bt.remain || 0) <= 0) continue;
+      const d = fmtDays(bt.expireAt);
+      if (d === null) continue;
+      const idx = bounds.findIndex((b) => d <= b);
+      if (idx >= 0) seg[idx].w += bt.remain;
+    }
+    const segSum = seg.reduce((s, x) => s + x.w, 0) || 1;
+    const tl = seg.map((s) => `<i class="${s.cls}" style="flex:${Math.max(1, s.w)}" title="${s.label}：${fmtCredit(s.w)} 积分"></i>`).join('');
+    const tlx = seg.map((s) => `<span style="flex:1 1 0">(${s.label})${s.w > 0 ? '.' : '.'}</span>`).join('');
+
+    /* ---- 24h 频谱（§5.2：待发生压暗区 + 现在分界 + 峰值标注） ---- */
+    const hours = usage.todayHours || [];
+    const nowHour = new Date().getHours();
+    const maxCall = Math.max(1, ...hours.map((h) => h.calls || 0));
+    const peak = hours.reduce((p, h) => (h.calls || 0) > (p.calls || 0) ? h : p, { calls: 0, hour: 0 });
+    const PLOT_X0 = 26, PLOT_X1 = 592, BASE_Y = 120, TOP_Y = 18, BAR_W = 15;
+    const slotW = (PLOT_X1 - PLOT_X0) / 24;
+    const bx = (i) => PLOT_X0 + 4.167 + i * 23.333;
+    const by = (v) => BASE_Y - Math.round((v / maxCall) * (BASE_Y - TOP_Y));
+    let bars = '';
+    for (let i = 0; i < 24; i++) {
+      if (i > nowHour) break; // 待发生区不画柱
+      const v = (hours[i] || {}).calls || 0;
+      const x = bx(i).toFixed(1), y = v > 0 ? by(v) : BASE_Y - 3, h = v > 0 ? BASE_Y - y : 3;
+      const isPeak = peak.calls > 0 && i === peak.hour;
+      bars += `<rect class="b" x="${x}" y="${y}" width="${BAR_W}" height="${Math.max(3, h)}" rx="${isPeak ? 2 : 1.5}" fill="url(#${isPeak ? 'bg1' : 'bg2'})" style="animation-delay:${500 + i * 20}ms"/>`;
+    }
+    const nowX = (PLOT_X0 + 4.167 + (nowHour + 1) * 23.333).toFixed(1);
+    const pendingW = (PLOT_X1 - Number(nowX)).toFixed(1);
+    const ticks = [0, 3, 6, 9, 12, 15, 18, 21].map((h) => {
+      const x = (bx(h) + BAR_W / 2).toFixed(1);
+      const col = h === nowHour ? '#8FE8FA' : 'var(--mu)';
+      const v = String(h).padStart(2, '0');
+      return `<text x="${x}" y="136" fill="${col}" font-size="9" text-anchor="middle" font-family="monospace">${v}</text>`;
+    }).join('');
+    const ruler = [1, 0.667, 0.333].map((f) => {
+      const y = TOP_Y + Math.round((BASE_Y - TOP_Y) * f * 0) || 0; // 三条虚线固定 y=18/52/86
+      return '';
+    });
+    const spectrum = `<svg viewBox="0 0 600 148" style="width:100%;height:auto;display:block" role="img" aria-label="24 小时调用分布">
+      <defs>
+        <linearGradient id="bg1" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--cy)"/><stop offset="100%" stop-color="var(--cy)" stop-opacity=".10"/></linearGradient>
+        <linearGradient id="bg2" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#5C6C86"/><stop offset="100%" stop-color="#5C6C86" stop-opacity=".22"/></linearGradient>
+        <linearGradient id="bgu" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="#fff" stop-opacity=".045"/><stop offset="100%" stop-color="#fff" stop-opacity=".012"/></linearGradient>
+      </defs>
+      <rect x="${nowX}" y="18" width="${pendingW}" height="102" fill="url(#bgu)"/>
+      <line x1="26" y1="18" x2="592" y2="18" stroke="rgba(120,150,220,.13)" stroke-dasharray="2 5"/>
+      <line x1="26" y1="52" x2="592" y2="52" stroke="rgba(120,150,220,.13)" stroke-dasharray="2 5"/>
+      <line x1="26" y1="86" x2="592" y2="86" stroke="rgba(120,150,220,.13)" stroke-dasharray="2 5"/>
+      <text x="21" y="21" fill="var(--mu)" font-size="8" text-anchor="end" font-family="monospace">${maxCall}</text>
+      <text x="21" y="55" fill="var(--mu)" font-size="8" text-anchor="end" font-family="monospace">${Math.round(maxCall * 0.667)}</text>
+      <text x="21" y="89" fill="var(--mu)" font-size="8" text-anchor="end" font-family="monospace">${Math.round(maxCall * 0.333)}</text>
+      <text x="21" y="123" fill="var(--mu)" font-size="8" text-anchor="end" font-family="monospace">0</text>
+      <line x1="26" y1="120" x2="592" y2="120" stroke="rgba(79,140,255,.45)" stroke-width="1"/>
+      ${bars}
+      ${peak.calls > 0 && peak.hour <= nowHour ? `<text x="${(bx(peak.hour) + BAR_W / 2).toFixed(1)}" y="13" fill="#8FE8FA" font-size="9" text-anchor="middle" font-family="monospace">${peak.calls}</text>` : ''}
+      <line x1="${nowX}" y1="18" x2="${nowX}" y2="120" stroke="rgba(150,180,255,.42)" stroke-width="1" stroke-dasharray="3 3"/>
+      <text x="${Number(nowX) + 5}" y="27" fill="var(--mu)" font-size="8.5" font-family="monospace">现在 ${String(new Date().getHours()).padStart(2, '0')}:${String(new Date().getMinutes()).padStart(2, '0')} · 之后待发生</text>
+      ${ticks}
+    </svg>`;
+
+    /* ---- 按模型今日 Top（最多 5 行） ---- */
+    const byModel = (usage.byModel || []).slice(0, 5);
+    const modelRows = byModel.map((m) => {
+      const pct = Math.round((m.credit || 0) / Math.max(0.01, today.credit || 1) * 100);
+      return `<div class="row" style="grid-template-columns:minmax(0,1fr) 64px 48px 66px">
+        <span class="ell">${esc(m.model || m.id)}</span><span class="mono">${m.calls} 次</span><span class="mono muted">${m.errors || 0} 错</span><span class="mono">${fmtCredit(m.credit)}</span>
       </div>`;
     }).join('');
 
-    // ---- 面板 2：今日自动任务（状态块 + 每账号任务摘要 + 快捷执行） ----
-    const taskTile = (name, st) => `<div class="tile">
-      <b class="${st.done ? 'ok' : st.some ? 'warn' : ''}">${st.done ? '✓ 全部完成' : st.some ? st.ok + '/' + st.total : '— 未执行'}</b>
-      <span>${name}</span></div>`;
-    let tcRows = '';
-    if (!tcSummary) tcRows = '';
-    else if (tcSummary.loading) tcRows = '<div class="muted" style="font-size:12px;margin-top:10px"><span class="spin"></span>正在读取任务进度…</div>';
-    else if (tcSummary.error) tcRows = `<div class="bad" style="font-size:12px;margin-top:10px">任务摘要读取失败：${esc(tcSummary.error)}</div>`;
-    else tcRows = tcSummary.rows.map((r) => `<div class="evline" data-go="tasks" data-focus="${esc(r.site)}|${esc(r.id)}" style="cursor:pointer" title="进任务中心并展开该账号详情">
-        <b style="font-size:12.5px;min-width:96px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.label)}</b>
-        ${r.error ? `<span class="bad" style="font-size:12px">读取失败</span>`
-          : `<span style="font-size:12.5px">待领 <b class="${r.claimable ? 'warn' : ''}">${r.claimable ?? 0}</b> · 可代打 <b>${r.playable ?? 0}</b></span>
-             <span class="muted" style="font-size:11px;margin-left:auto">数据 ${r.at ? esc(new Date(r.at).toLocaleTimeString()) : '—'}</span>`}
-      </div>`).join('');
-    const g = tasks.gainedTotal || { credit: 0, claims: 0 };
-
-    // ---- 面板 3：近 7 天消耗柱图 ----
-    const trend = recent.map((d) => {
-      const daySpeed = d.ms > 0 ? (d.completionTokens / (d.ms / 1000)).toFixed(1) + ' tok/s' : '';
-      return `<div class="col" title="${esc(d.date)}：${d.calls} 次调用，${fmtCredit(d.credit ?? 0)} 积分${daySpeed ? '，平均 ' + daySpeed : ''}"><span>${d.credit ? fmtCredit(d.credit) + '分' : ''}</span><i style="height:${Math.round((d.calls || 0) / maxCalls * 100)}%"></i><span>${esc(d.date.slice(5))}</span></div>`;
+    /* ---- 事件流（最近 5 条，状态点按 kind/文本着色） ---- */
+    const evDot = (e) => /失败|错误|401|耗尽|退出|漂移/.test(e.text) ? 'bd' : /领到|成功|启动|通过|签到/.test(e.text) ? 'ok' : /预警|过期|冷却|警告/.test(e.text) ? 'wn' : '';
+    const evRows = (evts.events || []).slice(0, 5).map((e) => {
+      const who = e.accountId && accNames[e.accountId] ? ' · ' + esc(accNames[e.accountId]) : '';
+      const evTip = `${new Date(e.at).toLocaleString()} · ${e.text}${e.site ? ' · ' + e.site : ''}${e.accountId && accNames[e.accountId] ? ' · ' + accNames[e.accountId] : ''}`;
+      return `<div class="row" title="${esc(evTip)}" style="grid-template-columns:6px 46px minmax(0,1fr)">
+        <span class="p ${evDot(e)}"></span>
+        <u class="mono muted" style="text-decoration:none">${new Date(e.at).toTimeString().slice(0, 5)}</u>
+        <span class="ell">${esc(e.text)}${e.site ? ' · ' + esc(e.site) : ''}${who}</span>
+      </div>`;
     }).join('');
 
-    // ---- 面板 4：最新事件 ----
-    const evRows = (evts.events || []).slice(0, 9).map((e) => {
-      const kind = (EVENT_KINDS.find((k) => k.id === e.kind) || {}).name || e.kind;
-      const who = e.accountId && accNames[e.accountId] ? ` · ${esc(accNames[e.accountId])}` : '';
-      return `<div class="evline"><span class="muted" style="font-size:11.5px;white-space:nowrap">${esc(new Date(e.at).toLocaleTimeString())}</span><span class="badge ${EVENT_BADGE[e.kind] || ''}" style="flex:0 0 auto">${esc(kind)}</span><span style="font-size:12.5px;overflow:hidden">${esc(e.text)}${e.site ? ` · ${esc(e.site)}` : ''}${who}</span></div>`;
-    }).join('');
-
-    // ---- 面板 5：推荐模型（巡检性价比 Top3，可直接设默认） ----
-    const mres = (modelsResp && modelsResp.data) || [];
-    const defModel = modelsResp ? modelsResp.default_model : null;
-    const hres = (health && health.results) || [];
-    const hByModel = {};
-    for (const r of hres) if (r.ok && !hByModel[r.model]) hByModel[r.model] = r; // results 已按性价比排序
-    let topModels = Object.entries(hByModel).map(([id, r]) => ({ id, site: r.site, mult: r.mult, ms: r.ms })).slice(0, 3);
-    if (!topModels.length) {
-      topModels = mres.filter((x) => !x.pending_login)
-        .sort((p, q) => (p.multiplier ?? 99) - (q.multiplier ?? 99))
-        .slice(0, 3).map((x) => ({ id: x.id, site: x.site, mult: x.multiplier, ms: null }));
+    /* ---- 底部四卡：自动任务 / 诊断 / 需关注 / 近 7 日消耗 ---- */
+    const doneOf = (map) => {
+      const ok = Object.entries(map || {}).filter(([uid, e]) => e.ok && enabled.some((x) => (x.a.uid || x.a.id) === uid)).length;
+      return { ok, total: enabled.length || 1 };
+    };
+    const ck = doneOf(tasks.checkin), gr = doneOf(tasks.growth), tv = doneOf(tasks.travel);
+    const taskDone = [ck, gr, tv].filter((x) => x.ok >= x.total && x.total > 0).length;
+    const dsum = (doctor && doctor.summary) || { pass: '—', warn: '—', fail: 0 };
+    const concerns = [];
+    for (const x of enabled) {
+      if (String(x.a.lastError || '').includes('401')) concerns.push({ cls: 'bd', tag: '重登', text: `${accNames[x.a.id] || x.a.id} · 登录态失效（401）` });
+      if (x.a.cooldownUntil && x.a.cooldownUntil > Date.now()) concerns.push({ cls: 'wn', tag: '冷却', text: `${accNames[x.a.id] || x.a.id} · 冷却至 ${new Date(x.a.cooldownUntil).toLocaleTimeString()}` });
+      if (x.a.tokenExpiresAt || x.a.expiresAt) {
+        const d = fmtDays(x.a.expiresAt);
+        if (d !== null && d >= 0 && d <= 7) concerns.push({ cls: 'wn', tag: '重登', text: `${accNames[x.a.id] || x.a.id} · token ${d} 天后到期` });
+      }
+      for (const bt of (x.a.creditDetail || [])) {
+        const d = fmtDays(bt.expireAt);
+        if (d !== null && d < 0 && (bt.remain || 0) > 0) concerns.push({ cls: 'bd', tag: '过期', text: `${accNames[x.a.id] || x.a.id} · 「${esc(bt.package || '批次')}」已过期余 ${fmtCredit(bt.remain)}` });
+      }
     }
-    const topRows = topModels.map((r) => `<div class="acctline">
-        <b style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(r.id)}</b>
-        ${r.mult === 0 ? '<span class="badge ok">免费</span>' : r.mult != null ? `<span class="badge">x${r.mult}</span>` : ''}
-        <span class="muted" style="font-size:12px;min-width:60px;text-align:right">${r.ms != null ? r.ms + ' ms' : '—'}</span>
-        ${r.id === defModel ? '<span class="badge acc">默认</span>' : `<button class="btn mini" data-setdef="${esc(r.id)}" data-site="${esc(r.site || '')}">设默认</button>`}
+    const concernRows = concerns.length
+      ? concerns.slice(0, 3).map((c) => `<div class="row" style="grid-template-columns:6px minmax(0,1fr) auto"><span class="p ${c.cls}"></span><span class="ell">${c.text}</span><span class="tag ${c.cls}" data-go="tasks" title="点击进入任务/账号处理（重登=资源池重新扫码，过期=检查批次明细）" style="cursor:pointer">${c.tag}</span></div>`).join('')
+      : '<div class="muted" style="padding:8px 2px">暂无异常 —— 一切正常</div>';
+    const max7 = Math.max(0.01, ...recent.map((d) => d.credit || 0));
+    const weekBars = recent.map((d, i) => `<i class="${d.date === today.date ? 'hi' : ''}" style="height:${Math.max(4, Math.round((d.credit || 0) / max7 * 100))}%;animation-delay:${80 + i * 60}ms" title="${esc(d.date)}：${fmtCredit(d.credit)} 积分 · ${d.calls} 次"></i>`).join('');
+    const weekDates = `<div class="muted mono" style="font-size:10px;display:flex;gap:5px">${recent.map((d) => `<span style="flex:1;text-align:center">${d.date.slice(8)}</span>`).join('')}</div>`;
+    const avg7 = recent.length ? (recent.reduce((s, d) => s + (d.credit || 0), 0) / recent.length) : 0;
+
+    /* ---- 高屏追加行：模型速览 / 任务流水 / 日志尾（仅 min-height:1300px 显示） ---- */
+    const mres = (modelsResp && modelsResp.data) || [];
+    const topModels = mres.filter((x) => !x.pending_login).sort((a, b) => (a.multiplier ?? 99) - (b.multiplier ?? 99)).slice(0, 5);
+    const modelQuick = topModels.map((m) => `<div class="row" style="grid-template-columns:minmax(0,1fr) 64px 62px">
+        <span class="ell">${esc(m.id)}</span>
+        <span class="mono" style="color:${m.multiplier === 0 ? 'var(--ok)' : (m.multiplier ?? 99) < 0.1 ? 'var(--cy)' : (m.multiplier ?? 99) > 1 ? 'var(--bd)' : 'var(--wn)'}">${m.multiplier === 0 ? 'x0.00' : m.multiplier != null ? 'x' + m.multiplier : '—'}</span>
+        <span class="tag ${m.id === (modelsResp?.default_model || '') ? 'ok' : ''}">${m.id === (modelsResp?.default_model || '') ? '默认' : '可用'}</span>
       </div>`).join('');
+    const taskFlow = (tasks.history || []).slice(0, 5).map((h) => `<div class="row" style="grid-template-columns:56px minmax(0,1fr) auto">
+        <u class="mono muted" style="text-decoration:none">${new Date(h.at).toTimeString().slice(0, 5)}</u>
+        <span class="ell">${esc(h.msg || ({ checkin: '每日签到', growth: '成长任务扫描', travel: '猫猫旅行巡逻' }[h.kind] || h.kind))}</span>
+        <span class="tag ${h.ok ? 'ok' : 'bd'}">${h.ok ? '✓' : '✗'}${h.creditGained ? ' +' + h.creditGained : ''}</span>
+      </div>`).join('');
+    const wideRow = `
+      <div class="wideonly">
+        <div class="card" style="--c:#4F8CFF">
+          <div class="h">模型速览 <span>${mres.filter((x) => !x.pending_login).length} 个 · 按倍率</span>
+            <div class="r"><a data-go="models" style="cursor:pointer;color:var(--ac);font-size:12px">全部 →</a></div></div>
+          ${modelQuick || '<div class="muted">暂无模型</div>'}
+        </div>
+        <div class="card" style="--c:#34D399">
+          <div class="h">任务流水 <span>最近记录</span>
+            <div class="r"><button class="btn" id="ovRunTasks">立即执行</button></div></div>
+          ${taskFlow || '<div class="muted">今天还没有记录</div>'}
+        </div>
+        <div class="card" style="--c:#F5A524">
+          <div class="h">最新事件 <span>系统 / 任务 / 账号</span>
+            <div class="r"><a data-go="events" style="cursor:pointer;color:var(--ac);font-size:12px">全部 →</a></div></div>
+          ${evRows || '<div class="muted">暂无事件</div>'}
+        </div>
+      </div>`;
 
     const changed = paint(el, `
-      <div class="kpis6">${kpis}</div>
-      <div class="dash">
-        <div class="card"><div class="panel-h"><b>积分与到期</b><span class="sub">策略 ${esc(bridge.policy || 'expiry-first')} · 点行管理</span><a data-go="accounts">账号管理 →</a></div>
-          ${accRows || '<div class="muted" style="padding:14px">还没有账号 —— 点右上角「账号管理 →」添加</div>'}</div>
-        <div class="card"><div class="panel-h"><b>今日自动任务</b><span class="sub">${esc(tasks.today || '')}</span><a data-go="tasks">任务中心 →</a></div>
-          <div style="display:flex;gap:10px;margin-bottom:12px">${taskTile('每日签到', ck)}${taskTile('成长任务', gr)}${taskTile('猫猫旅行', tv)}</div>
-          <div class="row" style="gap:12px;margin:0 0 12px;flex-wrap:wrap;font-size:12.5px">
-            <label class="tkswitch" title="总开关关闭后整个任务调度循环停止；手动按钮仍可用"><input type="checkbox" id="ovTkEnabled" ${(bridge.tasks || {}).enabled === false ? '' : 'checked'}> 自动任务</label>
-            <label class="tkswitch" title="关闭后每天不再自动签到"><input type="checkbox" id="ovTkCheckin" ${(bridge.tasks || {}).checkin === false ? '' : 'checked'}> 签到</label>
-            <label class="tkswitch" title="关闭后每天不再自动扫描成长任务"><input type="checkbox" id="ovTkGrowth" ${(bridge.tasks || {}).growth === false ? '' : 'checked'}> 成长</label>
+      <div class="k4">${kpis}</div>
+      <div class="g">
+        <div class="card hv tilt an" style="--c:#7B5CFF;animation-delay:240ms">
+          <div class="orbit"><i></i><u></u></div><div class="sheen"></div>
+          <div class="h">积分池 <span>${enabled.length} 账号 · ${totalBatches} 有效批次 · 策略 ${esc(bridge.policy || 'expiry-first')}${totalDays !== null ? ' · 按速率 ≈' + totalDays + ' 天' : ''}</span>
+            <div class="r"><a data-go="accounts" style="cursor:pointer;color:var(--ac);font-size:12px">账号管理 →</a></div></div>
+          <div class="mid" style="display:flex;gap:16px;align-items:center;flex-wrap:wrap">
+            ${ringSvg}
+            <div style="flex:1;min-width:220px">${accRows || '<div class="muted">还没有账号</div>'}</div>
           </div>
-          ${tcRows}
-          <div class="row" style="flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px">
-            <span class="spacer"></span>
-            <button class="btn mini" id="ovCheckin">立即签到</button>
-            <button class="btn mini" id="ovGrowth">扫描成长</button>
-            <button class="btn mini" id="ovTravel">🐾 巡逻</button>
+          <div style="margin-top:14px">
+            <div class="muted" style="margin-bottom:6px">批次到期分布 <span class="mono">${totalBatches} 批 · 未来 90 天</span></div>
+            <div class="tl">${tl}</div>
+            <div class="tlx">${tlx}</div>
           </div>
-          <div class="muted" style="font-size:11.5px;margin-top:8px">累计白嫖 ${fmtCredit(g.credit ?? 0)} 积分 · ${g.claims ?? 0} 次领奖 · 任务进度每日 09:00/15:00/21:00 自动刷新，不实时打上游</div>
         </div>
-        <div class="card"><div class="panel-h"><b>近 7 天消耗</b><span class="sub">柱高 = 调用次数 · 标注 = 积分</span><a data-go="usage">用量明细 →</a></div>
-          <div class="bars" style="height:128px">${trend || '<span class="muted">暂无数据</span>'}</div></div>
-        <div class="card"><div class="panel-h"><b>最新事件</b><span class="sub">任务 / 账号 / 策略 / 登录</span><a data-go="events">全部事件 →</a></div>
-          ${evRows || '<div class="muted" style="padding:14px">暂无事件</div>'}</div>
-        <div class="card"><div class="panel-h"><b>推荐模型</b><span class="sub">巡检可用 · 倍率低优先</span><a data-go="models">全部模型 →</a></div>
-          ${topRows || '<div class="muted" style="padding:14px">还没有模型 —— 先添加账号</div>'}</div>
-        <div class="card"><div class="panel-h"><b>快捷入口</b><span class="sub">低频功能都收在这</span></div>
-          <div style="display:flex;flex-wrap:wrap;gap:8px">
-            <button class="btn mini" data-go="settings">📖 接入配置</button>
-            <button class="btn mini" data-go="settings">⚙ 设置与运维</button>
-            <button class="btn mini" data-go="events">🔔 全部事件</button>
-            <button class="btn mini" id="ovReloadTc">↻ 刷新任务摘要</button>
-            <button class="btn mini" id="ovTheme" title="亮色/暗色切换，记住偏好；首次打开跟随系统">${document.documentElement.dataset.theme === 'light' ? '🌙 切暗色' : '☀️ 切亮色'}</button>
-          </div>
-          <div class="muted" style="font-size:11.5px;margin-top:12px">默认模型 <b>${esc(defModel || '—')}</b> · ${esc(state.base_url || '')} · v${esc(state.version || '?')}</div>
+        <div class="card hv tilt an" style="--c:#22D3EE;animation-delay:300ms">
+          <div class="h">实时遥测 <span>24h 调用频谱${peak.calls > 0 ? ' · 峰值 ' + String(peak.hour).padStart(2, '0') + ' 点 · ' + peak.calls + ' 次' : ' · 今日暂无调用'}</span></div>
+          ${spectrum}
+          <div class="h" style="margin:12px 0 6px">按模型 · 今日 <span>${byModel.length} 个模型</span></div>
+          ${modelRows || '<div class="muted" style="padding:6px 2px">今天还没有调用</div>'}
+          <div class="h" style="margin:12px 0 6px">事件流 <span>最近 5 条</span></div>
+          <div class="ticker">${evRows || '<div class="muted" style="padding:6px 2px">暂无事件</div>'}</div>
         </div>
-      </div>`);
+      </div>
+      <div class="k4b">
+        <div class="card hv tilt an" style="--c:#34D399;animation-delay:360ms">
+          <div class="k">自动任务 · 今日</div>
+          <div style="display:flex;gap:10px;align-items:baseline;margin:4px 0 6px"><span class="mono" style="font-size:22px">${taskDone}/3</span>
+            <span class="tag ${ck.ok >= ck.total ? 'ok' : ''}" data-go="tasks" title="今日签到进度 · 点击查看任务详情与手动签到" style="cursor:pointer">签到 ${ck.ok}/${ck.total}</span>
+            <span class="tag ${gr.ok >= gr.total ? 'ok' : ''}" data-go="tasks" title="今日成长任务进度 · 点击查看任务详情与手动扫描" style="cursor:pointer">成长 ${gr.ok}/${gr.total}</span></div>
+          <div class="muted">时点：签到 ${esc(((bridge.tasks || {}).checkinTimes || []).join(' ') || '09/21 点')} · 成长 ${esc(((bridge.tasks || {}).growthTimes || []).join(' ') || '01/13 点')}</div>
+        </div>
+        <div class="card hv tilt an" style="--c:#4F8CFF;animation-delay:420ms">
+          <div class="k">一键诊断</div>
+          <div style="display:flex;gap:14px;align-items:center;margin:4px 0 6px">
+            <span class="mono" style="font-size:20px;color:var(--ok);text-shadow:0 0 14px rgba(52,211,153,.5)">${dsum.pass}</span>
+            <span class="mono" style="font-size:20px;color:var(--wn);text-shadow:0 0 14px rgba(245,165,36,.45)">${dsum.warn}</span>
+            <span class="mono" style="font-size:20px;color:var(--mu)">${dsum.fail}</span>
+            <span class="sp" style="flex:1"></span><button class="btn" id="ovDoctor">重新诊断</button>
+          </div>
+          <div class="muted">通过 / 警告 / 失败 · 与 /wbp-doctor 同源</div>
+        </div>
+        <div class="card hv tilt an" style="--c:#F5A524;animation-delay:480ms">
+          <div class="k">需关注 <span class="mono" style="color:var(--mu)">${concerns.length} 项</span></div>
+          ${concernRows}
+        </div>
+        <div class="card hv tilt an" style="--c:#22D3EE;animation-delay:540ms">
+          <div class="k">近 7 日消耗 · 日均 ${fmtCredit(avg7)}</div>
+          <div class="rowsplit">${weekBars || '<i style="height:4%"></i>'}</div>
+          ${weekDates}
+          <div class="muted" style="margin-top:4px">今日 ${fmtCredit(today.credit ?? 0)} <span style="color:var(--cy)">· ${today.calls ?? 0} 次调用</span></div>
+        </div>
+      </div>
+      ${wideRow}`);
+
     if (changed) {
-      // T49：带 data-focus 的下钻目标（账号行→账号卡定位；任务摘要行→任务页切号）
+      /* 重绘时剥离 an 入场类：入场动画只配首绘，轮询重绘不整页动（用户反馈定时闪） */
+      el.querySelectorAll('.an').forEach((n) => n.classList.remove('an'));
+      /* count-up 数字（reduced-motion 下直接终值） */
+      const REDUCE = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      el.querySelectorAll('[data-count]').forEach((n) => {
+        const target = parseFloat(n.dataset.count), dec = parseInt(n.dataset.dec || '0', 10);
+        if (REDUCE || n.textContent !== '0') { n.textContent = dec ? target.toFixed(dec) : Math.round(target).toLocaleString('en-US'); return; } // 重绘/降级：直接终值，不从 0 重跑（用户反馈「整页定时闪」）
+        const dur = 850; let start = null;
+        const step = (ts) => {
+          if (start === null) start = ts;
+          const p = Math.min(1, (ts - start) / dur);
+          const val = target * (1 - Math.pow(1 - p, 3));
+          n.textContent = dec ? val.toFixed(dec) : Math.round(val).toLocaleString('en-US');
+          if (p < 1) requestAnimationFrame(step);
+        };
+        requestAnimationFrame(step);
+      });
+      /* 下钻（含 T49 focus 语义） */
       for (const a of el.querySelectorAll('[data-go]')) {
-        a.onclick = () => {
-          const focus = a.dataset.focus || null;
-          showView(a.dataset.go, focus);
-          if (a.dataset.go === 'tasks' && focus) {
-            // 任务页首渲染后把任务中心切到该账号（showView 里的通用加载不含选号逻辑）
-            setTimeout(() => {
-              const sel = $('#tcAccount');
-              if (sel && [...sel.options].some((o) => o.value === focus)) {
-                sel.value = focus;
-                localStorage.setItem('wbTcAccount', focus);
-                loadTaskCenter({ spinner: true });
-                const card = $('#tcList') && $('#tcList').closest('.card');
-                if (card) { card.classList.add('flash'); setTimeout(() => card.classList.remove('flash'), 2200); }
-              }
-            }, 600);
-          }
-        };
+        a.onclick = () => { showView(a.dataset.go, a.dataset.focus || null); };
       }
-      for (const b of el.querySelectorAll('[data-setdef]')) {
-        b.onclick = async () => {
-          b.disabled = true; b.textContent = '设置中…';
-          try {
-            await api('/default-model', { method: 'POST', body: { model: b.dataset.setdef, site: b.dataset.site } });
-            toast('默认模型 → ' + b.dataset.setdef, 'ok');
-            loadHeader();
-            loadOverview();
-          } catch (e) { toast('设置失败：' + e.message, 'bad'); b.disabled = false; b.textContent = '设默认'; }
-        };
-      }
-      const rt = $('#ovReloadTc'); if (rt) rt.onclick = () => { tcSummary = null; void loadTcSummary(); };
-      // T45：亮/暗主题切换（写 localStorage 记忆；引导脚本已在首帧前设好初始值）
-      const th = $('#ovTheme');
-      if (th) th.onclick = () => {
-        const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
-        document.documentElement.dataset.theme = next;
-        try { localStorage.setItem('wbTheme', next); } catch { /* 隐私模式等 */ }
-        th.textContent = next === 'light' ? '🌙 切暗色' : '☀️ 切亮色';
+      const doc2 = $('#ovDoctor'); if (doc2) doc2.onclick = async () => {
+        doc2.disabled = true;
+        try { const d = await api('/doctor'); toast(`诊断：${d.summary.pass} 通过 / ${d.summary.warn} 警告 / ${d.summary.fail} 失败`, d.summary.fail ? 'bad' : 'ok'); }
+        catch (e) { toast('诊断失败：' + e.message, 'bad'); }
+        doc2.disabled = false;
       };
-      const bind = (id, kind) => { const b = $(id); if (b) b.onclick = () => runTask(kind); };
-      bind('#ovCheckin', 'checkin'); bind('#ovGrowth', 'growth'); bind('#ovTravel', 'travel');
-      // T42：大屏自动任务开关（切换后重画大屏让 tile 状态与开关同步）
-      for (const [id, key] of [['ovTkEnabled', 'enabled'], ['ovTkCheckin', 'checkin'], ['ovTkGrowth', 'growth']]) {
-        bindTaskSwitch(id, key, () => { loadOverview(); loadTasks().catch(() => {}); });
-      }
+      const rt = $('#ovRunTasks'); if (rt) rt.onclick = () => runTask('all');
     }
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
@@ -1585,7 +1772,8 @@ async function loadEvents() {
     const rows = list.map((e) => {
       const kind = (EVENT_KINDS.find((k) => k.id === e.kind) || {}).name || e.kind;
       const who = e.accountId && accNames[e.accountId] ? ` · ${esc(accNames[e.accountId])}` : (e.accountId ? ` · ${esc(String(e.accountId).slice(0, 12))}` : '');
-      return `<tr>
+      const tip = `${new Date(e.at).toLocaleString()} · ${e.text}${e.site ? ' · ' + e.site : ''}${e.accountId && accNames[e.accountId] ? ' · ' + accNames[e.accountId] : ''}`;
+      return `<tr title="${esc(tip)}">
         <td class="muted" style="white-space:nowrap">${esc(new Date(e.at).toLocaleString())}</td>
         <td style="width:74px"><span class="badge ${EVENT_BADGE[e.kind] || ''}">${esc(kind)}</span></td>
         <td>${esc(e.text)}${e.site ? ` <span class="badge">${esc(e.site)}</span>` : ''}${who}</td>
@@ -2153,3 +2341,4 @@ setInterval(loadAlerts, 60000); // 预警条独立于页签轮询，切页不被
 })();
 
 showView(parseHash());
+document.body.classList.add('hud-on'); // HUD 重设计层：环境背景/侧栏/状态条配色由此激活

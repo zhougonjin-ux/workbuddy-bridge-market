@@ -129,7 +129,7 @@ input[type=date]{color-scheme:var(--colorscheme)}
 .kpi2{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px;min-width:0}
 .kpi2 b{font-size:25px;display:block;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .kpi2 span{color:var(--muted);font-size:12px;display:block;margin-top:2px}
-.dash{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.dash{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
 .dash>.card{margin-bottom:0;min-width:0}
 .panel-h{display:flex;align-items:baseline;gap:10px;margin-bottom:10px;flex-wrap:wrap}
 .panel-h b{font-size:13.5px}
@@ -220,3 +220,717 @@ details.secd[open]>summary{border-bottom:1px solid var(--line);margin-bottom:12p
   .bars{height:64px}
   h2{margin:12px 0 6px}
 }
+
+/* ==================================================================
+ * ===== HUD 重设计层（2026-10-04，CONSOLE-REDESIGN-PROMPT.md）=====
+ * 只追加不清空：上面全部旧类保持原样（app.js 内联样式依赖它们）。
+ * ================================================================== */
+
+/* ---------- §2 设计令牌：暗色档新增 HUD 变量（旧变量原值不动） ---------- */
+[data-theme='dark']{
+  --hud-bg:#06080E;
+  --edge:rgba(120,150,220,.18);
+  --hair:rgba(120,150,220,.12);
+  --tx:#E8EDF7;
+  --mu:#93A3BF;          /* 次要文字。低于此值在暗底上不可读，禁止调暗 */
+  --ac:#4F8CFF;          /* 蓝：常态 / 峰值 */
+  --cy:#22D3EE;          /* 青：实时 / 今日 */
+  --vi:#7B5CFF;          /* 紫：远期批次 */
+  --ok:#34D399;          /* 绿：健康 / 通过 */
+  --wn:#F5A524;          /* 橙：预警 / 近期到期 */
+  --bd:#F87171;          /* 红：已清零 / 失败 */
+  --mx:50%; --my:20%;
+  --ease:cubic-bezier(.215,.61,.355,1);
+}
+
+/* ---------- §2.2 亮色档：HUD 变量重定义为浅色方案，辉光弱化 ---------- */
+[data-theme='light']{
+  --hud-bg:#EEF1F7;
+  --edge:rgba(38,64,120,.22);
+  --hair:rgba(38,64,120,.14);
+  --tx:#1A2233;
+  --mu:#4E5B74;          /* 浅底上的次要文字，保证对比度 */
+  --ac:#2F6DE0;
+  --cy:#0891B2;
+  --vi:#6D4FD8;
+  --ok:#0E9F6E;
+  --wn:#B45309;
+  --bd:#DC2626;
+  --mx:50%; --my:20%;
+  --ease:cubic-bezier(.215,.61,.355,1);
+}
+
+/* ---------- HUD 环境：背景 / 粒子层 / 透视网格 / 聚光灯 / 扫描线 / 暗角 ---------- */
+body.hud-on{
+  background-color:var(--hud-bg);
+  background-image:
+    radial-gradient(700px 360px at 6% -12%,rgba(79,140,255,.20),transparent 70%),
+    radial-gradient(560px 320px at 102% 106%,rgba(34,211,238,.14),transparent 70%),
+    radial-gradient(420px 260px at 70% 8%,rgba(123,92,255,.10),transparent 70%);
+  background-attachment:fixed;
+}
+#fx{position:fixed;inset:0;width:100%;height:100%;z-index:0;pointer-events:none}
+.floor{
+  position:fixed;left:-30%;right:-30%;bottom:-6%;height:56vh;z-index:0;pointer-events:none;opacity:.42;
+  perspective:400px;perspective-origin:50% 0%;
+  background-image:
+    linear-gradient(rgba(79,140,255,.30) 1px,transparent 1px),
+    linear-gradient(90deg,rgba(79,140,255,.22) 1px,transparent 1px);
+  background-size:64px 64px;
+  transform:rotateX(74deg);transform-origin:50% 0;
+  -webkit-mask-image:linear-gradient(to top,#000 0%,rgba(0,0,0,.35) 40%,transparent 78%);
+  mask-image:linear-gradient(to top,#000 0%,rgba(0,0,0,.35) 40%,transparent 78%);
+  animation:floorRun 7s linear infinite;
+}
+@keyframes floorRun{to{background-position:0 64px,64px 0}}
+#glow{
+  position:fixed;inset:0;z-index:0;pointer-events:none;mix-blend-mode:screen;
+  background:radial-gradient(340px 340px at var(--mx) var(--my),rgba(79,140,255,.13),transparent 68%);
+  transition:opacity .4s ease;
+}
+.scan{
+  position:fixed;left:0;right:0;top:0;height:190px;z-index:3;pointer-events:none;
+  background:linear-gradient(180deg,transparent,rgba(34,211,238,.045) 44%,rgba(150,215,255,.10) 50%,rgba(34,211,238,.045) 56%,transparent);
+  animation:scanRun 7.5s linear infinite;
+}
+@keyframes scanRun{from{transform:translateY(-200px)}to{transform:translateY(108vh)}}
+.vig{position:fixed;inset:0;z-index:3;pointer-events:none;
+  background:radial-gradient(120% 90% at 50% 45%,transparent 55%,rgba(0,0,0,.55) 100%)}
+
+/* ---------- §4 布局：侧栏 + 主区栅格（全部 minmax(0,1fr)，禁裸 1fr） ---------- */
+.app{position:relative;z-index:4;display:grid;grid-template-columns:212px minmax(0,1fr);gap:12px;max-width:1460px;margin:0 auto;padding:14px}
+.side{
+  position:sticky;top:14px;align-self:start;
+  background:linear-gradient(180deg,rgba(255,255,255,.07),rgba(255,255,255,.02));
+  border:1px solid var(--edge);border-radius:14px;padding:14px 12px;
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  box-shadow:0 18px 50px rgba(0,0,0,.45),inset 0 1px 0 rgba(255,255,255,.06);
+}
+.brand2{display:flex;align-items:center;gap:9px;margin-bottom:14px}
+.side .logo{
+  width:32px;height:32px;border-radius:10px;flex:none;position:relative;
+  background:linear-gradient(140deg,var(--ac),var(--vi));
+  display:flex;align-items:center;justify-content:center;font-size:12px;color:#fff;
+  box-shadow:0 0 18px rgba(79,140,255,.55);overflow:hidden;
+}
+.side .logo::after{
+  content:"";position:absolute;top:-60%;left:-60%;width:60%;height:220%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.65),transparent);
+  transform:skewX(-20deg);animation:logoSweep 3.6s ease-in-out infinite;
+}
+@keyframes logoSweep{0%{left:-60%}55%,100%{left:130%}}
+.btitle{font-size:13px;font-weight:500;line-height:1.3;color:var(--tx)}
+.bsub{font-size:11px;color:var(--mu);font-family:ui-monospace,Menlo,monospace}
+.nav{display:flex;flex-direction:column;gap:3px}
+.nav button{
+  position:relative;display:flex;align-items:center;gap:9px;width:100%;
+  font-family:inherit;font-size:13px;color:var(--mu);
+  background:none;border:0;border-radius:9px;padding:9px 10px;cursor:pointer;text-align:left;
+  transition:background 160ms ease,color 160ms ease,transform 160ms var(--ease);
+}
+.nav button svg{width:15px;height:15px;flex:none;opacity:.75}
+.nav button:hover{background:rgba(255,255,255,.06);color:var(--tx)}
+.nav button.on{
+  background:linear-gradient(90deg,rgba(79,140,255,.20),rgba(79,140,255,.04));color:var(--tx);
+  box-shadow:inset 2px 0 0 var(--ac),0 0 18px rgba(79,140,255,.12);
+}
+.nav button.on svg{opacity:1;color:var(--cy);filter:drop-shadow(0 0 6px rgba(34,211,238,.7))}
+.nav button .n2{margin-left:auto;font-size:10px;font-family:ui-monospace,Menlo,monospace;color:var(--mu);opacity:.7}
+.srv{margin-top:14px;padding-top:12px;border-top:1px solid var(--hair);font-size:11px;color:var(--mu);line-height:1.8}
+.srv b{color:var(--ok);font-weight:500;text-shadow:0 0 10px rgba(52,211,153,.5)}
+.sn{margin-top:14px;padding-top:12px;border-top:1px solid var(--hair);display:flex;flex-direction:column;gap:7px}
+.sn div{display:flex;justify-content:space-between;font-size:11px;color:var(--mu)}
+.sn b{color:var(--tx);font-weight:500;font-family:ui-monospace,Menlo,monospace}
+.side .grow{flex:0 1 auto}
+
+.main{min-width:0;display:flex;flex-direction:column;gap:12px}
+main{max-width:none;padding:0}
+section{display:flex;flex-direction:column;gap:12px;min-height:0}
+
+/* ---------- HUD 顶栏 ---------- */
+.topbar{
+  display:flex;align-items:center;gap:9px;flex-wrap:wrap;padding:10px 14px;position:relative;overflow:hidden;
+  background:rgba(11,16,25,.74);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  border:1px solid var(--edge);border-radius:14px;
+}
+.topbar::after{
+  content:"";position:absolute;left:0;bottom:0;height:1px;width:38%;
+  background:linear-gradient(90deg,transparent,var(--cy),#fff,var(--cy),transparent);
+  animation:bus 3.8s linear infinite;opacity:.75;
+}
+@keyframes bus{from{transform:translateX(-120%)}to{transform:translateX(320%)}}
+.crumb{font-size:14px;font-weight:500;display:flex;align-items:baseline;gap:8px;color:var(--tx)}
+.glitch{position:relative}
+.glitch::before,.glitch::after{content:attr(data-t);position:absolute;left:0;top:0;opacity:0;pointer-events:none}
+.glitch.go::before{color:var(--cy);animation:gA 260ms steps(2) 2}
+.glitch.go::after{color:var(--bd);animation:gB 260ms steps(2) 2}
+@keyframes gA{0%,100%{transform:none;opacity:0}50%{transform:translate(-2px,1px);opacity:.85}}
+@keyframes gB{0%,100%{transform:none;opacity:0}50%{transform:translate(2px,-1px);opacity:.75}}
+.crumb span{color:var(--mu);font-weight:400;font-size:12px}
+.sp{flex:1;min-width:0}
+.chip{
+  display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--mu);
+  background:rgba(255,255,255,.03);border:1px solid var(--edge);border-radius:999px;padding:4px 10px;
+  font-variant-numeric:tabular-nums;white-space:nowrap;
+}
+.chip b{color:var(--tx);font-weight:500}
+.topbar .dot,.foot .dot{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px var(--ok);animation:pulse 1.8s ease-in-out infinite}
+.topbar .dot.off{background:var(--bd);box-shadow:0 0 8px var(--bd)}
+@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.3;transform:scale(.75)}}
+.p{width:6px;height:6px;border-radius:50%;background:var(--ac);box-shadow:0 0 8px var(--ac);display:inline-block;flex:none}
+.p.ok{background:var(--ok);box-shadow:0 0 8px var(--ok)}
+.p.wn{background:var(--wn);box-shadow:0 0 8px var(--wn)}
+.p.bd{background:var(--bd);box-shadow:0 0 8px var(--bd)}
+
+/* HUD 语境下的主操作按钮（旧 .btn 保留） */
+.topbar .btn.pri{border-color:rgba(34,211,238,.45);background:rgba(34,211,238,.12);color:var(--cy)}
+.topbar .btn.pri:hover{box-shadow:0 0 18px rgba(34,211,238,.32)}
+.ripple{position:absolute;border-radius:50%;transform:translate(-50%,-50%) scale(0);pointer-events:none;
+  background:radial-gradient(circle,rgba(255,255,255,.55),rgba(34,211,238,.25) 60%,transparent 70%);
+  animation:rip 520ms var(--ease) forwards}
+@keyframes rip{to{transform:translate(-50%,-50%) scale(1);opacity:0}}
+
+/* ---------- §5.1 HUD 卡片（作用域限定 .hudview，不碰旧页面卡片） ---------- */
+.hudview .card{
+  position:relative;
+  background:linear-gradient(180deg,rgba(255,255,255,.078),rgba(255,255,255,.026));
+  border:1px solid var(--edge);border-radius:14px;
+  backdrop-filter:blur(7px);-webkit-backdrop-filter:blur(7px);
+  transform-style:preserve-3d;
+  transition:box-shadow 240ms ease,border-color 240ms ease,transform 240ms var(--ease);
+}
+.hudview .card.tilt{transition:transform 150ms linear,box-shadow 240ms ease,border-color 240ms ease}
+.hudview .card::before{
+  content:"";position:absolute;left:12%;right:12%;top:-1px;height:1px;
+  background:linear-gradient(90deg,transparent,var(--c,var(--ac)),transparent);opacity:.9;
+}
+.hudview .card::after{
+  content:"";position:absolute;inset:0;border-radius:14px;pointer-events:none;opacity:.5;
+  background:
+    linear-gradient(var(--c,var(--ac)),var(--c,var(--ac))) left top/1px 14px no-repeat,
+    linear-gradient(var(--c,var(--ac)),var(--c,var(--ac))) left top/14px 1px no-repeat,
+    linear-gradient(var(--c,var(--ac)),var(--c,var(--ac))) right bottom/1px 14px no-repeat,
+    linear-gradient(var(--c,var(--ac)),var(--c,var(--ac))) right bottom/14px 1px no-repeat;
+}
+.orbit{position:absolute;inset:0;border-radius:14px;overflow:hidden;pointer-events:none;padding:1px;
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;
+  mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);mask-composite:exclude}
+.orbit i{position:absolute;left:50%;top:50%;width:195%;aspect-ratio:1;
+  background:conic-gradient(from 0deg,transparent 0 56%,rgba(34,211,238,0) 62%,var(--cy) 72%,#EAF9FF 76%,var(--cy) 80%,transparent 88% 100%);
+  animation:spin 6s linear infinite;transform:translate(-50%,-50%)}
+.orbit u{position:absolute;left:50%;top:50%;width:130%;aspect-ratio:1;
+  background:conic-gradient(from 180deg,transparent 0 68%,var(--vi) 80%,transparent 92%);
+  animation:spin 9s linear infinite reverse;transform:translate(-50%,-50%)}
+@keyframes spin{from{transform:translate(-50%,-50%) rotate(0)}to{transform:translate(-50%,-50%) rotate(360deg)}}
+.sheen{position:absolute;inset:0;border-radius:14px;overflow:hidden;pointer-events:none}
+.sheen::after{content:"";position:absolute;top:-40%;bottom:-40%;left:0;width:32%;
+  background:linear-gradient(100deg,transparent,rgba(255,255,255,.10) 42%,rgba(34,211,238,.20) 55%,transparent);
+  transform:translateX(-180%) skewX(-18deg);opacity:0}
+@media (hover:hover){
+  .hudview .card.hv:hover .sheen::after{animation:sweep 900ms var(--ease);opacity:1}
+  .hudview .card.hv:hover{border-color:rgba(79,140,255,.45);box-shadow:0 0 0 1px rgba(79,140,255,.14),0 14px 38px rgba(0,0,0,.45),0 0 26px rgba(79,140,255,.10)}
+}
+@keyframes sweep{from{transform:translateX(-180%) skewX(-18deg)}to{transform:translateX(420%) skewX(-18deg)}}
+
+/* ---------- HUD 语境通用文字/栅格 ---------- */
+.h{font-size:13px;font-weight:500;margin-bottom:10px;display:flex;align-items:center;gap:8px;color:var(--tx)}
+.h::before{content:"";width:3px;height:12px;border-radius:2px;background:var(--ac);box-shadow:0 0 8px var(--ac);animation:blink 2.4s ease-in-out infinite}
+@keyframes blink{0%,100%{opacity:.5}50%{opacity:1;box-shadow:0 0 14px var(--ac)}}
+.h span{font-size:11px;color:var(--mu);font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
+.h .r{margin-left:auto;display:flex;gap:6px;align-items:center}
+.mono{font-family:ui-monospace,Menlo,monospace;font-variant-numeric:tabular-nums}
+.hudview .muted{color:var(--mu);font-size:12px}
+.k4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.k2{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.k3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+.k4b{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}
+.g{display:grid;grid-template-columns:minmax(0,1.32fr) minmax(0,1fr);gap:12px}
+.k{font-size:12px;color:var(--mu)}
+.v{font-size:26px;font-weight:500;font-variant-numeric:tabular-nums;margin:3px 0 4px;font-family:ui-monospace,Menlo,monospace;color:var(--tx)}
+.v.glow{text-shadow:0 0 22px rgba(79,140,255,.5);animation:breathe 4.2s ease-in-out infinite}
+@keyframes breathe{0%,100%{text-shadow:0 0 16px rgba(79,140,255,.35)}50%{text-shadow:0 0 30px rgba(120,180,255,.75)}}
+.spark{width:100%;height:26px;display:block;margin-top:2px}
+.spark path.l{stroke-dasharray:200;stroke-dashoffset:200;animation:draw 1.4s var(--ease) forwards .2s}
+@keyframes draw{to{stroke-dashoffset:0}}
+
+.tag{font-size:11px;border-radius:6px;padding:1px 6px;border:1px solid var(--edge);color:var(--mu);font-variant-numeric:tabular-nums;white-space:nowrap}
+.tag.ok{color:var(--ok);border-color:rgba(52,211,153,.4);background:rgba(52,211,153,.08)}
+.tag.wn{color:var(--wn);border-color:rgba(245,165,36,.4);background:rgba(245,165,36,.08)}
+.tag.bd{color:var(--bd);border-color:rgba(248,113,113,.4);background:rgba(248,113,113,.08)}
+.tag.ac{color:var(--ac);border-color:rgba(79,140,255,.4);background:rgba(79,140,255,.1)}
+
+.hudview .row{display:grid;gap:8px;align-items:center;font-size:12px;padding:8px 6px;border-radius:8px;border-top:1px solid var(--hair);transition:background 150ms ease}
+.hudview .row:first-child{border-top:0}
+.hudview .row.head{color:var(--mu);font-size:11px;padding-bottom:4px}
+@media (hover:hover){.hudview .row:not(.head):hover{background:rgba(79,140,255,.09)}}
+.ell{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+
+.bar{height:4px;border-radius:999px;background:rgba(255,255,255,.07);overflow:hidden;position:relative}
+.bar i{display:block;height:100%;border-radius:999px;position:relative;overflow:hidden}
+.bar.live i::after{content:"";position:absolute;top:0;bottom:0;left:0;width:34%;
+  background:linear-gradient(90deg,transparent,rgba(255,255,255,.6),transparent);animation:shine 2.6s linear infinite}
+@keyframes shine{from{transform:translateX(-120%)}to{transform:translateX(320%)}}
+
+.seg{display:inline-flex;gap:4px;background:rgba(255,255,255,.04);border:1px solid var(--edge);border-radius:9px;padding:3px}
+.seg button{font-family:inherit;font-size:12px;cursor:pointer;border:0;border-radius:7px;padding:4px 10px;
+  background:none;color:var(--mu);transition:background 150ms ease,color 150ms ease}
+.seg button.on{background:rgba(79,140,255,.2);color:var(--tx);box-shadow:inset 0 0 0 1px rgba(79,140,255,.35)}
+.segbar{display:flex;align-items:center}
+
+rect.b{transform-box:fill-box;transform-origin:50% 100%;animation:grow 700ms var(--ease) both}
+@keyframes grow{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+.cur{animation:curSweep 4.6s linear infinite}
+@keyframes curSweep{from{transform:translateX(0)}to{transform:translateX(546px)}}
+
+.an{opacity:0;transform:translateY(10px);animation:up 460ms var(--ease) forwards}
+@keyframes up{to{opacity:1;transform:none}}
+.warp{animation:warp 320ms var(--ease)}
+@keyframes warp{0%{opacity:0;transform:translateY(12px) scale(.994)}60%{opacity:1}100%{opacity:1;transform:none}}
+.tick{animation:tickIn 520ms var(--ease)}
+@keyframes tickIn{from{opacity:0;transform:translateX(-10px);background:rgba(34,211,238,.16)}to{opacity:1;transform:none;background:transparent}}
+
+.rowsplit{display:flex;align-items:flex-end;gap:5px;height:64px;margin:6px 0 2px}
+.rowsplit i{flex:1;border-radius:3px 3px 0 0;background:linear-gradient(180deg,rgba(79,140,255,.75),rgba(79,140,255,.12));transform-origin:50% 100%;animation:grow2 680ms var(--ease) both}
+.rowsplit i.hi{background:linear-gradient(180deg,rgba(34,211,238,.85),rgba(34,211,238,.12))}
+@keyframes grow2{from{transform:scaleY(0)}to{transform:scaleY(1)}}
+
+/* ---------- §5.3 批次到期分布时间轴 ---------- */
+.tl{--tl-bri:.6;display:flex;gap:4px;height:24px;border-radius:9px;padding:3px;
+  background:rgba(255,255,255,.04);box-shadow:inset 0 0 0 1px rgba(150,180,255,.10)}
+.tl i{position:relative;border-radius:6px;overflow:hidden;opacity:var(--tl-bri);
+  background:linear-gradient(180deg,#AFC9FF 0%,#6499FF 48%,#3C6ED6 100%);
+  box-shadow:0 0 10px rgba(79,140,255,.3),0 2px 6px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.4)}
+.tl i::after{content:"";position:absolute;inset:0;width:40%;background:linear-gradient(90deg,transparent,rgba(255,255,255,.45),transparent);animation:shine 3.2s linear infinite}
+.tl i.v{background:linear-gradient(180deg,#CDB8FF 0%,#8E6EFF 48%,#6A46E0 100%);
+  box-shadow:0 0 10px rgba(123,92,255,.3),0 2px 6px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.4)}
+.tl i.w{background:linear-gradient(180deg,#FFDD97 0%,#F7AB2C 48%,#CB7F0D 100%);
+  box-shadow:0 0 10px rgba(245,165,36,.3),0 2px 6px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.4)}
+.tl i.d{background:linear-gradient(180deg,#FFB8B8 0%,#F87676 48%,#CB4C4C 100%);
+  box-shadow:0 0 10px rgba(248,113,113,.3),0 2px 6px rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.4)}
+.tlx{display:flex;gap:4px;padding:0 3px;margin-top:6px;font-size:10px;color:#98A6C3;font-family:ui-monospace,Menlo,monospace;letter-spacing:.2px}
+.tlx span{text-align:center;white-space:nowrap;overflow:hidden;min-width:0}
+
+/* ---------- 贴底状态条 + 悬浮操作坞 ---------- */
+.foot{
+  position:sticky;bottom:0;z-index:6;
+  display:flex;align-items:center;gap:6px 16px;flex-wrap:wrap;
+  font-size:11px;color:var(--mu);line-height:1.5;
+  padding:9px 14px;border-radius:12px;
+  border:1px solid var(--edge);
+  background:linear-gradient(180deg,rgba(16,22,36,.86),rgba(10,14,24,.92));
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px);
+  box-shadow:0 -8px 30px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.07);
+}
+.foot b{color:var(--tx);font-weight:500;font-family:ui-monospace,Menlo,monospace}
+.foot .sb{display:inline-flex;align-items:center;gap:6px;color:#B7C4DC}
+.foot .sbsep{width:1px;height:12px;background:var(--hair);flex:none}
+.foot .fnote{color:#6F7D97}
+.dock{position:fixed;right:18px;bottom:18px;z-index:9;display:flex;flex-direction:column-reverse;align-items:flex-end;gap:8px}
+.dock .fab{
+  width:46px;height:46px;border-radius:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  border:1px solid rgba(34,211,238,.4);background:linear-gradient(150deg,rgba(34,211,238,.22),rgba(79,140,255,.18));
+  color:var(--cy);font-size:18px;backdrop-filter:blur(8px);box-shadow:0 0 24px rgba(34,211,238,.22);
+  transition:transform 200ms var(--ease),box-shadow 200ms ease;
+}
+.dock .fab:hover{transform:translateY(-2px) scale(1.04);box-shadow:0 0 32px rgba(34,211,238,.4)}
+.dock .items{display:flex;flex-direction:column;gap:7px;opacity:0;transform:translateY(10px) scale(.96);pointer-events:none;
+  transition:opacity 220ms ease,transform 220ms var(--ease)}
+.dock.open .items{opacity:1;transform:none;pointer-events:auto}
+.dock .items button{
+  font-family:inherit;font-size:12px;cursor:pointer;white-space:nowrap;
+  border:1px solid var(--edge);border-radius:9px;padding:7px 12px;color:var(--tx);
+  background:rgba(14,19,29,.9);backdrop-filter:blur(8px);
+  box-shadow:0 8px 22px rgba(0,0,0,.4);transition:transform 140ms var(--ease),background 160ms ease;text-align:right;
+}
+.dock .items button:hover{background:rgba(79,140,255,.22);transform:translateX(-3px)}
+
+/* ---------- 亮色档 HUD 适配：辉光弱化、环境层降噪 ---------- */
+[data-theme='light'] body.hud-on{
+  background-image:
+    radial-gradient(700px 360px at 6% -12%,rgba(47,109,224,.10),transparent 70%),
+    radial-gradient(560px 320px at 102% 106%,rgba(8,145,178,.08),transparent 70%);
+}
+[data-theme='light'] .floor{opacity:.12}
+[data-theme='light'] #glow{opacity:.25}
+[data-theme='light'] .scan{opacity:.25}
+[data-theme='light'] .vig{background:radial-gradient(120% 90% at 50% 45%,transparent 62%,rgba(30,42,66,.18) 100%)}
+[data-theme='light'] .side{background:rgba(255,255,255,.72);box-shadow:0 12px 34px rgba(30,42,66,.12),inset 0 1px 0 rgba(255,255,255,.8)}
+[data-theme='light'] .nav button:hover{background:rgba(38,64,120,.06)}
+[data-theme='light'] .nav button.on{background:linear-gradient(90deg,rgba(47,109,224,.14),rgba(47,109,224,.03));box-shadow:inset 2px 0 0 var(--ac),0 0 12px rgba(47,109,224,.08)}
+[data-theme='light'] .nav button.on svg{color:var(--cy);filter:none}
+[data-theme='light'] .side .logo{box-shadow:0 2px 10px rgba(47,109,224,.35)}
+[data-theme='light'] .side .logo::after{display:none}
+[data-theme='light'] .topbar{background:rgba(255,255,255,.78)}
+[data-theme='light'] .topbar::after{opacity:.4}
+[data-theme='light'] .topbar .dot{box-shadow:none;animation:none}
+[data-theme='light'] .hudview .card{background:rgba(255,255,255,.82)}
+[data-theme='light'] .hudview .card::before{opacity:.5}
+[data-theme='light'] .hudview .card::after{opacity:.3}
+[data-theme='light'] .hudview .card.hv:hover{box-shadow:0 10px 26px rgba(30,42,66,.14),0 0 0 1px rgba(47,109,224,.16)}
+[data-theme='light'] .v.glow{text-shadow:none;animation:none}
+[data-theme='light'] .srv b{text-shadow:none}
+[data-theme='light'] .p{box-shadow:none}
+[data-theme='light'] .foot{background:rgba(255,255,255,.88);box-shadow:0 -6px 20px rgba(30,42,66,.10)}
+[data-theme='light'] .foot b{color:var(--tx)}
+[data-theme='light'] .foot .sb{color:#3E4B64}
+[data-theme='light'] .foot .fnote{color:#7A8699}
+[data-theme='light'] .bar{background:rgba(38,64,120,.10)}
+[data-theme='light'] .bar.live i::after{background:linear-gradient(90deg,transparent,rgba(255,255,255,.85),transparent)}
+[data-theme='light'] .tl{background:rgba(38,64,120,.06);box-shadow:inset 0 0 0 1px rgba(38,64,120,.14)}
+[data-theme='light'] .tl i{box-shadow:0 1px 4px rgba(30,42,66,.2),inset 0 1px 0 rgba(255,255,255,.5)}
+[data-theme='light'] .dock .fab{background:linear-gradient(150deg,rgba(8,145,178,.18),rgba(47,109,224,.14));box-shadow:0 4px 14px rgba(8,145,178,.25)}
+[data-theme='light'] .dock .items button{background:rgba(255,255,255,.94);box-shadow:0 6px 16px rgba(30,42,66,.16)}
+[data-theme='light'] .chip{background:rgba(38,64,120,.04)}
+
+/* ---------- §4 断点 ---------- */
+.wideonly,.wideonly-in{display:none}
+.sidenote{display:none}
+@media (max-width:1180px){
+  .app{grid-template-columns:64px minmax(0,1fr)}
+  .side{padding:14px 8px}
+  .btitle,.bsub,.nav button span,.nav button .n2,.srv,.sidenote{display:none}
+  .nav button{justify-content:center;padding:10px 0}
+  .k4,.k4b{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .g{grid-template-columns:minmax(0,1fr)}
+  .foot .opt{display:none}
+  .foot{padding-right:56px}
+}
+@media (max-width:760px){
+  .app{grid-template-columns:minmax(0,1fr);gap:10px;padding:10px}
+  .side{position:static;order:2;padding:8px}
+  .nav{flex-direction:row;justify-content:space-between;gap:4px}
+  .nav button{flex:1;justify-content:center;padding:9px 0}
+  .main{order:1}
+  .k4,.k2,.k3,.k4b,.g{grid-template-columns:minmax(0,1fr)}
+  .brand2{display:none}
+  .floor{opacity:.22}
+  .dock{right:12px;bottom:12px}
+  .foot .opt2{display:none}
+  .foot{gap:4px 12px}
+  .mid>div{min-width:0 !important}
+  .h{flex-wrap:wrap;row-gap:8px}
+  .v{font-size:22px}
+  .hudview .card{padding:12px}
+  .svgwrap{overflow-x:auto}
+}
+
+/* ---------- §4 高度分档：媒体查询的 height 即视口高（= innerHeight） ---------- */
+@media (min-width:1181px) and (min-height:840px){
+  .app{min-height:calc(100vh - 28px)}
+  .side{align-self:stretch;display:flex;flex-direction:column}
+  .side .grow{flex:1 1 auto;min-height:14px}
+  .main{min-height:0}
+  .sidenote{display:block}
+  .foot{margin-top:auto}
+}
+@media (min-width:1181px) and (min-height:1040px){
+  .wideonly-in{display:block}
+}
+@media (min-width:1181px) and (min-height:1300px){
+  .wideonly{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}
+}
+@media (min-height:900px) and (min-width:1181px){
+  .side{font-size:12px}
+}
+
+/* ---------- §6.1 降级（reduced-motion）：只隐藏装饰层，绝不隐藏内容 ---------- */
+@media (prefers-reduced-motion:reduce){
+  .an{animation:none;opacity:1;transform:none}
+  .floor,.scan,#glow{display:none}
+  .logo::after,.topbar::after,.cur,.orbit i,.orbit u{display:none}
+  .sig i,.v.glow,.h::before,.topbar .dot,.foot .dot,.bar.live i::after,.ripple,.rowsplit i,.tl i::after{animation:none}
+  .rowsplit i{transform:none}
+  rect.b{animation:none}
+  .spark path.l{stroke-dashoffset:0;animation:none}
+  .sig i{height:10px}
+  .hudview .card,.btn,.hudview .row,.seg button,.dock .items,.dock .fab{transition:none}
+}
+
+/* ---------- HUD 模式下的旧 header 降级：预警条保留（常驻价值），品牌/服务信息与 topbar 重复故收起 ---------- */
+body.hud-on header.legacy-header .brand,
+body.hud-on header.legacy-header #srvMeta{display:none}
+body.hud-on header.legacy-header{padding:0 0 6px;border-bottom:none;background:none}
+body.hud-on header.legacy-header:has(#alerts:empty){display:none}
+
+/* ---------- 窄屏溢出根治（§4 判据 scrollWidth<=innerWidth）：
+   topbar/foot 的 flex 子项不收缩时会把整行撑出视口 —— 允许 chip 收缩截断 ---------- */
+.topbar{min-width:0;max-width:100%}
+.topbar .chip{max-width:46vw;overflow:hidden;text-overflow:ellipsis}
+.topbar .crumb{max-width:100%}
+.main,.main>*,#backBar,.segbar,section{min-width:0;max-width:100%}
+@media (max-width:760px){
+  .topbar{gap:6px}
+  .topbar .chip{max-width:40vw}
+  .foot{min-width:0;max-width:100%}
+  .foot span{min-width:0}
+}
+
+/* ---------- 溢出根治第二刀：旧 T38 表格 min-width:520px 无横滑容器时撑破布局 ---------- */
+body.hud-on{overflow-x:hidden}
+body.hud-on .card{overflow-x:auto}
+body.hud-on table{max-width:none}
+
+/* ---------- 用户反馈四连修（2026-10-04 下午）---------- */
+/* 1) 圆环中心衬底：暗/亮两档各给 --ring-core，主数字不再压在渐变环上看不清 */
+[data-theme='dark']{--ring-core:rgba(8,12,22,.86)}
+[data-theme='light']{--ring-core:rgba(255,255,255,.92)}
+/* 2) 分段/导航切换防闪：wb-dim 只是 300ms 的轻微亮度渐入，替代整段 warp */
+@keyframes wbDim{from{opacity:.55}to{opacity:1}}
+.wb-dim{animation:wbDim .42s ease both}
+/* 3) 页面宽度不一：滚动条出现/消失导致 8px 跳动，stable 槽位根治（Chromium 94+/Firefox 97+，不支持则回退旧行为） */
+html{scrollbar-gutter:stable}
+/* 4) 主题化 tooltip：全局引擎接管原生 title（见 fx.js），.wbtip 深浅两档 */
+.wbtip{
+  position:fixed;z-index:1000;pointer-events:none;
+  max-width:340px;padding:6px 10px;border-radius:8px;
+  font-size:12px;line-height:1.55;color:var(--tx);
+  background:rgba(10,15,26,.94);border:1px solid var(--edge);
+  box-shadow:0 10px 30px rgba(0,0,0,.5),0 0 0 1px rgba(79,140,255,.10);
+  opacity:0;transform:translateY(4px);
+  transition:opacity 140ms ease,transform 140ms var(--ease);
+  white-space:pre-line;word-break:break-all;
+}
+.wbtip.show{opacity:1;transform:none}
+[data-theme='light'] .wbtip{
+  background:rgba(255,255,255,.98);border-color:rgba(38,64,120,.25);
+  box-shadow:0 8px 24px rgba(30,42,66,.18);
+}
+@media (prefers-reduced-motion:reduce){.wbtip{transition:none}}
+
+/* ---------- 用户反馈 round-3 ---------- */
+/* 1) 分段条「返回大屏后残留」：.segbar{display:flex} 覆盖了 [hidden] 的 UA display:none
+      （作者样式恒胜 UA 样式——0.3.5 折叠线同款坑）。显式压回。 */
+.segbar[hidden]{display:none!important}
+section[hidden]{display:none!important}
+/* 2) 分段间点击闪动：任务/用量/事件三个 view 高度不同 → 切换时页面总高变化，
+      body.hud-on 有 scrollbar-gutter 但整页高度跳变仍让背景/foot 跳。
+      给分段容器一个最小高度平滑过渡，并让分段切换不重触发 canvas 粒子重建。 */
+.main{min-height:60vh}
+section{min-height:0}
+
+/* ---------- round-4：tab/数字防位移 ---------- */
+/* 1) 数字全部等宽（tabular-nums）：不同数字宽度不同是按钮/布局位移的主因 */
+body.hud-on{font-variant-numeric:tabular-nums}
+.seg button{min-width:64px;text-align:center}   /* 分段按钮宽度钉住，数字变化不再挤动相邻按钮 */
+.kpi2,.tag{font-variant-numeric:tabular-nums}
+/* 2) k4b 三卡与分段条内的 tag 高度固定，避免内容行高变化引起卡片高度抖动 */
+.k4b .tag{min-width:52px;text-align:center}
+
+/* ---------- round-4：多主题系统 ----------
+ * data-theme 扩展为四档：dark(默认 HUD)/light/midnight(墨蓝)/sand(暖沙)。
+ * 每档只覆盖 HUD 令牌与关键表面色；布局与组件规则全部复用。 */
+[data-theme='midnight']{
+  --hud-bg:#0A1020;
+  --edge:rgba(130,170,240,.20);
+  --hair:rgba(130,170,240,.13);
+  --tx:#E4ECFC;
+  --mu:#8FA3C8;
+  --ac:#5EA0FF;
+  --cy:#2DD4BF;
+  --vi:#9B7BFF;
+  --ok:#3DDC97;
+  --wn:#FBBF24;
+  --bd:#FB7185;
+  --ring-core:rgba(9,15,30,.88);
+}
+[data-theme='sand']{
+  --hud-bg:#F4EFE6;
+  --edge:rgba(122,94,58,.24);
+  --hair:rgba(122,94,58,.15);
+  --tx:#2C2418;
+  --mu:#6E6151;
+  --ac:#B4711E;
+  --cy:#0E7490;
+  --vi:#7C5CC4;
+  --ok:#15803D;
+  --wn:#B45309;
+  --bd:#B91C1C;
+  --ring-core:rgba(255,253,248,.94);
+}
+/* 主题档表面微调：midnight 走深蓝系辉光；sand 全部降噪 */
+[data-theme='midnight'] body.hud-on, body[data-x]{}
+[data-theme='midnight'] .side{background:linear-gradient(180deg,rgba(120,170,255,.09),rgba(120,170,255,.02))}
+[data-theme='midnight'] .topbar{background:rgba(10,18,34,.76)}
+[data-theme='midnight'] .foot{background:linear-gradient(180deg,rgba(12,20,38,.88),rgba(8,14,28,.94))}
+[data-theme='midnight'] .hudview .card{background:linear-gradient(180deg,rgba(140,180,255,.08),rgba(140,180,255,.02))}
+[data-theme='sand'] .side{background:rgba(255,252,246,.8);box-shadow:0 12px 34px rgba(90,70,40,.14)}
+[data-theme='sand'] .topbar{background:rgba(255,253,248,.85)}
+[data-theme='sand'] .foot{background:rgba(255,252,246,.92)}
+[data-theme='sand'] .hudview .card{background:rgba(255,253,248,.88)}
+[data-theme='sand'] .floor{opacity:.08}
+[data-theme='sand'] .scan{opacity:.15}
+[data-theme='sand'] #glow{opacity:.18}
+[data-theme='sand'] .nav button.on{background:linear-gradient(90deg,rgba(180,113,30,.16),rgba(180,113,30,.03));box-shadow:inset 2px 0 0 var(--ac),0 0 12px rgba(180,113,30,.08)}
+[data-theme='sand'] .nav button.on svg{color:var(--ac);filter:none}
+[data-theme='sand'] .side .logo{background:linear-gradient(140deg,var(--ac),var(--vi));box-shadow:0 2px 10px rgba(180,113,30,.35)}
+[data-theme='sand'] .side .logo::after{display:none}
+[data-theme='sand'] .v.glow{text-shadow:none;animation:none}
+[data-theme='sand'] .p{box-shadow:none}
+[data-theme='sand'] .topbar .dot,.foot .dot{box-shadow:none;animation:none}
+[data-theme='sand'] .tl{background:rgba(122,94,58,.08);box-shadow:inset 0 0 0 1px rgba(122,94,58,.16)}
+[data-theme='sand'] .bar{background:rgba(122,94,58,.10)}
+[data-theme='sand'] .chip{background:rgba(122,94,58,.05)}
+
+/* 主题面板 */
+#themePanel{
+  background:rgba(12,17,28,.96);border:1px solid var(--edge);
+  box-shadow:0 18px 44px rgba(0,0,0,.5);backdrop-filter:blur(10px);
+}
+#themePanel button{
+  font-family:inherit;font-size:12.5px;cursor:pointer;text-align:left;
+  display:flex;align-items:center;gap:9px;width:150px;
+  border:1px solid transparent;border-radius:9px;padding:8px 10px;
+  background:none;color:var(--tx);
+  transition:background 150ms ease,border-color 150ms ease;
+}
+#themePanel button:hover{background:rgba(79,140,255,.14);border-color:var(--edge)}
+#themePanel button.on{border-color:var(--ac);background:rgba(79,140,255,.12)}
+#themePanel .sw{width:26px;height:16px;border-radius:5px;flex:none;border:1px solid rgba(255,255,255,.2)}
+[data-theme='light'] #themePanel{background:rgba(255,255,255,.98);box-shadow:0 14px 34px rgba(30,42,66,.2)}
+[data-theme='sand'] #themePanel{background:rgba(255,252,246,.98)}
+
+/* ---------- round-5：右上角主题面板 + 新增古风/科技/樱花 三档 ---------- */
+/* 面板定位：挂在 topbar 主题按钮下方（JS 设 left/top），样式随主题 */
+#themePanel{
+  position:fixed;z-index:80;display:flex;flex-direction:column;gap:5px;
+  padding:10px;border-radius:14px;
+}
+/* 古风：宣纸米 + 黛青 + 朱砂 */
+[data-theme='guofeng']{
+  --hud-bg:#F5F1E8;
+  --edge:rgba(90,74,52,.26);
+  --hair:rgba(90,74,52,.16);
+  --tx:#3A2E20;
+  --mu:#75664F;
+  --ac:#9E3D3D;          /* 朱砂 */
+  --cy:#2F6E5E;          /* 黛青 */
+  --vi:#6B4E8E;          /* 紫棠 */
+  --ok:#3E7C4F;
+  --wn:#B07A2A;
+  --bd:#A83232;
+  --ring-core:rgba(250,246,236,.95);
+}
+[data-theme='guofeng'] body.hud-on{background-image:radial-gradient(700px 360px at 6% -12%,rgba(158,61,61,.09),transparent 70%),radial-gradient(560px 320px at 102% 106%,rgba(47,110,94,.08),transparent 70%)}
+[data-theme='guofeng'] .side{background:rgba(250,246,236,.85);box-shadow:0 12px 34px rgba(90,74,52,.14)}
+[data-theme='guofeng'] .topbar{background:rgba(250,246,236,.88)}
+[data-theme='guofeng'] .foot{background:rgba(250,246,236,.94)}
+[data-theme='guofeng'] .hudview .card{background:rgba(250,246,236,.9)}
+[data-theme='guofeng'] .floor{opacity:.07}
+[data-theme='guofeng'] .scan{opacity:.12}
+[data-theme='guofeng'] #glow{opacity:.15}
+[data-theme='guofeng'] .nav button.on{background:linear-gradient(90deg,rgba(158,61,61,.14),rgba(158,61,61,.03));box-shadow:inset 2px 0 0 var(--ac)}
+[data-theme='guofeng'] .nav button.on svg{color:var(--ac);filter:none}
+[data-theme='guofeng'] .side .logo{background:linear-gradient(140deg,var(--ac),var(--vi));box-shadow:0 2px 10px rgba(158,61,61,.3)}
+[data-theme='guofeng'] .side .logo::after{display:none}
+[data-theme='guofeng'] .v.glow{text-shadow:none;animation:none}
+[data-theme='guofeng'] .p{box-shadow:none}
+[data-theme='guofeng'] .topbar .dot,.foot .dot{box-shadow:none;animation:none}
+[data-theme='guofeng'] .hudview .card.hv:hover{box-shadow:0 10px 26px rgba(90,74,52,.14)}
+[data-theme='guofeng'] .bar{background:rgba(90,74,52,.10)}
+[data-theme='guofeng'] .tl{background:rgba(90,74,52,.07);box-shadow:inset 0 0 0 1px rgba(90,74,52,.15)}
+[data-theme='guofeng'] .chip{background:rgba(90,74,52,.05)}
+
+/* 科技：纯黑底 + 荧光绿/青，强 HUD 感 */
+[data-theme='cyber']{
+  --hud-bg:#020604;
+  --edge:rgba(0,255,170,.22);
+  --hair:rgba(0,255,170,.13);
+  --tx:#D8FFE9;
+  --mu:#5FA98A;
+  --ac:#00E68C;          /* 荧光绿 */
+  --cy:#00D4FF;          /* 电青 */
+  --vi:#B96BFF;
+  --ok:#00FF9D;
+  --wn:#FFC94D;
+  --bd:#FF5470;
+  --ring-core:rgba(2,8,5,.88);
+}
+[data-theme='cyber'] body.hud-on{background-image:radial-gradient(700px 360px at 6% -12%,rgba(0,230,140,.13),transparent 70%),radial-gradient(560px 320px at 102% 106%,rgba(0,212,255,.10),transparent 70%)}
+[data-theme='cyber'] .side{background:linear-gradient(180deg,rgba(0,230,140,.07),rgba(0,230,140,.02))}
+[data-theme='cyber'] .nav button.on{background:linear-gradient(90deg,rgba(0,230,140,.18),rgba(0,230,140,.03));box-shadow:inset 2px 0 0 var(--ac),0 0 18px rgba(0,230,140,.14)}
+[data-theme='cyber'] .nav button.on svg{color:var(--cy)}
+[data-theme='cyber'] .hudview .card{background:linear-gradient(180deg,rgba(0,230,140,.06),rgba(0,230,140,.015))}
+[data-theme='cyber'] .topbar{background:rgba(3,10,6,.8)}
+[data-theme='cyber'] .foot{background:linear-gradient(180deg,rgba(3,12,7,.9),rgba(2,8,5,.95))}
+[data-theme='cyber'] .v.glow{text-shadow:0 0 22px rgba(0,230,140,.55)}
+
+/* 樱花：浅粉底 + 深樱色 */
+[data-theme='sakura']{
+  --hud-bg:#FBF0F3;
+  --edge:rgba(150,70,100,.22);
+  --hair:rgba(150,70,100,.14);
+  --tx:#43222F;
+  --mu:#8A6070;
+  --ac:#E0527E;          /* 樱 */
+  --cy:#5E8FBF;
+  --vi:#9A5FB5;
+  --ok:#3E8E68;
+  --wn:#C07A30;
+  --bd:#C73355;
+  --ring-core:rgba(253,243,246,.95);
+}
+[data-theme='sakura'] body.hud-on{background-image:radial-gradient(700px 360px at 6% -12%,rgba(224,82,126,.10),transparent 70%),radial-gradient(560px 320px at 102% 106%,rgba(94,143,191,.08),transparent 70%)}
+[data-theme='sakura'] .side{background:rgba(253,243,246,.85);box-shadow:0 12px 34px rgba(150,70,100,.13)}
+[data-theme='sakura'] .topbar{background:rgba(253,243,246,.88)}
+[data-theme='sakura'] .foot{background:rgba(253,243,246,.94)}
+[data-theme='sakura'] .hudview .card{background:rgba(253,243,246,.9)}
+[data-theme='sakura'] .floor{opacity:.07}
+[data-theme='sakura'] .scan{opacity:.12}
+[data-theme='sakura'] #glow{opacity:.15}
+[data-theme='sakura'] .nav button.on{background:linear-gradient(90deg,rgba(224,82,126,.15),rgba(224,82,126,.03));box-shadow:inset 2px 0 0 var(--ac)}
+[data-theme='sakura'] .nav button.on svg{color:var(--ac);filter:none}
+[data-theme='sakura'] .side .logo{background:linear-gradient(140deg,var(--ac),var(--vi));box-shadow:0 2px 10px rgba(224,82,126,.3)}
+[data-theme='sakura'] .side .logo::after{display:none}
+[data-theme='sakura'] .v.glow{text-shadow:none;animation:none}
+[data-theme='sakura'] .p{box-shadow:none}
+[data-theme='sakura'] .topbar .dot,.foot .dot{box-shadow:none;animation:none}
+[data-theme='sakura'] .bar{background:rgba(150,70,100,.10)}
+[data-theme='sakura'] .chip{background:rgba(150,70,100,.05)}
+
+/* ---------- 子页面宽度恒定（切 tab 不闪的最终解）----------
+ * 根源：各 view 内容高度/宽度不同 → 容器宽随内容波动。给 main 内所有 view
+ * 统一 min-width 与滚动策略：内容宽随容器而不是相反。 */
+.main{width:100%}
+.main section{width:100%;min-width:0}
+.hudview .card{min-width:0}
+.hudview .card *{min-width:0}
+.g>.card{min-width:0}
+
+#themePanel{width:176px}
+
+/* round-5 补：浅色三主题（古风/樱花/暖沙）下，旧版表面类（backBar、非 hudview 的 .card、.alertbar、modal 等）一并跟随 */
+[data-theme='guofeng'] #backBar,[data-theme='guofeng'] .main .card{background:rgba(250,246,236,.9);border-color:var(--edge);color:var(--tx)}
+[data-theme='sakura'] #backBar,[data-theme='sakura'] .main .card{background:rgba(253,243,246,.9);border-color:var(--edge);color:var(--tx)}
+[data-theme='sand'] #backBar,[data-theme='sand'] .main .card{background:rgba(255,253,248,.9);border-color:var(--edge);color:var(--tx)}
+[data-theme='guofeng'] #backBar b,[data-theme='sakura'] #backBar b,[data-theme='sand'] #backBar b{color:var(--tx)}
+/* 主题面板背景跟随主题（浅色主题下用浅面板） */
+[data-theme='guofeng'] #themePanel{background:rgba(250,246,236,.98);box-shadow:0 14px 34px rgba(90,74,52,.2)}
+[data-theme='sakura'] #themePanel{background:rgba(253,243,246,.98);box-shadow:0 14px 34px rgba(150,70,100,.2)}
+[data-theme='midnight'] #themePanel{background:rgba(10,18,34,.97)}
+[data-theme='cyber'] #themePanel{background:rgba(3,12,7,.97)}
+/* 主题面板收口：选择后关闭（toggleTheme 内 onclick 已 hidden，这里不加） */
+#themePanel[hidden]{display:none!important}
+
+/* round-8：浅色系主题（guofeng/sakura/sand）下 tooltip 用浅面板 */
+[data-theme='guofeng'] .wbtip,[data-theme='sakura'] .wbtip,[data-theme='sand'] .wbtip{
+  background:rgba(255,253,248,.98);border-color:rgba(90,74,52,.28);
+  box-shadow:0 8px 24px rgba(90,74,52,.18);color:var(--tx);
+}
+/* bug⑤：主题按钮 hover/active 不该跟着主题 swatch 变色（用户报「点击主题按钮按钮也会变色」）——
+   .btn 无碍，但 navTheme 在 topbar 里被 .nav button.on 规则误染？不：是 topbar .btn hover 用 --ac 底。
+   给 navTheme 固定中性样式： */
+#navTheme{background:rgba(127,140,170,.10)}
+#navTheme:hover{background:rgba(127,140,170,.18);box-shadow:none}
+#navTheme:active{background:rgba(127,140,170,.24);box-shadow:none}
+[data-theme='guofeng'] #navTheme,[data-theme='sakura'] #navTheme,[data-theme='sand'] #navTheme,[data-theme='light'] #navTheme{background:rgba(90,74,52,.08)}
+[data-theme='guofeng'] #navTheme:hover,[data-theme='sakura'] #navTheme:hover,[data-theme='sand'] #navTheme:hover,[data-theme='light'] #navTheme:hover{background:rgba(90,74,52,.15)}
+
+/* bug③：面板打开期间主题按钮 tooltip 不得压面板 */
+body.wbpanel-open .wbtip{z-index:70}
+
+/* round-9：新主题补齐旧页面令牌（旧 .btn/表格/输入框用 --panel2 系，缺定义会 fallback 成透明） */
+[data-theme='midnight'],[data-theme='midnight'] body{--panel:#101a30;--panel2:#15213a;--line:#223252;--text:#E4ECFC;--muted:#8FA3C8;--accent:#5EA0FF;--bad:#FB7185}
+[data-theme='sand'],[data-theme='sand'] body{--panel:#FFFDF8;--panel2:#F6F0E4;--line:#E2D6C0;--text:#2C2418;--muted:#6E6151;--accent:#B4711E;--bad:#B91C1C}
+[data-theme='guofeng'],[data-theme='guofeng'] body{--panel:#FAF6EC;--panel2:#F1EADA;--line:#DCCFB4;--text:#3A2E20;--muted:#75664F;--accent:#9E3D3D;--bad:#A83232}
+[data-theme='cyber'],[data-theme='cyber'] body{--panel:#04120C;--panel2:#07190F;--line:#123626;--text:#D8FFE9;--muted:#5FA98A;--accent:#00E68C;--bad:#FF5470}
+[data-theme='sakura'],[data-theme='sakura'] body{--panel:#FDF3F6;--panel2:#F9E8EE;--line:#EBD0DA;--text:#43222F;--muted:#8A6070;--accent:#E0527E;--bad:#C73355}

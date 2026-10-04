@@ -393,7 +393,13 @@ const server = http.createServer(async (req, res) => {
       if ((file === path.resolve(CONSOLE_DIR) || file.startsWith(path.resolve(CONSOLE_DIR) + path.sep)) && fs.existsSync(file) && fs.statSync(file).isFile()) {
         const ext = path.extname(file).toLowerCase();
         const type = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon' }[ext] || 'application/octet-stream';
-        res.writeHead(200, { 'Content-Type': type + '; charset=utf-8', 'Cache-Control': 'no-store' });
+        const st = fs.statSync(file);
+        const etag = '"' + st.mtimeMs.toString(36) + '-' + st.size.toString(36) + '"';
+        if (req.headers['if-none-match'] === etag) {
+          res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' });
+          return res.end();
+        }
+        res.writeHead(200, { 'Content-Type': type + '; charset=utf-8', 'Cache-Control': 'no-cache', ETag: etag });
         return res.end(fs.readFileSync(file));
       }
       return sendError(res, 404, '控制台资源不存在');
