@@ -4,12 +4,12 @@ description: 按 Roadmap 批量实现 workbuddy-bridge 插件功能与 bug 修�
 
 实现 workbuddy-bridge 插件的待办功能。参数 `$ARGUMENTS` 支持三种写法：
 
-- **功能编号**：`T42 T44`，逗号或空格分隔。
-- **批次代号**：`feat` = 做 T42–T49 剩余全部新功能（第三批，T40/T41 已被 0.3.24 吸收）。`bug1` 已于 2026-10-03 完成（v0.3.16）；`feat` 在旧语义下指的 T32–T39 也已于 2026-10-03 完成（v0.3.19）。
-- **`all`** = 从 T42 到 T49 顺序全做（T47 拆分排最后）。
-- **为空时** = 默认做 T42 T44 T43 T45（第一优先级四项，一次会话可完成）。
+- **功能编号**：`T50 T52`，逗号或空格分隔。
+- **批次代号**：`feat` = 做 T50–T54 全部新功能（第五批，2026-10-05 添加）。旧语义已作废：T42–T49（第三批）已于 2026-10-04 完成（v0.3.26，commit f4a085c）；T32–T39 于 2026-10-03 完成（v0.3.19）；bug1 于 2026-10-03 完成（v0.3.16）。
+- **`all`** = 从 T50 到 T54 顺序全做（T51 并入 T50 同一次扫描实现，实际执行序 T50(+T51) → T52 → T53 → T54）。
+- **为空时** = 默认做全部 T50–T54（体量不大，一次会话可完成；上次会话曾连做 T42–T49 共 8 项）。
 
-✅ **ROADMAP 已全部收官（2026-10-04，v0.3.26，commit f4a085c）：T1–T31、B1–B4、T32–T39、T40/T41（0.3.24 吸收）、T42–T49 全部完成并发布，没有任何待办功能。** 新会话跑本命令时应先读项目记忆核对进度——若记忆确认全清，直接告诉用户「roadmap 已全部完成，没有待办」，**不要重做任何编号**。下文的功能描述仅作历史实现记录保留。
+📋 **当前待办：第五批 T50–T54（2026-10-05 添加，全部细节已调查完毕——端点/参数/行为语义/实测数据齐全，零调查成本直接开工，清单见「第五批」一节）。** 已完成历史：T1–T31、B1–B4、T32–T39、T40/T41（0.3.24 吸收）、T42–T49（v0.3.26，commit f4a085c）。新会话先读项目记忆 workbuddy-bridge-plugin.md 最近的「/wbp-build 进度」段核对进度，不要重做已完成编号。
 
 ## 检查点纪律（all/批量模式必读）
 
@@ -28,7 +28,7 @@ description: 按 Roadmap 批量实现 workbuddy-bridge 插件功能与 bug 修�
 - 控制台 HTML 是 no-store 头，改完让用户刷新页面即可生效；`/console/api/*` 接受 `X-Console-Token`（页面内 `__WB_TOKEN__="..."`）**或** `Authorization: Bearer <apiKey>` 两套鉴权；`/admin/*` 只认 apiKey。
 - ⚠️ **「改源码」与「cp 进缓存」必须成对完成再重启**：交棒重启拉起的是**缓存目录**的 `server.mjs`，不是源码目录。2026-10-03 21:1x 因为只改源码就重启，SSE 修复没生效、白白重启一次才发现（token 计数仍是 1）。正确顺序：改源码 → `npm test` → cp 进缓存 → diff 校验一致 → 试启 → 交棒重启。
 - ⚠️ **别删已安装缓存的旧版本目录**（`cache/dev-workbuddy-bridge-local/workbuddy-bridge/0.3.3/` 等）：运行中的服务仍从那里启动，`rm -rf` 在 Windows 上不是全有全无（会删到一半报 Device busy，留下半个目录 → 控制台 500）。要清理先确认没有进程从该目录运行。
-- 每完成一个功能：`node --check` 全部改动文件 + `npm test`（在 server/ 下跑，当前 61 条必须全过，纯函数新增要补测试）。**只跑 `npm test`，不要裸跑 `node --test`**（后者会把 smoke 测试也执行，2026-10-03 曾污染生产账号池）。
+- 每完成一个功能：`node --check` 全部改动文件 + `npm test`（在 server/ 下跑，当前 88 条必须全过，纯函数新增要补测试）。**只跑 `npm test`，不要裸跑 `node --test`**（后者会把 smoke 测试也执行，2026-10-03 曾污染生产账号池）。
 
 ## 每个功能做完后的统一收尾流程
 
@@ -178,6 +178,45 @@ CSS 变量已集中在 :root（--panel/--line/--text/...），加 `[data-theme="
 大屏账号行/任务摘要行点击进入子页面后，自动滚动并高亮定位到对应账号卡/任务块（module 变量传 focus id，目标 render 完成后 scrollIntoView + 2s 高亮描边）。
 ### T47 🔧 控制台 index.html 拆分（工程项，放最后）
 单文件 ~2000 行。拆成 style.css / app.js 两个静态文件由 /console/* 继续服务（保持零依赖 + no-store + token 内联注入方式）。纯维护性重构，功能零变化，谨慎做（改坏 UI 的回退成本高）。
+
+## 🚀 第五批（`/wbp-build feat` 或 `all` 或空参数，T50–T54）—— 2026-10-05 添加
+
+**来源**：对比 Go 参考项目 `.ref\workbuddy2api-panel-main`（比插件当时参考的版本新，2026-09 新逆向）+ 生产账号实测。**全部只读端点已于 2026-10-05 用公瑾账号实测 200 通过**；POST 端点未实发（会改变账号状态），行为语义引自 Go 项目三账号验证结论。参考实现：`internal/upstream/streak.go`（端点+字段）、`internal/upstream/blackcat.go`（礼包/补偿/补签/热力图）、`internal/upstream/profile.go`（昵称）、`internal/upstream/global_models.go`（v3/config）、`internal/scheduler/streak.go`（调度流程）。
+
+**growth 域请求形态（与猫猫旅行同构，tasks.mjs 已有同域先例）**：`{chatBase}`（copilot.tencent.com，**不带 /v2 前缀**）+ billingHeaders 鉴权 + `X-User-Id`，信封 `{code:0,msg,data}`。billing 域 = `{billingBase}`（www.codebuddy.cn）同款头。
+
+### T50 🔧 连登管家（连登状态+补签卡+档位兑换+自动抽奖）—— 本批最大项，T51 并入实现
+端点组（growth 域）：
+- `GET /activity/growth/streak` → `data`: `{streak:{days, month_total_days, next_tier, next_tier_remaining, makeup_dates[]}, makeup_cards:{balance, max:4}, redemption_status:{tier_7d_status, tier_14d_status, tier_28d_status, remaining_days, tiers:[{tier,days,credit,energy,cards,chances}]}}`。**实测（2026-10-05 公瑾）**：days=2、三档全 locked、补签卡 0/4。档位奖励：7d→credit 0/能量 2/卡 1/抽奖 1；14d→+50c/能量 3/卡 1/抽奖 1；28d→+150c/能量 5/卡 1/抽奖 1。
+- `POST /activity/growth/redeem` body `{tier:"7d"|"14d"|"28d", client_token:<uuid>}`；未解锁 HTTP 403「连续登录天数不足」（幂等跳过）；`tier_7d_status` 等 ∈ locked/可兑/claimed。
+- `GET /activity/growth/lottery/summary` → `data:{chances, module:{enabled}}`（实测 chances=0、enabled=true）。
+- `POST /activity/growth/lottery/draw` body `{client_token:<uuid>}`——每次耗 1 chance，prize 形状由活动期决定，透传记录即可。
+- `GET /activity/growth/heatmap` → `data.cells[] {date:"YYYY-MM-DD", score, has_new_buddy}`（一整年）。
+- `POST /activity/growth/makeup-cards/use` body `{target_date:"YYYY-MM-DD"}`——无卡/已签返回业务错误静默跳过。
+- client_token = 前端 randomUUID 同款幂等令牌（Go 用 crypto/rand 16 字节 hex 拼接，`crypto.randomUUID()` 等价）。
+- **流程（照抄 scheduler/streak.go 的 streakBonusAccount）**：签到排程后同轮执行 → ①heatmap 查昨日 score==0 且 makeup_cards.balance>0 → 补签保连登（连登一断要重攒 7 天）→ ②T51 礼包/补偿 → ③GET streak → 逐档 status 非 locked/claimed 就 redeem → ④lottery/summary → chances>0 循环 draw。
+- 落点：tasks.mjs 新 kind='streak'（受 tasks.enabled 总开关门控，时点复用 checkinTimes 之后顺延；幂等可一天多跑）；tasks-state.json 新 streak 段 + record() 事件 + gainedTotal 白嫖统计累计；config 无需新字段（复用 tasks.enabled/checkinTimes）。
+- UI：大屏「今日自动任务」tile 加连登块（x 天 · 下一档差 N 天 · 补签卡 b/max · chances），任务页任务总览行同步。
+- ⚠️**验收纪律（0.3.20/0.3.21 血泪，领奖类功能必犯）**：不能只看请求 200——redeem 验收看 redemption_status 从可兑变 claimed；draw 验收看 chances 递减且 summary 回读减少；补签验收看 heatmap/makeup_dates 变化。**带目标值的操作必须看目标值本身的变化。**
+
+### T51 🔧 新手礼包 + 活动补偿自动领取（并入 T50 流程步骤②）
+- `POST {billing}/billing/meter/claim-gift` body `{}` → `data:{credit}`——新手礼包每号一次，已领返回业务错误静默跳过。
+- `POST {billing}/billing/meter/claim-compensation` body `{}` → `data:{credit}`——有则领无则业务错误。
+- 注意是 **billing 域**不是 growth 域；领到 credit 时事件 + notify（「🎊 新手礼包 +Nc」样式）+ 白嫖统计累计。
+
+### T52 🔧 官方打卡热力图上屏
+- 数据源 T50 已接的 heatmap。console-api 新增 `/console/api/heatmap?site=&account=`，服务端带 TTL 缓存（参照 taskCenterView 模式，6h 或随任务刷新失效）。
+- UI：任务中心子页面与本地 checkinDays 日历（T15）并排显示官方热力图（约 53 周×7 格，score 分级着色，hover=日期+score+has_new_buddy）。官方=权威全历史（从账号注册日起算），本地=插件启用日起算，两者并存并注明口径。
+
+### T53 🔧 账号昵称同步（改上游昵称后免手动改备注）
+- `GET {billing}/console/account`，头：Bearer + `x-client-platform: web` + Origin/Referer `https://www.workbuddy.cn`（profile.go 同款，实测 200）。
+- **隐私边界（强制）**：响应含 phoneNumber/wechatOpenId 等敏感字段——代码**只解析 uid 与 nickname 两个字段**，其余不解析、不落日志、不透传；只在用户手动触发时调用（账号卡或账号管理页加「同步昵称」动作），**不进任何定时轮询**。
+- uid 与池内账号不一致报错防串号；成功更新显示名并落池。
+
+### T54 🔧 /v3/config 模型目录对账
+- `GET https://copilot.tencent.com/v3/config`（CN 域实测 200）→ `data.agents[]`（每个含 name/models[]/modelTags，cli agent 是主目标）。
+- 用途一：protocol.mjs 加签名项（v3/config agents 里 cli models 非空且含当前 defaultModel）。
+- 用途二（可选）：模型目录并集补缺——Go 项目实测 global 域有模型只在企业端点下发（gpt-5.3-codex 只在 /v2 家族）；CN 域增量先实测对比现有 /console/enterprises/personal/models 目录，无增量就只做签名不做并集。
 
 ## 成本纪律
 
