@@ -437,8 +437,16 @@ const server = http.createServer(async (req, res) => {
     // 控制台 API（用会话 token 或 apiKey 鉴权）
     if (pathname.startsWith('/console/api/')) {
       if (!consoleAuthorized(req)) {
-        warn(`控制台接口鉴权失败：${req.method} ${pathname}`);
-        return sendError(res, 401, '控制台会话失效：请刷新页面重开 /console', 'invalid_console_token');
+        // 附上当前 CONSOLE_TOKEN：服务每次启动都重新随机生成，旧标签页手里的 token
+        // 就此永久失效。原先只回 401 让前端「刷新页面」，可页面自己没法拿到新 token
+        // —— 于是一个没关的旧页签会以每 2 秒一次的频率持续刷鉴权失败日志，3 分钟
+        // 就把 server.log 刷成 19/33 行全是噪声，真正的业务日志被淹没
+        // （2026-10-04 手操实测）。前端拿到新 token 后续上，用户无感。
+        // /console/api/unlock 本身不走这里（它在鉴权前单独处理），不会自激。
+        return sendJsonWith(res, 401, {
+          error: { message: '控制台会话失效，正在自动续期', type: 'invalid_console_token', code: 401 },
+          newToken: CONSOLE_TOKEN,
+        }, { 'X-WB-New-Token': CONSOLE_TOKEN });
       }
       const body = req.method === 'POST' ? await readJsonBody(req) : null;
       return await handleConsoleApi({ cfg, req, res, url, body });

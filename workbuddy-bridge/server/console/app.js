@@ -1,11 +1,32 @@
 'use strict';
-const TOKEN = window.__WB_TOKEN__ || '';
+// T51：服务每次启动都重新生成会话 token，没关的旧标签页手里的这份会永久失效。
+// 原先只回 401 让人「刷新页面」，可页面自己拿不到新 token —— 旧页签于是每 2 秒刷一条
+// 鉴权失败日志，3 分钟把 server.log 刷成 19/33 行噪声（2026-10-04 手操实测）。
+// 现在服务端 401 会带上新 token（响应体 newToken / 响应头 X-WB-New-Token），
+// 前端静默续期并重试一次，用户完全无感。
+let TOKEN = window.__WB_TOKEN__ || '';
+let __renewing = null; // 续期中的 Promise，避免并发请求同时续期（只发一次 unlock）
+
 const $ = (s, el = document) => (el || document).querySelector(s);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
 /* T50 api 微缓存：GET 请求 3.5s 内复用上次结果（stale-while-revalidate：先回缓存再后台刷新）。
  * 切 tab 连点多个分段时不再每次全量等接口——首个渲染立即出，网络慢也有内容。 */
 const __apiCache = new Map(); // path -> { t, p }
+
+/**
+ * T51：会话 token 续期。服务端 401 会把新 token 带回来（响应体 newToken），
+ * 这里换掉 TOKEN 并清掉 GET 缓存，让后续请求用新凭证。
+ * 并发请求同时遇到 401 时只发一次续期请求（__renewing 去重），避免风暴。
+ */
+async function renewToken(res) {
+  const nt = (res.headers.get('X-WB-New-Token') || '').trim();
+  if (!nt || nt === TOKEN) return false;
+  TOKEN = nt;
+  __apiCache.clear();
+  return true;
+}
+
 async function api(path, opts = {}) {
   const isGet = !(opts && opts.body) && (!opts || !opts.method || opts.method === 'GET');
   if (isGet) {
@@ -20,6 +41,17 @@ async function api(path, opts = {}) {
       let json = null;
       try { json = JSON.parse(text); } catch { json = { raw: text }; }
       if (!res.ok) {
+        // T51：token 过期时静默续期并重试一次（失败才抛给调用方）
+        if (res.status === 401 && await renewToken(res)) {
+          const again = await fetch('/console/api' + path, {
+            ...opts,
+            headers: { 'X-Console-Token': TOKEN, 'Content-Type': 'application/json', ...(opts.headers || {}) },
+          });
+          const t2 = await again.text();
+          let j2 = null;
+          try { j2 = JSON.parse(t2); } catch { j2 = { raw: t2 }; }
+          if (again.ok) return j2;
+        }
         const info = json.error;
         const msg = typeof info === 'string' ? info : (info && info.message) || ('HTTP ' + res.status);
         throw new Error(msg);
@@ -39,6 +71,8 @@ async function api(path, opts = {}) {
   let json = null;
   try { json = JSON.parse(text); } catch { json = { raw: text }; }
   if (!res.ok) {
+    // T51：同上，POST 也要能续期后重试
+    if (res.status === 401 && await renewToken(res)) return api(path, opts);
     const info = json.error;
     const msg = typeof info === 'string' ? info : (info && info.message) || ('HTTP ' + res.status);
     throw new Error(msg);
@@ -834,8 +868,13 @@ async function loadAccounts() {
         if (ev.target.closest('select')) return;
         let pinnedAccountId = policy.pinnedAccountId;
         if (p.dataset.p === 'pinned') {
+          // 下拉框只在「当前策略已是 pinned」时渲染（见 pinnedSelect 的调用条件），
+          // 所以从别的策略切过来时 sel 必然是 null —— 原实现直接报「还没有账号可固定」，
+          // 用户被卡死在这里，且无法自行恢复（策略切不过去，下拉框就永远不会出现）。
+          // 正确做法：没有下拉框就回落到第一个可用账号；真一个账号都没有才报错。
           const sel = p.querySelector('select');
-          pinnedAccountId = sel ? sel.value : null;
+          const fallback = (sites.find((s) => s.policy_applies) || sites[0] || {}).accounts?.[0]?.id || null;
+          pinnedAccountId = sel ? sel.value : (policy.pinnedAccountId || fallback);
           if (!pinnedAccountId) { toast('还没有账号可固定，先添加账号', 'bad'); return; }
         }
         try { await api('/policy', { method: 'POST', body: { policy: p.dataset.p, pinnedAccountId } }); toast('策略已切换：' + (POLICIES.find((x) => x.id === p.dataset.p) || {}).name, 'ok'); } catch (e) { toast('切换失败：' + e.message, 'bad'); }
@@ -939,7 +978,7 @@ function bindAcctAction(btn, done) {
     const { act, site, id } = btn.dataset;
     try {
       if (act === 'rename') {
-        const name = prompt('修改账号显示名：', '');
+        const name = await askText('修改账号显示名', '', { placeholder: '留空则不改', okText: '保存' });
         if (name && name.trim()) await api('/pool/account', { method: 'POST', body: { site, id, label: name.trim() } });
       } else if (act === 'pin') {
         await api('/policy', { method: 'POST', body: { policy: 'pinned', pinnedAccountId: id } });
@@ -951,10 +990,10 @@ function bindAcctAction(btn, done) {
         toast('已清除耗尽/冷却标记', 'ok');
       } else if (act === 'manual') {
         const cur = btn.closest('.acct')?.querySelector('[data-manual]')?.textContent || '';
-        const v = prompt('手动到期兜底（接口拿不到到期时间时生效；格式 YYYY-MM-DD，留空清除）：', cur);
+        const v = await askText('手动到期兜底', cur, { placeholder: 'YYYY-MM-DD，留空清除', okText: '保存' });
         if (v !== null) await api('/pool/account', { method: 'POST', body: { site, id, manualExpireAt: v.trim() } });
       } else if (act === 'remove') {
-        if (!confirm('确定删除该账号？（token 会从本机移除，账号本身不受影响）')) return;
+        if (!await askConfirm('确定删除该账号？', { okText: '删除' })) return;
         await api('/pool/account/remove', { method: 'POST', body: { site, id } });
       } else if (act === 'burnout-copy') {
         // T32：点「预计用不完」标记复制建议文案，方便贴到别处或照着安排任务
@@ -968,6 +1007,54 @@ function bindAcctAction(btn, done) {
 
 /* ---------- 登录弹窗（微信扫码） ---------- */
 function closeModal() { $('#modalRoot').innerHTML = ''; }
+
+/**
+ * 取代原生 prompt() / confirm()。
+ *
+ * 为什么必须换：原生对话框在**内嵌浏览器**里不可用 —— ZCode 自带的 IAB 直接抛
+ * "prompt() is not supported"，点「改名」「删除」毫无反应（连报错都没有），
+ * 用户只当按钮坏了。2026-10-04 手操实测发现，一并影响到期兜底、清空用量、
+ * 删除密钥、恢复备份共 6 处。项目本来就有 #modalRoot 弹窗机制（登录框在用），
+ * 这里把输入/确认也收敛到同一套。
+ *
+ * 用法：
+ *   const name = await askText('修改账号显示名', '');
+ *   if (name === null) return;            // 用户取消
+ *   if (await askConfirm('确定删除？')) {} // true=确认
+ */
+function askText(title, def = '', { placeholder = '', okText = '确定' } = {}) {
+  return new Promise((resolve) => {
+    $('#modalRoot').innerHTML = `<div class="modal" id="mAsk"><div class="box" style="width:420px">
+      <h3>${esc(title)}</h3>
+      <div class="fld"><input type="text" id="mAskIn" value="${esc(def)}" placeholder="${esc(placeholder)}" style="width:100%"></div>
+      <div class="row" style="margin-top:14px"><button class="btn primary" id="mAskOk">${esc(okText)}</button><span class="spacer"></span><button class="btn" id="mAskCancel">取消</button></div>
+    </div></div>`;
+    const inp = $('#mAskIn');
+    inp.focus(); inp.select();
+    const finish = (v) => { closeModal(); resolve(v); };
+    $('#mAskOk').onclick = () => finish(inp.value);
+    $('#mAskCancel').onclick = () => finish(null);
+    $('#mAsk').onclick = (e) => { if (e.target.id === 'mAsk') finish(null); };
+    inp.onkeydown = (e) => { if (e.key === 'Enter') finish(inp.value); if (e.key === 'Escape') finish(null); };
+  });
+}
+
+function askConfirm(title, { okText = '确定', danger = true } = {}) {
+  return new Promise((resolve) => {
+    $('#modalRoot').innerHTML = `<div class="modal" id="mAsk"><div class="box" style="width:400px">
+      <h3>${esc(title)}</h3>
+      <div class="row" style="margin-top:16px;justify-content:flex-end">
+        <button class="btn ${danger ? 'danger' : 'primary'}" id="mAskOk">${esc(okText)}</button>
+        <button class="btn" id="mAskCancel">取消</button>
+      </div>
+    </div></div>`;
+    const finish = (v) => { closeModal(); resolve(v); };
+    $('#mAskOk').onclick = () => finish(true);
+    $('#mAskCancel').onclick = () => finish(false);
+    $('#mAsk').onclick = (e) => { if (e.target.id === 'mAsk') finish(false); };
+  });
+}
+
 function openLoginModal(sites) {
   const siteOpts = (sites || []).map((s) => `<option value="${esc(s.site)}">${esc(s.label)}</option>`).join('');
   $('#modalRoot').innerHTML = `<div class="modal" id="mWrap"><div class="box">
@@ -1562,7 +1649,7 @@ function renderTcList() {
       <div class="row" style="margin-bottom:5px">
         <b style="font-size:13px">${esc(x.title)}</b>${state}
         ${x.credit ? `<span class="badge ok">+${x.credit} 积分</span>` : ''}
-        ${x.autoplayable ? `<span class="badge" title="可由桥接代打（模型 ${esc(x.autoplayModel || 'default')}）">🤖 可代打</span>` : (x.autoplayBlockedReason ? `<span class="badge" title="${esc(x.autoplayBlockedReason)}">🤖 ${esc(x.autoplayBlockedReason.slice(0, 18))}</span>` : '')}
+        ${x.autoplayable ? `<span class="badge" title="可由桥接代打（模型 ${esc(x.autoplayModel || 'default')}）">🤖 可代打</span>` : (x.autoplayBlockedReason ? `<span class="badge" title="${esc(x.autoplayBlockedReason)}">🤖 ${esc(x.autoplayBlockedReason)}</span>` : '')}
         <span class="spacer"></span>
         <span class="muted" style="font-size:12px">${x.target ? `${x.current}/${x.target}` : ''}</span>
         ${x.autoplayable && !x.claimable ? `<button class="btn mini" data-tcplay="${esc(x.code)}" data-need="${x.remain}">代打</button>` : ''}
@@ -1717,7 +1804,7 @@ async function loadUsage() {
         </div>
       </details>`);
     $('#uReset').onclick = async () => {
-      if (!confirm('清空全部用量统计？')) return;
+      if (!await askConfirm('清空全部用量统计？此操作不可撤销。', { okText: '清空' })) return;
       await api('/usage/reset', { method: 'POST' });
       toast('已重置', 'ok'); loadUsage();
     };
@@ -2038,8 +2125,8 @@ function healthState(a) {
     for (const b of el.querySelectorAll('[data-keydel]')) {
       b.onclick = async () => {
         const masked = b.dataset.keydel;
-        const full = prompt(`删除密钥 ${masked}\n\n粘贴该密钥的完整值以确认（防误删）：`);
-        if (!full) return;
+        const full = await askText(`删除密钥 ${masked}`, '', { placeholder: '粘贴该密钥的完整值以确认（防误删）', okText: '删除' });
+        if (!full || !full.trim()) return;
         try {
           await api('/keys/remove', { method: 'POST', body: { key: full.trim() } });
           toast('密钥已删除', 'ok');
@@ -2121,7 +2208,7 @@ function healthState(a) {
     $('#bkFile').onchange = async (ev) => {
       const file = ev.target.files && ev.target.files[0];
       if (!file) return;
-      if (!confirm('恢复会覆盖当前配置与账号池（同目录的现有文件会先备份成 .prestore-*）。继续？')) { ev.target.value = ''; return; }
+      if (!await askConfirm('恢复会覆盖当前配置与账号池（同目录的现有文件会先备份成 .prestore-*）。继续？', { okText: '继续恢复' })) { ev.target.value = ''; return; }
       try {
         const parsed = JSON.parse(await file.text());
         const r = await api('/backup/restore', { method: 'POST', body: { files: parsed.files || parsed } });
@@ -2153,15 +2240,26 @@ function healthState(a) {
       } catch (e) { toast('保存失败：' + e.message, 'bad'); }
     };
     // ---- T34 行为绑定：预警阈值 ----
+    // 保存失败时把输入框恢复成服务端真值：否则非法值（比如天数填 0）会留在框里，
+    // 用户接着改别的数再点保存，容易忘了刚才报错、误以为整体没生效。
+    const restoreAlerts = () => {
+      $('#alLow').value = ALERT_TH.lowBalance;
+      $('#alDays').value = ALERT_TH.expiryDays;
+      $('#alMin').value = ALERT_TH.expiryMinAmount;
+    };
     $('#alSave').onclick = async () => {
       try {
         const r = await api('/alerts', { method: 'POST', body: {
           lowBalance: $('#alLow').value, expiryDays: $('#alDays').value, expiryMinAmount: $('#alMin').value,
         } });
         ALERT_TH = r.alerts;
+        restoreAlerts();
         toast(`阈值已保存：余额 ≤${r.alerts.lowBalance}、${r.alerts.expiryDays} 天内到期且余量 >${r.alerts.expiryMinAmount}`, 'ok');
         loadAlerts(); // 立刻重画预警条，不用等 60 秒
-      } catch (e) { toast('保存失败：' + e.message, 'bad'); }
+      } catch (e) {
+        restoreAlerts();
+        toast('保存失败：' + e.message + '（已恢复原值）', 'bad');
+      }
     };
     $('#alReset').onclick = async () => {
       try {
@@ -2204,15 +2302,24 @@ function healthState(a) {
     };
     $('#ntTest').onclick = async () => {
       const b = $('#ntTest');
+      const msg = $('#ntMsg');
       b.disabled = true;
+      b.textContent = '投递中…（最多等 10 秒）';
+      msg.textContent = '';
       try {
         // 先存再测：测试的是「当前配置」，不是页面上还没保存的草稿
         await api('/notify', { method: 'POST', body: { enabled: true, channels: chList.filter((c) => String(c.url || '').trim()) } });
         const r = await api('/notify/test', { method: 'POST' });
-        $('#ntMsg').textContent = r.note || '';
-        toast(r.note || '已发送', r.sent ? 'ok' : 'bad');
+        // 后端现在回传每个通道的真实结果，失败要如实显示（含可行动的原因），
+        // 不能一律报「已投递」——否则用户等不到推送只会以为通道坏了。
+        const failed = (r.results || []).filter((x) => !x.ok);
+        msg.innerHTML = failed.length
+          ? `<span class="bad">${esc(r.note)}</span>`
+          : `<span class="ok">${esc(r.note)}</span>`;
+        toast(r.note || '已发送', r.ok ? 'ok' : 'bad');
       } catch (e) { toast('测试失败：' + e.message, 'bad'); }
       b.disabled = false;
+      b.textContent = '🔔 测试通知';
     };
 
     // ---- T39 行为绑定：协议自检 ----

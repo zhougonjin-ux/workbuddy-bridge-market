@@ -146,18 +146,43 @@ export function buildChannelRequest(ch, title, text) {
   return null;
 }
 
-/** 向一个通道投递（不抛错；10 秒超时防挂住事件循环）。 */
-function deliver(ch, title, text) {
+/**
+ * 向一个通道投递（不抛错；10 秒超时防挂住事件循环）。
+ * 返回 Promise<结果>，结果形如 { type, ok, status, error }。
+ *
+ * 为什么返回结果而不只是 fire-and-forget：控制台的「测试通知」需要告诉用户
+ * 到底成没成。原先只统计"发起了几个"，于是投递到不可达地址时前端照样显示
+ * 「已向 1 个通道投递」——用户等不到手机推送，只当通道配错了或消息没触发
+ * （2026-10-04 手操实测：notexist.invalid 明确 Failed to parse URL，前端仍报成功）。
+ * 日常通知（notifyChannels）依旧不 await 它，行为不变。
+ */
+export function deliver(ch, title, text) {
   const req = buildChannelRequest(ch, title, text);
-  if (!req) return;
+  if (!req) return Promise.resolve({ type: ch.type, ok: false, error: '通道类型无法构造请求' });
   const ac = new AbortController();
   const to = setTimeout(() => ac.abort(), 10_000);
-  fetch(req.url, { ...req.init, signal: ac.signal })
+  return fetch(req.url, { ...req.init, signal: ac.signal })
     .then((r) => {
-      if (r.ok) log(`通知已投递：${ch.type}`);
-      else warn(`通知通道 ${ch.type} 返回 ${r.status}`);
+      if (r.ok) {
+        log(`通知已投递：${ch.type}`);
+        return { type: ch.type, ok: true, status: r.status };
+      }
+      warn(`通知通道 ${ch.type} 返回 ${r.status}`);
+      return { type: ch.type, ok: false, status: r.status, error: `上游返回 HTTP ${r.status}` };
     })
-    .catch((e) => warn(`通知通道 ${ch.type} 投递失败：`, e.message || String(e)))
+    .catch((e) => {
+      const msg = String(e?.message || e);
+      warn(`通知通道 ${ch.type} 投递失败：`, msg);
+      // 给用户看的是可行动的原因，不是 "fetch failed"
+      const friendly = /Failed to parse URL|Invalid URL/i.test(msg)
+        ? '地址格式不对（不是有效的 http/https URL？）'
+        : /abort/i.test(msg) ? '连接超时（10 秒无响应）'
+          : /ENOTFOUND|getaddrinfo/i.test(msg) ? '域名解析失败（地址打错了？）'
+            : /ECONNREFUSED/i.test(msg) ? '连接被拒绝（端口/服务没起？）'
+              : /certificate|SSL|TLS/i.test(msg) ? 'HTTPS 证书校验失败'
+                : msg;
+      return { type: ch.type, ok: false, error: friendly };
+    })
     .finally(() => clearTimeout(to));
 }
 
@@ -181,9 +206,11 @@ export function notifyChannels(cfg, title, text, { key = null, force = false } =
   return n;
 }
 
-/** 控制台「测试通知」：忽略节流，往所有通道真发一条。返回投递数。 */
-export function testChannels(cfg, title = 'WorkBuddy 积分桥测试 🔔', text = '通知通道已连通，收到即配置成功。') {
-  return notifyChannels(cfg, title, text, { force: true });
+/** 控制台「测试通知」：忽略节流，往所有通道真发一条，并等每个通道的真实结果。 */
+export async function testChannels(cfg, title = 'WorkBuddy 积分桥测试 🔔', text = '通知通道已连通，收到即配置成功。') {
+  const channels = enabledChannels(cfg);
+  const results = await Promise.all(channels.map((ch) => deliver(ch, title, text)));
+  return { total: results.length, ok: results.filter((r) => r.ok).length, results };
 }
 
 /** 测试隔离：清空节流表。 */

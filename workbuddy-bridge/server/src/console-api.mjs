@@ -671,9 +671,17 @@ export async function handleConsoleApi(ctx) {
     });
   }
   if (p === '/notify/test' && method === 'POST') {
-    // force=true 绕过 5 分钟节流，用户点按钮就是想立刻看到结果
-    const n = testChannels(cfg);
-    return sendJson(res, 200, { ok: true, sent: n, note: n ? `已向 ${n} 个通道投递（HTTP 是异步的，稍等几秒看手机）` : '没有已启用的通道——先添加一个并保存' });
+    // 等每个通道的真实投递结果再回（原先只数"发起了几个"，投递失败也报成功 ——
+    // 用户等不到手机推送，只当通道配错了）。超时上限由 deliver 的 10s 兜底。
+    const r = await testChannels(cfg);
+    if (!r.total) {
+      return sendJson(res, 200, { ok: false, sent: 0, total: 0, results: [], note: '没有已启用的通道——先添加一个并保存' });
+    }
+    const failed = r.results.filter((x) => !x.ok);
+    const note = failed.length
+      ? `失败 ${failed.length}/${r.total}：${failed.map((f) => `${f.type} — ${f.error}`).join('；')}`
+      : `全部 ${r.total} 个通道投递成功，去手机上看看`;
+    return sendJson(res, 200, { ok: failed.length === 0, sent: r.ok, total: r.total, results: r.results, note });
   }
 
   // ---- 号池：启用/禁用、重置状态、删除、改标签 ----
