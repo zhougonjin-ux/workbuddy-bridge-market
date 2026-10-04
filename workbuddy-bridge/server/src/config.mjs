@@ -249,6 +249,12 @@ export function defaultConfig() {
       only: [],               // 只巡检这些模型（空 = 全部）
       onlyFree: false,        // true = 只巡检倍率 0 的免费模型
     },
+    // 用量周报（T46）：每周一在这些时点把上周用量汇总推送到通知通道（桌面气泡 + T33 多通道）。
+    // 纯读数零消耗；每周最多一次（状态落数据目录 weekly.json，重启不重复发）。
+    weekly: {
+      enabled: true,
+      times: ['09:00'],       // ["HH:MM"]，周一命中即发
+    },
     // 桌面通知（T11）：签到失败/猫猫归来/账号登录态失效弹 Windows toast。默认开。
     // channels（T33）：把同一条通知并行推到手机，fire-and-forget。
     //   webhook    POST JSON { title, text }
@@ -593,6 +599,22 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
       cfg.healthCheck.only = cfg.healthCheck.only.map((s) => s.trim()).filter(Boolean);
     }
     if (typeof cfg.healthCheck.onlyFree !== 'boolean') cfg.healthCheck.onlyFree = defaults.healthCheck.onlyFree;
+  }
+
+  // ---- 用量周报（T46）----
+  if (!isPlainObject(cfg.weekly)) {
+    if (cfg.weekly !== undefined) fix('weekly 必须是对象，已回退为默认值');
+    cfg.weekly = structuredClone(defaults.weekly);
+  } else {
+    if (typeof cfg.weekly.enabled !== 'boolean') cfg.weekly.enabled = defaults.weekly.enabled;
+    if (cfg.weekly.times === undefined) { cfg.weekly.times = defaults.weekly.times; }
+    else if (!Array.isArray(cfg.weekly.times)
+      || !cfg.weekly.times.every((s) => /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(s).trim()))) {
+      fix('weekly.times 必须是 "HH:MM" 字符串数组（如 ["09:00"]），已回退为默认值');
+      cfg.weekly.times = structuredClone(defaults.weekly.times);
+    } else {
+      cfg.weekly.times = cfg.weekly.times.map((s) => String(s).trim().padStart(5, '0'));
+    }
   }
 
   // ---- 桌面通知（T11）+ 外部通知通道（T33）----

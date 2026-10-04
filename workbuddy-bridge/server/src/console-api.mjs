@@ -26,11 +26,12 @@ import { recentEvents } from './events.mjs';
 import { compressionStats } from './compress.mjs';
 import { sendJson } from './util.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
-import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask } from './tasks.mjs';
+import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask, startTaskLoop, stopTaskLoop } from './tasks.mjs';
 import { importLocalAccounts } from './localimport.mjs';
 import { budgetStatus, budgetCheckAndAnnounce } from './budget.mjs';
 import { testChannels } from './notify.mjs';
 import { runProtocolCheck, protocolCheckBrief } from './protocol.mjs';
+import { weeklyTick } from './weekly.mjs';
 import { burnoutReport, predictAccount } from './burnout.mjs';
 import { recentDailyCreditAvg } from './usage.mjs';
 import { checkForUpdate } from './updatecheck.mjs';
@@ -350,23 +351,33 @@ export async function handleConsoleApi(ctx) {
 
   // 保存自动任务设置：精确时点（"HH:MM" 逗号分隔，空串=回退到旧的小时数组）、
   // 对话体验类任务代打开关与单任务代打上限。立即落盘 config.json（调度循环热读取）。
+  // T42：新增 enabled/checkin/growth 三个开关（大屏与任务页可切）。
+  //   时点类字段只在请求体里带了才更新——开关类操作是单字段 POST，
+  //   若沿袭「没带就置空」的旧语义，切个开关会把时点配置一并清掉。
   if (p === '/tasks/config' && method === 'POST') {
     const body = ctx.body || {};
+    const enabledBefore = cfg.tasks.enabled !== false;
     const parseTimes = (v) => String(v ?? '')
       .split(/[,，;；\s]+/)
       .map((s) => s.trim())
       .filter(Boolean)
       .map((s) => s.padStart(5, '0'));
-    const norm = { checkinTimes: parseTimes(body.checkinTimes), growthTimes: parseTimes(body.growthTimes), travelTimes: parseTimes(body.travelTimes), listTimes: parseTimes(body.listTimes) };
+    const norm = {
+      checkinTimes: body.checkinTimes !== undefined ? parseTimes(body.checkinTimes) : null,
+      growthTimes: body.growthTimes !== undefined ? parseTimes(body.growthTimes) : null,
+      travelTimes: body.travelTimes !== undefined ? parseTimes(body.travelTimes) : null,
+      listTimes: body.listTimes !== undefined ? parseTimes(body.listTimes) : null,
+    };
     for (const [k, arr] of Object.entries(norm)) {
+      if (arr === null) continue;
       if (arr.some((s) => !/^([01]?\d|2[0-3]):[0-5]\d$/.test(s))) {
         return sendJson(res, 400, { ok: false, error: `${k} 里有非法时点（应为 HH:MM，如 09:30）：${arr.join(',')}` });
       }
+      cfg.tasks[k] = arr;
     }
-    cfg.tasks.checkinTimes = norm.checkinTimes;
-    cfg.tasks.growthTimes = norm.growthTimes;
-    if (norm.travelTimes) cfg.tasks.travelTimes = norm.travelTimes;
-    if (norm.listTimes) cfg.tasks.listTimes = norm.listTimes;
+    for (const k of ['enabled', 'checkin', 'growth']) {
+      if (typeof body[k] === 'boolean') cfg.tasks[k] = body[k];
+    }
     if (body.travelLocationId !== undefined) {
       const loc = Number(body.travelLocationId);
       if (!Number.isInteger(loc) || loc < 1 || loc > 99) return sendJson(res, 400, { ok: false, error: 'travelLocationId 须为 1-99 整数' });
@@ -379,9 +390,19 @@ export async function handleConsoleApi(ctx) {
       cfg.tasks.maxChatsPerTask = n;
     }
     saveConfig(cfg);
+    // T42：总开关热生效。startTaskLoop 只在启动时判断一次 enabled（之后每分钟 tick 现读
+    // checkin/growth 分类开关，分类开关天然热生效），所以只有总开关真的变了才停/起循环——
+    // 每次保存都重启会把循环闭包里「今天已触发/巡逻防抖」的记忆清零。
+    if (enabledBefore !== (cfg.tasks.enabled !== false)) {
+      stopTaskLoop();
+      if (cfg.tasks.enabled !== false) startTaskLoop(cfg);
+    }
     return sendJson(res, 200, {
       ok: true,
       saved: {
+        enabled: cfg.tasks.enabled,
+        checkin: cfg.tasks.checkin,
+        growth: cfg.tasks.growth,
         checkinTimes: cfg.tasks.checkinTimes,
         growthTimes: cfg.tasks.growthTimes,
         travelTimes: cfg.tasks.travelTimes,
@@ -443,6 +464,18 @@ export async function handleConsoleApi(ctx) {
     } catch (e) {
       return sendJson(res, 502, { error: String(e.message || e).slice(0, 160) });
     }
+  }
+
+  // ---- T46：用量周报（状态/预览 + 手动生成一次并推送）----
+  if (p === '/weekly' && method === 'GET') {
+    let state = {};
+    try { state = JSON.parse(fs.readFileSync(path.join(paths.root, 'weekly.json'), 'utf8')); } catch { /* 没发过 */ }
+    return sendJson(res, 200, { ok: true, config: cfg.weekly, state });
+  }
+  if (p === '/weekly/run' && method === 'POST') {
+    const r = await weeklyTick(cfg, new Date(), { force: true });
+    if (r.skipped) return sendJson(res, 200, { ok: false, skipped: r.skipped });
+    return sendJson(res, 200, { ok: true, summary: r.summary, text: r.text });
   }
 
   // ---- workbuddy-bridge：导入本机已登录客户端的账号 ----
@@ -1019,26 +1052,36 @@ export async function handleConsoleApi(ctx) {
     startSSE(res, { 'X-Console-Stream': 'workbuddy-bridge' });
     let closed = false;
     res.on('close', () => { closed = true; });
-    const push = async (event, data) => {
+    const push = async (event, text) => {
       if (closed || res.writableEnded) return false;
-      try { await writeSSEEvent(res, event, JSON.stringify(data)); return true; }
+      try { await writeSSEEvent(res, event, text); return true; }
       catch { closed = true; return false; }
     };
+    // T43：数据没变就不发帧。bridge/tasks/usage 本就是低频变化的数据，固定节奏推送的
+    // 大多数轮次是纯重复流量；用 JSON 序列化串当哈希（等价于深比较，省得写浅 hash 还
+    // 漏嵌套字段），每个连接独立记账。ping 保活帧不参与——它的职责就是每 15 秒证明连接活着。
+    const lastSent = new Map(); // event → 上次发送的 payload 序列化串
+    const pushIfChanged = async (event, data) => {
+      const text = JSON.stringify(data);
+      if (lastSent.get(event) === text) return true;
+      lastSent.set(event, text);
+      return push(event, text);
+    };
     // 首帧立即给，前端建流后不用再等一个周期
-    await push('bridge', bridgeStatus(cfg, { redact: true }));
-    await push('tasks', taskStatus());
-    await push('usage', usageSnapshot(7));
+    await pushIfChanged('bridge', bridgeStatus(cfg, { redact: true }));
+    await pushIfChanged('tasks', taskStatus());
+    await pushIfChanged('usage', usageSnapshot(7));
     const jobs = [
       ['bridge', () => bridgeStatus(cfg, { redact: true }), 20_000],
       ['tasks', () => taskStatus(), 30_000],
       ['usage', () => usageSnapshot(7), 60_000],
-      ['ping', () => ({ at: Date.now() }), 15_000], // 保活帧（也兼作服务存活探测）
+      ['ping', () => ({ at: Date.now() }), 15_000, true], // 保活帧（也兼作服务存活探测），每次都发
     ];
-    for (const [event, make, ms] of jobs) {
+    for (const [event, make, ms, always] of jobs) {
       const t = setInterval(async () => {
         if (closed) { clearInterval(t); return; }
         try {
-          const ok = await push(event, make());
+          const ok = always ? await push(event, JSON.stringify(make())) : await pushIfChanged(event, make());
           if (!ok) clearInterval(t);
         } catch { clearInterval(t); }
       }, ms);

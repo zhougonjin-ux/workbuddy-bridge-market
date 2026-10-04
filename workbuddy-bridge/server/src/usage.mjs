@@ -163,6 +163,12 @@ export function recordBalance(site, remain) {
   scheduleSave();
 }
 
+/** T46 用量周报：把原始 days map（'YYYY-MM-DD' → 当日统计）暴露给 weekly.mjs 按自然周聚合。 */
+export function usageDays() {
+  ensureLoaded();
+  return data.days;
+}
+
 /** 汇总：今天 / 最近 N 天 / 按模型排行 / 余额趋势 / 今日小时分布。 */
 export function usageSnapshot(days = 7) {
   ensureLoaded();
