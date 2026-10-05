@@ -768,12 +768,12 @@ const { budgetBlockActive, budgetBlockError } = await import('../src/budget.mjs'
 const { evaluateSignatures, PROTOCOL_SIGNATURES } = await import('../src/protocol.mjs');
 const { setConfigDir } = await import('../src/config.mjs');
 
-test('T33 enabledChannels：只认三种类型、必须有 url、enabled:false 被排除', () => {
+test('T33 enabledChannels：只认白名单类型、必须有 url、enabled:false 被排除', () => {
   const cfg = { notify: { channels: [
     { type: 'webhook', url: 'https://a.example/hook' },
     { type: 'bark', url: 'https://b.example/key', enabled: false },   // 显式关掉
     { type: 'serverchan', url: '  https://c.example/send  ' },       // 前后空格要 trim
-    { type: 'telegram', url: 'https://d.example' },                  // 未知类型：丢弃
+    { type: 'sms', url: 'https://d.example' },                       // 未知类型：丢弃（T62 后 telegram/feishu/dingtalk 已入白名单）
     { type: 'webhook', url: '' },                                    // 没 url：丢弃
     null,
   ] } };

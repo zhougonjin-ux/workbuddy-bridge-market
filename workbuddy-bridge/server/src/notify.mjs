@@ -97,7 +97,7 @@ export function notifyTask(cfg, title, text, keySuffix = '') {
 // 全部 fire-and-forget：投递在后台跑，notify() 立刻返回，绝不阻塞任务主流程。
 // 节流复用 shouldNotify 的同一张表（按通道分 key），一个通道坏了不影响别的。
 
-const CHANNEL_TYPES = new Set(['webhook', 'bark', 'serverchan']);
+const CHANNEL_TYPES = new Set(['webhook', 'bark', 'serverchan', 'feishu', 'dingtalk', 'telegram']);
 
 /** 清洗成 URL 安全的一段（title/body 里可能有空格与中文）。 */
 function urlSeg(s, max = 80) {
@@ -141,6 +141,33 @@ export function buildChannelRequest(ch, title, text) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: new URLSearchParams({ title: t, desp: b }).toString(),
       },
+    };
+  }
+  // T62：飞书自定义机器人 / 钉钉自定义机器人 / Telegram Bot。
+  //   feishu   POST {msg_type:'text', content:{text}}（url = 开放平台复制的 webhook 地址）
+  //   dingtalk POST {msgtype:'text', text:{content}}（url = oapi.dingtalk.com 机器人 webhook）
+  //   telegram POST {chat_id, text}——url 形如 https://api.telegram.org/bot<token>/sendMessage，
+  //            chat_id 拼在 url 查询参数里（?chat_id=123456），这里解析出来挪进 body。
+  if (ch.type === 'feishu') {
+    return {
+      url: ch.url,
+      init: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msg_type: 'text', content: { text: `【${t}】${b}` } }) },
+    };
+  }
+  if (ch.type === 'dingtalk') {
+    return {
+      url: ch.url,
+      init: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ msgtype: 'text', text: { content: `【${t}】${b}` } }) },
+    };
+  }
+  if (ch.type === 'telegram') {
+    const u = new URL(ch.url);
+    const chatId = u.searchParams.get('chat_id') || '';
+    if (!chatId) throw new Error('telegram 通道的 url 里缺 chat_id 查询参数（如 ?chat_id=123456）');
+    u.searchParams.delete('chat_id');
+    return {
+      url: u.toString(),
+      init: { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, text: `【${t}】${b}` }) },
     };
   }
   return null;

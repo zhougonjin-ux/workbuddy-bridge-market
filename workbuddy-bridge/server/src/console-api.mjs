@@ -28,7 +28,8 @@ import { sendJson } from './util.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
 import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask, startTaskLoop, stopTaskLoop, heatmapView, syncAccountNickname } from './tasks.mjs';
 import { importLocalAccounts } from './localimport.mjs';
-import { budgetStatus, budgetCheckAndAnnounce } from './budget.mjs';
+import { budgetStatus, budgetCheckAndAnnounce, accountBudgetCheckAndAnnounce, accountBudgetStatus } from './budget.mjs';
+import { backupList, backupNow, backupTick } from './backup.mjs';
 import { testChannels } from './notify.mjs';
 import { runProtocolCheck, protocolCheckBrief } from './protocol.mjs';
 import { weeklyTick } from './weekly.mjs';
@@ -146,10 +147,12 @@ function alertThresholds(cfg) {
 }
 
 /** T32：把预测结果挂到 /pool 返回的账号快照上，账号卡批次行据此显示「预计用不完」。 */
-function attachBurnoutToAccounts(site, accounts, dailyAvg) {
+function attachBurnoutToAccounts(cfg, site, accounts, dailyAvg) {
   for (const a of accounts) {
     const p = predictAccount(a, { dailyAvg });
     a.burnout = { dailyAvg: p.dailyAvg, riskCount: p.riskCount, totalWaste: p.totalWaste, batches: p.batches };
+    // T63：按账号预算状态挂在账号上，账号卡余额旁显示「今日 N/M」
+    a.budget = accountBudgetStatus(cfg, a.id);
   }
   return accounts;
 }
@@ -299,7 +302,7 @@ export async function handleConsoleApi(ctx) {
         }
       }
     }
-    return sendJson(res, 200, { site, accounts: attachBurnoutToAccounts(site, accounts, recentDailyCreditAvg(7)), supports_credit: supportsCreditQuery(cfg, site) });
+    return sendJson(res, 200, { site, accounts: attachBurnoutToAccounts(cfg, site, accounts, recentDailyCreditAvg(7)), supports_credit: supportsCreditQuery(cfg, site) });
   }
 
   // ---- workbuddy-bridge：调度策略查看/切换 ----
@@ -319,6 +322,15 @@ export async function handleConsoleApi(ctx) {
     // /backup 保留明文：导出的用途本就是把账号整套搬走。
     const b = bridgeStatus(cfg, { redact: true });
     b.budget = budgetCheckAndAnnounce(cfg); // T13：预警条数据源 + 每天一次的预算提醒
+    // T63：按账号预算（每 20s 轮询下发 + 超限每天提醒一次）
+    const bAccs = [];
+    for (const s of b.sites || []) {
+      for (const a of s.accounts || []) {
+        if (a.enabled === false) continue;
+        bAccs.push({ site: s.site, id: a.id, label: a.label || a.nickname || a.id });
+      }
+    }
+    b.perAccountBudget = accountBudgetCheckAndAnnounce(cfg, bAccs);
     b.burnout = burnoutBrief(cfg); // T32：预警条的「预计用不完」项
     b.alerts = alertThresholds(cfg); // T34：预警阈值（原先写死在前端，现由配置下发）
     return sendJson(res, 200, b);
@@ -501,6 +513,44 @@ export async function handleConsoleApi(ctx) {
     }
   }
 
+  // ---- T58：数据自动备份（列表 / 立即备份 / 配置 enabled/times/keep）----
+  if (p === '/backups' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, config: cfg.backup, list: backupList(), state: (() => { try { return JSON.parse(fs.readFileSync(path.join(paths.root, 'backup-state.json'), 'utf8')); } catch { return {}; } })() });
+  }
+  if (p === '/backups/run' && method === 'POST') {
+    try {
+      const r = backupNow(cfg);
+      return sendJson(res, 200, { ok: true, ...r, message: `已备份 ${r.files} 个文件到 ${path.basename(r.file)}（滚动保留 ${r.kept} 份）` });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: String(e.message || e).slice(0, 160) });
+    }
+  }
+  if (p === '/backups/config' && method === 'POST') {
+    const body = ctx.body || {};
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+      cfg.backup.enabled = body.enabled;
+    }
+    if (body.times !== undefined) {
+      const times = String(body.times ?? '')
+        .split(/[,，;；\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean)
+        .map((s) => s.padStart(5, '0'));
+      if (times.some((s) => !/^([01]?\d|2[0-3]):[0-5]\d$/.test(s))) {
+        return sendJson(res, 400, { ok: false, error: `times 里有非法时点（应为 HH:MM，如 09:00）：${times.join(',')}` });
+      }
+      cfg.backup.times = times;
+    }
+    if (body.keep !== undefined) {
+      const n = Number(body.keep);
+      if (!Number.isInteger(n) || n < 1 || n > 52) return sendJson(res, 400, { ok: false, error: 'keep 必须是 1-52 的整数' });
+      cfg.backup.keep = n;
+    }
+    saveConfig(cfg);
+    return sendJson(res, 200, { ok: true, config: cfg.backup });
+  }
+
   // ---- T46：用量周报（状态/预览 + 手动生成一次并推送）----
   if (p === '/weekly' && method === 'GET') {
     let state = {};
@@ -632,6 +682,16 @@ export async function handleConsoleApi(ctx) {
     if (body.mode !== undefined) {
       if (!['warn', 'free', 'pause'].includes(body.mode)) return sendJson(res, 400, { ok: false, error: 'mode 必须是 warn/free/pause' });
       cfg.budget.mode = body.mode;
+    }
+    // T63 按账号预算：{ accountId: 每日积分 }，整包替换（前端每次提交全量）；非法值剔除
+    if (body.accounts !== undefined) {
+      if (!isPlainObj(body.accounts)) return sendJson(res, 400, { ok: false, error: 'accounts 必须是对象（accountId → 每日积分）' });
+      const kept = {};
+      for (const [k, v] of Object.entries(body.accounts)) {
+        const n = Number(v);
+        if (Number.isFinite(n) && n > 0) kept[k] = n;
+      }
+      cfg.budget.accounts = kept;
     }
     saveConfig(cfg);
     return sendJson(res, 200, { ok: true, budget: budgetStatus(cfg) });

@@ -255,6 +255,14 @@ export function defaultConfig() {
       enabled: true,
       times: ['09:00'],       // ["HH:MM"]，周一命中即发
     },
+    // 数据自动备份（T58）：每天在这些时点把 config + 账号池 + 状态文件打包存到
+    // 数据目录 backups/（同一天只备一次，滚动保留 keep 份）。账号池里是上游 token，
+    // 丢了就得全部重扫——每天备一次，最多丢当天的增量。
+    backup: {
+      enabled: true,
+      times: ['09:00'],       // ["HH:MM"]，每天命中第一个时点即备
+      keep: 4,                // 滚动保留份数
+    },
     // 桌面通知（T11）：签到失败/猫猫归来/账号登录态失效弹 Windows toast。默认开。
     // channels（T33）：把同一条通知并行推到手机，fire-and-forget。
     //   webhook    POST JSON { title, text }
@@ -279,6 +287,7 @@ export function defaultConfig() {
       dailyCredits: 100,      // 每日预算（积分，估算口径）
       warnPercent: 80,        // 达到该比例时预警（控制台预警条 + 事件）
       mode: 'warn',           // warn=只预警 | free=超限后 default/auto 改道免费模型（T13）| pause=超限直接拒绝新请求（T37）
+      accounts: {},           // T63 按账号预算：{ accountId: 每日积分 }，只提醒+展示不改道（见 budget.mjs）
     },
     // 限流：服务只绑 127.0.0.1，所以要挡的不是远程攻击，而是
     //   1) 客户端 bug 导致的失控重试循环
@@ -343,7 +352,7 @@ const isStr = (v) => typeof v === 'string';
 const isBool = (v) => typeof v === 'boolean';
 
 /** T33 认可的外部通知通道类型（与 notify.mjs 的 CHANNEL_TYPES 保持一致）。 */
-export const NOTIFY_CHANNEL_TYPES = ['webhook', 'bark', 'serverchan'];
+export const NOTIFY_CHANNEL_TYPES = ['webhook', 'bark', 'serverchan', 'feishu', 'dingtalk', 'telegram'];
 
 /** 有限正数（端口允许 0，表示随机端口）。 */
 function isPort(v) {
@@ -617,6 +626,30 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     }
   }
 
+  // ---- 数据自动备份（T58）----
+  if (!isPlainObject(cfg.backup)) {
+    if (cfg.backup !== undefined) fix('backup 必须是对象，已回退为默认值');
+    cfg.backup = structuredClone(defaults.backup);
+  } else {
+    if (typeof cfg.backup.enabled !== 'boolean') cfg.backup.enabled = defaults.backup.enabled;
+    if (cfg.backup.times === undefined) { cfg.backup.times = structuredClone(defaults.backup.times); }
+    else if (!Array.isArray(cfg.backup.times)
+      || !cfg.backup.times.every((s) => /^([01]?\d|2[0-3]):[0-5]\d$/.test(String(s).trim()))) {
+      fix('backup.times 必须是 "HH:MM" 字符串数组（如 ["09:00"]），已回退为默认值');
+      cfg.backup.times = structuredClone(defaults.backup.times);
+    } else {
+      cfg.backup.times = cfg.backup.times.map((s) => String(s).trim().padStart(5, '0'));
+    }
+    if (cfg.backup.keep === undefined) cfg.backup.keep = defaults.backup.keep;
+    else {
+      const n = Number(cfg.backup.keep);
+      if (!Number.isInteger(n) || n < 1 || n > 52) {
+        fix('backup.keep 必须是 1-52 的整数（滚动保留份数），已回退为默认值');
+        cfg.backup.keep = defaults.backup.keep;
+      } else cfg.backup.keep = n;
+    }
+  }
+
   // ---- 桌面通知（T11）+ 外部通知通道（T33）----
   if (cfg.notify !== undefined && !isPlainObject(cfg.notify)) {
     fix('notify 必须是对象，已回退为默认值');
@@ -700,6 +733,22 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     if (!['warn', 'free', 'pause'].includes(cfg.budget.mode)) {
       fix(`budget.mode 必须是 warn/free/pause 之一，已回退为 ${defaults.budget.mode}`);
       cfg.budget.mode = defaults.budget.mode;
+    }
+    // T63 按账号预算：{ accountId: 每日积分预算 }；值非法的条目剔除而不是整段回退
+    if (cfg.budget.accounts === undefined) cfg.budget.accounts = {};
+    else if (!isPlainObject(cfg.budget.accounts)) {
+      fix('budget.accounts 必须是对象（accountId → 每日积分预算），已重置为空');
+      cfg.budget.accounts = {};
+    } else {
+      for (const [k, v] of Object.entries(cfg.budget.accounts)) {
+        const n = Number(v);
+        if (!Number.isFinite(n) || n <= 0) {
+          fix(`budget.accounts.${k} 必须是正数，已剔除该条目`);
+          delete cfg.budget.accounts[k];
+        } else {
+          cfg.budget.accounts[k] = n;
+        }
+      }
     }
   }
 

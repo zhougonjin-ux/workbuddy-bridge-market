@@ -556,6 +556,16 @@ async function loadOverview() {
     const streakTip = streakEntries.length
       ? streakEntries.map(([uid, e]) => `${accNames[uid] || uid.slice(0, 8)}：连登 ${e.days ?? '?'} 天 · 下一档${e.nextTier || '—'}差 ${e.nextTierRemaining ?? '?'} 天 · 补签卡 ${e.makeupBalance ?? '?'}/${e.makeupMax ?? '?'} · 抽奖 ${e.chancesLeft ?? e.chances ?? 0} 次 · 快照 ${e.date || ''}`).join('\n')
       : '还没有连登扫描记录（签到/连登巡检后出现）';
+    // T60：三档进度条——每段按当前连登天数填充，已兑换的档整条点亮
+    const stkSeg = (label, need, days, status) => {
+      const claimed = status === 'claimed';
+      const pct = claimed ? 100 : Math.round(Math.min(1, Math.max(0, days) / need) * 100);
+      const unlocked = pct >= 100;
+      return `<span class="stk ${claimed ? 'got' : unlocked ? 'ready' : ''}" title="${label} 档：连登 ${need} 天解锁（${claimed ? '已兑换' : unlocked ? '已解锁待兑换，跑一次连登巡检即可' : '还差 ' + (need - days) + ' 天'}）"><i style="width:${pct}%"></i><u>${label}</u></span>`;
+    };
+    const stkbar = stTop
+      ? `<div class="stkbar">${stkSeg('7天', 7, stTop.days, stTop.tier7d)}${stkSeg('14天', 14, stTop.days, stTop.tier14d)}${stkSeg('28天', 28, stTop.days, stTop.tier28d)}</div>`
+      : '';
     const dsum = (doctor && doctor.summary) || { pass: '—', warn: '—', fail: 0 };
     const concerns = [];
     for (const x of enabled) {
@@ -643,7 +653,8 @@ async function loadOverview() {
             <span class="tag ${ck.ok >= ck.total ? 'ok' : ''}" data-go="tasks" title="今日签到进度 · 点击查看任务详情与手动签到" style="cursor:pointer">签到 ${ck.ok}/${ck.total}</span>
             <span class="tag ${gr.ok >= gr.total ? 'ok' : ''}" data-go="tasks" title="今日成长任务进度 · 点击查看任务详情与手动扫描" style="cursor:pointer">成长 ${gr.ok}/${gr.total}</span>
             <span class="tag ${st.ok >= st.total ? 'ok' : ''}" data-go="tasks" title="${esc(streakTip)}" style="cursor:pointer">🔗 ${stTop ? '连登 ' + stTop.days + ' 天' : '连登未巡'}</span></div>
-          <div class="muted">${stTop ? `下一档 ${esc(stTop.nextTier || '—')} 差 ${stTop.nextTierRemaining ?? '—'} 天 · 补签卡 ${stTop.makeupBalance ?? '—'}/${stTop.makeupMax ?? '—'} · 抽奖 ${stTop.chancesLeft ?? 0} 次` : '连登巡检跑过后这里显示档位/补签卡/抽奖次数'}</div>
+          ${stkbar}
+          <div class="muted">${stTop ? `连登 ${stTop.days} 天 · 下一档 ${esc(stTop.nextTier || '—')} 差 ${stTop.nextTierRemaining ?? '—'} 天 · 补签卡 ${stTop.makeupBalance ?? '—'}/${stTop.makeupMax ?? '—'} · 抽奖 ${stTop.chancesLeft ?? 0} 次` : '连登巡检跑过后这里显示档位/补签卡/抽奖次数'}</div>
           <div class="muted">时点：签到 ${esc(((bridge.tasks || {}).checkinTimes || []).join(' ') || '09/21 点')} · 成长 ${esc(((bridge.tasks || {}).growthTimes || []).join(' ') || '01/13 点')}</div>
         </div>
         <div class="card hv tilt an" style="--c:#4F8CFF;animation-delay:420ms">
@@ -758,6 +769,14 @@ async function loadAlerts() {
         items.push(`<span class="alertbar red" title="今日已消耗 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分${actTip}">🔴 预算超限：今日 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分（${act}）</span>`);
       } else if (bt.warn) {
         items.push(`<span class="alertbar orange" title="今日已消耗 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分，已达预警线">🟠 预算预警：今日 ${fmtCredit(bt.spent)}/${fmtCredit(bt.budget)} 积分（${bt.percent}%）</span>`);
+      }
+    }
+    // T63：按账号预算预警（只提醒不拦截；预算在设置页预算卡按账号配置）
+    for (const pb of b.perAccountBudget || []) {
+      if (pb.exceeded) {
+        items.push(`<span class="alertbar red" title="该账号的每日预算已用尽（按账号预算只提醒，不拦截请求）">🔴 账号预算超限：${esc(pb.label)} 今日 ${fmtCredit(pb.spent)}/${fmtCredit(pb.daily)} 积分</span>`);
+      } else if (pb.warn) {
+        items.push(`<span class="alertbar orange" title="该账号今日消耗已达预警线（按账号预算只提醒，不拦截请求）">🟠 账号预算预警：${esc(pb.label)} 今日 ${fmtCredit(pb.spent)}/${fmtCredit(pb.daily)}（${pb.percent}%）</span>`);
       }
     }
     const accName = (a) => esc(a.label || a.nickname || a.id);
@@ -993,9 +1012,11 @@ function acctCard(site, row, raw) {
   const dl = daysLeftOf(rawBal, bo.dailyAvg);
   const dlTag = dl !== null ? `<span class="dltag" title="按近 7 日日均 ${fmtCredit(bo.dailyAvg)} 积分估算">≈${dl} 天</span>` : '';
   const boTag = bo.riskCount > 0 ? `<span class="badge warn" title="有 ${bo.riskCount} 个批次到期前按当前速率用不完">📉 到期预计浪费 ${fmtCredit(bo.totalWaste)}</span>` : '';
+  // T63：按账号每日预算徽标（设置页预算卡配置；只提醒不拦截）
+  const budTag = a.budget ? `<span class="badge ${a.budget.exceeded ? 'bad' : a.budget.warn ? 'warn' : ''}" title="按账号每日预算：今日已消耗 ${fmtCredit(a.budget.spent)}/${fmtCredit(a.budget.daily)} 积分">今日 ${fmtCredit(a.budget.spent)}/${fmtCredit(a.budget.daily)}</span>` : '';
   return `<div class="acct ${a.enabled ? '' : 'off'} ${isPinned ? 'pinned' : ''}" data-acct-card data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="点击固定使用该账号，再点一次恢复自动调度">
     <div class="hd"><b data-act="rename" data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="点击改名">${esc(a.label || a.id)}</b>${pinnedBadge}${inUse}${a.is_default ? '<span class="badge acc">默认</span>' : ''}${status}<span class="spacer"></span><small class="muted">${esc(String(a.uid || '').slice(0, 8))}…</small></div>
-    <div class="bal">${bal === null ? '<span class="muted" style="font-size:14px">余额未知</span>' : bal}<small>积分${dlTag}${boTag}${a.creditCheckedAt ? ' · 刷新于 ' + new Date(a.creditCheckedAt).toLocaleTimeString() : ''}</small></div>
+    <div class="bal">${bal === null ? '<span class="muted" style="font-size:14px">余额未知</span>' : bal}<small>积分${dlTag}${boTag}${budTag}${a.creditCheckedAt ? ' · 刷新于 ' + new Date(a.creditCheckedAt).toLocaleTimeString() : ''}</small></div>
     <div class="batches">${batches || (a.creditDetail && a.creditDetail.length ? '' : '<span class="muted" style="font-size:12px">暂无批次明细 —— 点「刷新全部积分」获取</span>')}</div>
     ${spentNote}
     ${a.manualExpireAt ? `<div style="font-size:12px" class="muted">手动到期兜底：<span class="warn">${esc(a.manualExpireAt)}</span></div>` : ''}
@@ -1542,6 +1563,16 @@ async function loadTasks() {
             <button class="btn" id="bdSave">保存预算</button>
             <span class="muted" id="bdNow" style="font-size:12px"></span>
           </div>
+          <div class="row" style="flex-wrap:wrap;gap:10px;margin-top:12px">
+            <b style="font-size:13px">按账号预算 <span class="sub">T63 · 单账号每日上限（积分），留空=不限 · 只提醒不拦截</span></b>
+          </div>
+          <div class="row" style="flex-wrap:wrap;gap:10px">
+            ${(bridge.sites || []).flatMap((s) => (s.accounts || []).filter((a) => a.enabled !== false).map((a) => `
+              <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="账号 ${esc(a.label || a.id)}（${esc(s.label)}）的每日消耗上限；超限只弹通知与预警条，不拦截请求">
+                ${esc(a.label || a.id)}
+                <input type="number" min="1" class="bdAcct" data-site="${esc(s.site)}" data-id="${esc(a.id)}" value="${cfg.budget?.accounts?.[a.id] ?? ''}" placeholder="不限" style="width:76px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+              </label>`)).join('') || '<span class="muted" style="font-size:12px">还没有账号</span>'}
+          </div>
           <div class="muted" style="font-size:12px;margin-top:8px">预算口径与「用量」页一致（上游没报积分时按倍率×tokens 估算）；「自动切免费」不影响显式指定的模型，「暂停新请求」则会拦下所有模型请求（含显式指定）。</div>
         </div>
       </details>`;
@@ -1627,6 +1658,9 @@ async function loadTasks() {
           dailyCredits: Number($('#bdDaily').value) || 100,
           warnPercent: Number($('#bdWarn').value) || 80,
           mode: $('#bdMode').value,
+          accounts: Object.fromEntries([...document.querySelectorAll('.bdAcct')]
+            .map((i) => [i.dataset.id, Number(i.value)])
+            .filter(([, v]) => Number.isFinite(v) && v > 0)),
         } });
         const bt = r.budget || {};
         toast(`预算已保存：${bt.enabled ? '今日 ' + fmtCredit(bt.spent) + '/' + fmtCredit(bt.budget) + '（' + bt.percent + '%）' : '已关闭'}`, 'ok');
@@ -1997,10 +2031,10 @@ function healthState(a) {
   async function loadHealth() {
     const el = $('#sec-health');
     try {
-      const [bridge, keys, srr, sec, nt, pc, w] = await Promise.all([
+      const [bridge, keys, srr, sec, nt, pc, w, bk] = await Promise.all([
         api('/bridge'), api('/keys').catch(() => null), api('/schedule-router').catch(() => null),
         api('/security').catch(() => null), api('/notify').catch(() => null), api('/protocol').catch(() => null),
-        api('/weekly').catch(() => null)]);
+        api('/weekly').catch(() => null), api('/backups').catch(() => null)]);
     // T34：预警阈值从 /bridge 下发，写进卡片输入框（loadAlerts 已同步更新同一份）
     const at = bridge.alerts || {};
     ALERT_TH = { ...ALERT_FALLBACK, ...(at || {}) };
@@ -2174,6 +2208,9 @@ function healthState(a) {
           <b>webhook</b>：POST JSON <code>{ title, text }</code>，适合自建中转。<br>
           <b>bark</b>：地址填到设备 key 为止，如 <code>https://api.day.app/你的Key</code>，标题正文自动拼到路径里。<br>
           <b>serverchan</b>：填完整的 SendKey 地址，如 <code>https://sctapi.ftqq.com/你的Key.send</code>。<br>
+          <b>feishu</b>：填飞书自定义机器人 webhook 地址（群设置 → 群机器人添加）。<br>
+          <b>dingtalk</b>：填钉钉自定义机器人 webhook 地址（安全设置选「自定义关键词」，加「通知」二字）。<br>
+          <b>telegram</b>：填 <code>https://api.telegram.org/bot&lt;token&gt;/sendMessage?chat_id=&lt;会话ID&gt;</code>。<br>
           地址里含密钥，保存后这里只显示打码值；不配置就完全不发外部请求。每个通道按事件独立 5 分钟节流。
         </div>
       </div>
@@ -2193,6 +2230,24 @@ function healthState(a) {
           <span class="muted" id="wkMsg" style="font-size:12px">${w && w.state && w.state.lastSent ? '上次发送：' + esc(w.state.lastSent) + '（每周最多一次，重启不重复发）' : '本周还没发过（周一自动发，或点按钮手动生成）'}</span>
         </div>
         <div class="muted" style="font-size:12px;margin-top:8px">推送走「通知通道」卡里配置的 webhook/Bark/Server酱 + Windows 气泡；没配通道也能在事件时间线里看到生成记录。</div>
+      </div>
+      <h2>数据备份 <span class="sub">T58 · 每天 ${(bk && bk.config && (bk.config.times || []).join(' / ')) || '09:00'} 自动把 config + 账号池 + 状态文件打包到数据目录 backups/（滚动保留 ${(bk && bk.config && bk.config.keep) || 4} 份）</span></h2>
+      <div class="card" style="margin-bottom:20px">
+        <div class="row" style="flex-wrap:wrap;gap:10px;align-items:center">
+          <span class="badge ${bk && bk.config && bk.config.enabled !== false ? 'ok' : ''}">${bk && bk.config && bk.config.enabled !== false ? '已启用' : '已关闭'}</span>
+          <button class="btn" id="bkRun">▶ 立即备份一次</button>
+          <label style="display:flex;align-items:center;gap:5px;font-size:13px" title="自动备份的滚动保留份数（1-52）">保留份数
+            <input id="bkKeep" type="number" min="1" max="52" value="${(bk && bk.config && bk.config.keep) ?? 4}" style="width:60px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px" title="每天自动备份的时点，逗号分隔">时点
+            <input id="bkTimes" value="${esc(((bk && bk.config && bk.config.times) || ['09:00']).join(', '))}" placeholder="09:00" style="width:120px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+          </label>
+          <label style="display:flex;align-items:center;gap:5px;font-size:13px"><input type="checkbox" id="bkEnabled" ${bk && bk.config && bk.config.enabled !== false ? 'checked' : ''}> 启用自动备份</label>
+          <button class="btn mini" id="bkSave">保存设置</button>
+          <span class="muted" id="bkMsg" style="font-size:12px">${bk && bk.state && bk.state.lastBackupDay ? '上次备份：' + esc(bk.state.lastBackupDay) : '今天还没备份过'}</span>
+        </div>
+        <div id="bkList" style="margin-top:10px">${(bk.list || []).slice(0, 6).map((f) => `<div class="row" style="grid-template-columns:minmax(0,1fr) auto auto"><span class="mono" style="font-size:12px">${esc(f.name)}</span><span class="muted" style="font-size:11.5px">${(f.bytes / 1024).toFixed(1)} KB</span><span class="muted" style="font-size:11.5px">${f.mtime ? esc(new Date(f.mtime).toLocaleString()) : ''}</span></div>`).join('') || '<div class="muted" style="padding:6px 2px;font-size:12px">还没有备份文件——点「立即备份一次」生成第一份</div>'}</div>
+        <div class="muted" style="font-size:12px;margin-top:8px">备份含账号池（上游 token，明文）与全部状态文件，只落在本机数据目录 backups/，不上传任何服务器。恢复：停服后把备份 JSON 里的 files 解包回数据目录，或参考 /backup 导入。</div>
       </div>
       <h2>一键诊断 <span class="sub">T24 · 只读体检：服务/配置/登录态/账号池/路由/数据文件/后台循环/协议，与 /wbp-doctor 同源</span></h2>
       <div class="card" style="margin-bottom:20px">
@@ -2375,7 +2430,7 @@ function healthState(a) {
       $('#ntList').innerHTML = (list && list.length) ? list.map((c, i) => `
         <div class="row" data-ch="${i}" style="margin-bottom:8px;padding:9px 11px;border:1px solid var(--line);border-radius:9px">
           <select data-ch-type="${i}" style="min-width:118px">
-            ${['webhook', 'bark', 'serverchan'].map((t) => `<option value="${t}" ${c.type === t ? 'selected' : ''}>${t}</option>`).join('')}
+            ${['webhook', 'bark', 'serverchan', 'feishu', 'dingtalk', 'telegram'].map((t) => `<option value="${t}" ${c.type === t ? 'selected' : ''}>${t}</option>`).join('')}
           </select>
           <input type="text" data-ch-url="${i}" value="${esc(c.url || '')}" placeholder="完整地址（含密钥）" style="flex:1;min-width:200px">
           <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input type="checkbox" data-ch-on="${i}" ${c.enabled !== false ? 'checked' : ''}> 启用</label>
@@ -2448,6 +2503,31 @@ function healthState(a) {
         } else toast('未生成：' + (r.skipped || '未知原因'), 'bad');
       } catch (e) { toast('生成失败：' + e.message, 'bad'); }
       b.disabled = false; b.textContent = '▶ 立即生成一次';
+    };
+
+    // ---- T58 行为绑定：数据备份 ----
+    $('#bkRun').onclick = async () => {
+      const b = $('#bkRun');
+      b.disabled = true; b.textContent = '备份中…';
+      try {
+        const r = await api('/backups/run', { method: 'POST' });
+        if (r.ok) {
+          toast(r.message || '备份完成', 'ok');
+          if ($('#bkMsg')) $('#bkMsg').textContent = '上次备份：刚刚';
+          loadHealth(); // 刷新备份列表
+        } else toast('备份失败：' + (r.error || '未知'), 'bad');
+      } catch (e) { toast('备份失败：' + e.message, 'bad'); }
+      b.disabled = false; b.textContent = '▶ 立即备份一次';
+    };
+    $('#bkSave').onclick = async () => {
+      try {
+        const r = await api('/backups/config', { method: 'POST', body: {
+          enabled: $('#bkEnabled').checked,
+          times: $('#bkTimes').value,
+          keep: Number($('#bkKeep').value) || 4,
+        } });
+        toast(`备份设置已保存：${r.config.enabled ? '每天 ' + (r.config.times || []).join(' / ') : '已关闭'} · 保留 ${r.config.keep} 份`, 'ok');
+      } catch (e) { toast('保存失败：' + e.message, 'bad'); }
     };
 
     // ---- T24 行为绑定：一键诊断 ----

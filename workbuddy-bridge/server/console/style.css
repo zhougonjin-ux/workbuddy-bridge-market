@@ -934,3 +934,11 @@ body.wbpanel-open .wbtip{z-index:70}
 [data-theme='guofeng'],[data-theme='guofeng'] body{--panel:#FAF6EC;--panel2:#F1EADA;--line:#DCCFB4;--text:#3A2E20;--muted:#75664F;--accent:#9E3D3D;--bad:#A83232}
 [data-theme='cyber'],[data-theme='cyber'] body{--panel:#04120C;--panel2:#07190F;--line:#123626;--text:#D8FFE9;--muted:#5FA98A;--accent:#00E68C;--bad:#FF5470}
 [data-theme='sakura'],[data-theme='sakura'] body{--panel:#FDF3F6;--panel2:#F9E8EE;--line:#EBD0DA;--text:#43222F;--muted:#8A6070;--accent:#E0527E;--bad:#C73355}
+
+/* ---- T60：连登三档进度条（大屏「自动任务·今日」卡） ---- */
+.stkbar { display: flex; gap: 6px; margin: 2px 0 7px; }
+.stk { position: relative; flex: 1; height: 12px; background: var(--chip, rgba(120,150,220,.16)); border-radius: 6px; overflow: hidden; }
+.stk i { position: absolute; top: 0; bottom: 0; left: 0; background: linear-gradient(90deg, var(--ac, #4F8CFF), var(--cy, #22D3EE)); opacity: .45; transition: width .4s var(--ease, ease); }
+.stk.ready i { opacity: .8; }
+.stk.got i { opacity: 1; background: linear-gradient(90deg, var(--ok, #34D399), var(--cy, #22D3EE)); }
+.stk u { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; font-family: monospace; color: var(--tx, #E4ECFC); text-decoration: none; pointer-events: none; }

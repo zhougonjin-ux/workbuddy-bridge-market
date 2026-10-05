@@ -162,6 +162,24 @@ export async function runDiagnostics(cfg) {
     const growthRuns = Object.values(tasks.growth || {}).length;
     const checkinRuns = Object.values(tasks.checkin || {}).length;
     add('自动任务', 'pass', `签到记录 ${checkinRuns} 个账号 · 成长任务记录 ${growthRuns} 个账号 · 任务状态文件正常`);
+    // T66：连登管家巡检——漏跑一天连登断链重攒 7 天，值得单独一项盯住。
+    // 只读本地 tasks-state，不发上游请求。签到时点已过且没有今天的 streak 记录 → warn。
+    const streakEntries = Object.values(tasks.streak || {});
+    const now0 = new Date();
+    const todayStr = `${now0.getFullYear()}-${String(now0.getMonth() + 1).padStart(2, '0')}-${String(now0.getDate()).padStart(2, '0')}`;
+    const hhmm = `${String(now0.getHours()).padStart(2, '0')}:${String(now0.getMinutes()).padStart(2, '0')}`;
+    const times = Array.isArray(cfg.tasks?.checkinTimes) && cfg.tasks.checkinTimes.length ? cfg.tasks.checkinTimes : [];
+    const pastDue = times.some((x) => x <= hhmm)
+      || (Array.isArray(cfg.tasks?.checkinHours) && cfg.tasks.checkinHours.some((h) => h <= now0.getHours()));
+    const ranToday = streakEntries.some((e) => e.date === todayStr && e.ok);
+    if (ranToday) {
+      const top = streakEntries.filter((e) => e.ok && e.date === todayStr).sort((a, b) => (b.days || 0) - (a.days || 0))[0];
+      add('连登管家', 'pass', `今天已巡检${top ? `（连登 ${top.days ?? '?'} 天 · 下一档 ${top.nextTier || '—'} 差 ${top.nextTierRemaining ?? '?'} 天）` : ''}`);
+    } else if (pastDue) {
+      add('连登管家', 'warn', '今天签到时点已过但连登管家没有巡检记录——连登断链要重攒 7 天，点任务页「🔗 连登巡检」补跑');
+    } else {
+      add('连登管家', 'pass', '今天还没到签到时点（时点过后自动巡检，错过会补跑）');
+    }
   } catch (e) {
     add('自动任务', 'fail', `任务状态读取失败：${e.message}`);
   }

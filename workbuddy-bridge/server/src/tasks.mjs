@@ -465,7 +465,25 @@ export async function growthScanAccount(cfg, site, accountId) {
     }
   }
   invalidateTaskCenter(site, accountId); // 扫描可能报名/代打/领奖，缓存的进度视图已过期
-  return { ok: true, accepted, autoChats, autoTasks, autoNotes, claimed, creditGained, tasks: tasks.length };
+  // T56：人工任务（已报名、未达标、不能代打——公众号关注/体验客户端等）收集给通知，
+  // 不领白不领的奖励经常因为「没人看任务页」被漏掉。
+  const manualTasks = cfg.tasks?.manualRemind !== false
+    ? tasks.filter((t) => !t.claimed && t.code && t.acceptStatus === 'accepted' && !t.locked
+        && t.target > 0 && t.current < t.target && !judgeTask(t, cfg, site).autoplayable)
+      .map((t) => t.title)
+    : [];
+  return { ok: true, accepted, autoChats, autoTasks, autoNotes, claimed, creditGained, manualTasks, tasks: tasks.length };
+}
+
+/** T56：人工任务提醒（每账号每天最多一次；notify 自带的 5 分钟节流挡不住一天多次扫描）。 */
+function remindManualTasks(cfg, site, label, uid, titles) {
+  const s = loadState();
+  if (!s.manualNotifyDay) s.manualNotifyDay = {};
+  if (s.manualNotifyDay[uid] === todayKey()) return;
+  s.manualNotifyDay[uid] = todayKey();
+  saveState();
+  notifyTask(cfg, '⏰ 有任务需要手动完成', `${label}：${titles.join('、')}`, uid);
+  recordEvent('task', `人工任务提醒：${label} —— ${titles.join('、')}`, { site, accountId: uid });
 }
 
 /** 领奖后顺手刷新余额（积分到账要反映到调度缓存里）。 */
@@ -522,7 +540,23 @@ export async function travelScanAccount(cfg, site, accountId) {
     if (!rid) return { ok: true, action: 'arrived_no_record', msg: '猫猫已到站但缺少 record_id，本轮跳过' };
     const r = await growthJSON(cfg, site, auth, siteCfg, 'POST', '/activity/growth/buddy/travel/claim', { record_id: rid });
     const credit = Number(r?.reward_credit) || Number(st?.reward_credit) || 0;
-    return { ok: true, action: 'claimed', msg: `旅行归来，领到 ${credit} 积分`, credit };
+    // T59：领完立即看能否再出发（每日 1 次上限由上游控制）——原先领奖后本轮就结束，
+    // 再派出要等下一个巡逻时点，中间猫猫闲置几个小时。
+    let redeparted = false;
+    const loc = Number(cfg.tasks?.travelLocationId) || 4;
+    try {
+      const st2 = await growthJSON(cfg, site, auth, siteCfg, 'GET', '/activity/growth/buddy/travel/status', null);
+      if (st2?.state === 'idle' && !st2?.daily_limit_reached) {
+        await growthJSON(cfg, site, auth, siteCfg, 'POST', '/activity/growth/buddy/travel/depart', { location_id: loc });
+        redeparted = true;
+      }
+    } catch { /* 再派失败不影响领奖结果，下一轮巡逻自然重试 */ }
+    return {
+      ok: true,
+      action: redeparted ? 'claimed_and_departed' : 'claimed',
+      msg: redeparted ? `旅行归来，领到 ${credit} 积分，猫猫已再次出发` : `旅行归来，领到 ${credit} 积分`,
+      credit,
+    };
   }
   if (state === 'idle') {
     if (st?.daily_limit_reached) return { ok: true, action: 'daily_limit', msg: '今天已派出过，明天再来' };
@@ -804,6 +838,53 @@ export async function syncAccountNickname(cfg, site, accountId) {
   return { ok: true, nickname, changed: true, msg: `显示名已更新为「${nickname}」` };
 }
 
+/* ---------------- T57 券码到期提醒 ----------------
+ * 开学季等活动的第三方券码（KFC/瑞幸/酷狗等）过期 = 白丢。12 小时一次只读探针
+ * （GET {billingBase}/portal/activity/school/vouchers，不消耗积分），7 天内到期且
+ * 没提醒过的批次 → notify + 事件。活动未开放/没有券时静默——绝大多数日子零调用。
+ */
+export async function fetchVouchers(cfg, site, accountId) {
+  await ensureToken(cfg, site, { accountId });
+  const auth = getAuth(site);
+  const siteCfg = cfg.sites[site];
+  const headers = billingHeaders(siteCfg, auth);
+  const { json } = await callJSON(cfg, siteCfg.billingBase + '/portal/activity/school/vouchers', { headers, what: '券码列表' });
+  const data = unwrap(json, '券码列表');
+  return Array.isArray(data?.items) ? data.items : [];
+}
+
+export async function checkVoucherExpiry(cfg, now = new Date()) {
+  const s = loadState();
+  if (!s.voucherAlerted) s.voucherAlerted = {}; // uid → 上次提醒的券批指纹（同批只提醒一次）
+  let alerted = 0;
+  for (const sk of siteKeys(cfg)) {
+    if (!cfg.sites[sk]?.logged_in) continue;
+    for (const a of listAccounts(sk)) {
+      if (a.enabled === false || !a.accessToken) continue;
+      const uid = a.uid || a.id;
+      try {
+        const items = await fetchVouchers(cfg, sk, a.id);
+        const soon = items.filter((v) => {
+          const t = Date.parse(v.valid_to || '');
+          if (!Number.isFinite(t)) return false;
+          const days = (t - now.getTime()) / 86400_000;
+          return days >= 0 && days <= 7;
+        });
+        if (!soon.length) continue;
+        const key = soon.map((v) => String(v.grant_id ?? v.code ?? '')).join(',');
+        if (s.voucherAlerted[uid] === key) continue;
+        s.voucherAlerted[uid] = key;
+        saveState();
+        alerted += soon.length;
+        const detail = soon.map((v) => `「${v.prize_name || v.sku_code || '券码'}」至 ${v.valid_to}`).join('、');
+        notifyTask(cfg, '🎫 券码即将过期', `${a.label || a.id}：${detail}。去客户端「我的券码」复制核销`, uid);
+        recordEvent('task', `券码提醒：${a.label || a.id} 有 ${soon.length} 张券 7 天内到期（${detail}）`, { site: sk, accountId: uid });
+      } catch { /* 无活动/端点不可用——预期路径，静默 */ }
+    }
+  }
+  return alerted;
+}
+
 /* ---------------- 批量执行 ---------------- */
 
 /** 对一个站点的所有账号跑一类任务。travel/streak 是幂等扫描（一天可多次），checkin/growth 每天一次。 */
@@ -849,6 +930,7 @@ async function runForSite(cfg, site, kind) {
         const { tasks, ...rest } = result;
         record('growth', uid, { ok: true, site, ...rest });
         if (result.claimed > 0) await refreshAfterGain(cfg, site, a.id);
+        if ((result.manualTasks || []).length) remindManualTasks(cfg, site, a.label || a.id, uid, result.manualTasks);
       }
       out.push({ id: a.id, label: a.label || a.id, ...result });
     } catch (e) {
@@ -1059,6 +1141,26 @@ function summarize(result) {
   return out;
 }
 
+/**
+ * T55 补跑判定：今天的时点是否已有「已经错过的」（存在即视为错过——服务在那一刻
+ * 没活着：关机/重启/崩溃）。调度 tick 每分钟都会查一遍，所以补跑天然覆盖
+ * 「启动时错过」与「运行中错过但当时 firedDay 未标记」两类场景。
+ * 没配置任何时点（HH:MM 数组与旧小时数组都空）= 调度未启用该类，不补跑。
+ */
+export function missedRunToday(cfg, kind, d = new Date()) {
+  const t = cfg.tasks || {};
+  const times = kind === 'checkin' ? (Array.isArray(t.checkinTimes) && t.checkinTimes.length ? t.checkinTimes : null)
+    : kind === 'growth' ? (Array.isArray(t.growthTimes) && t.growthTimes.length ? t.growthTimes : null)
+    : null;
+  if (times) {
+    const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    return times.some((x) => x <= hhmm);
+  }
+  const hours = kind === 'checkin' ? t.checkinHours : kind === 'growth' ? t.growthHours : null;
+  if (Array.isArray(hours) && hours.length) return hours.some((h) => h <= d.getHours());
+  return false;
+}
+
 /** 启动任务调度循环（每分钟检查到点；支持 ["HH:MM"] 精确时点与旧的小时数组；
  *  签到/成长每天每类最多一次，猫猫旅行是巡逻状态机（幂等），同一时点只跑一次但一天可多次）。 */
 export function startTaskLoop(cfg) {
@@ -1069,6 +1171,7 @@ export function startTaskLoop(cfg) {
   }
   let lastTravelMs = 0;
   let lastListMs = 0;
+  let lastVoucherMs = 0;
   timers.tasks = setInterval(async () => {
     try {
       const today = todayKey();
@@ -1076,6 +1179,21 @@ export function startTaskLoop(cfg) {
       if (scheduledNow(cfg, 'list') && Date.now() - lastListMs > 10 * 60_000) {
         lastListMs = Date.now();
         void prewarmTaskCenter(cfg);
+      }
+      // T55 补跑：今天的时点已错过（服务那一刻没活着）且今天还没跑过 → 立即补跑。
+      // 连登管家搭 checkin 的车，签到补跑时连登一起补——连登断一天要重攒 7 天，这是主保护对象。
+      for (const k of ['checkin', 'growth']) {
+        if (cfg.tasks?.[k] === false) continue;
+        if (firedDay[k] !== today && missedRunToday(cfg, k)) {
+          firedDay[k] = today;
+          log(`${KIND_LABEL[k] || k}的时点已过且今天未执行，补跑一次`);
+          void runAndLog(cfg, k);
+        }
+      }
+      // T57 券码到期提醒：12 小时一次只读探针（第三方券码过期 = 白丢，活动期抽中的 KFC/瑞幸等）
+      if (Date.now() - lastVoucherMs > 12 * 3600_000) {
+        lastVoucherMs = Date.now();
+        void checkVoucherExpiry(cfg);
       }
       let kind = scheduledNow(cfg, 'checkin') && firedDay.checkin !== today
         ? 'checkin'

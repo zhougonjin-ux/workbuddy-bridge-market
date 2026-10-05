@@ -8,13 +8,14 @@
 //   - budgetStatus 每个请求都会被路由调用，只读内存统计（usageSnapshot），不打上游；
 //   - 预警/超限事件与通知每天最多发一次（warnedDay），不刷屏；
 //   - 默认关闭（budget.enabled=false），重度消耗者才需要护栏。
-import { usageSnapshot } from './usage.mjs';
+import { usageSnapshot, todayAccountCredit } from './usage.mjs';
 import { recordEvent } from './events.mjs';
 import { notify } from './notify.mjs';
 
 const BUDGET_MODES = ['warn', 'free', 'pause'];
 
 let warnedDay = null;
+let accountWarnedDay = {}; // T63：accountId → 已提醒日期（内存记忆，重启后最多重提一次）
 
 /** 今日预算状态：{ enabled, mode, spent, budget, percent, warn, exceeded }。未启用时 enabled=false。 */
 export function budgetStatus(cfg) {
@@ -103,4 +104,71 @@ export function budgetBlockError(st) {
 /** 测试隔离：重置「今天已提醒」状态。 */
 export function resetBudgetAnnounce() {
   warnedDay = null;
+  accountWarnedDay = {};
+}
+
+/* ---------------- T63：按账号每日预算 ----------------
+ * 全局预算（T13）管总量，这里管单账号：多账号场景下「这个小号每天最多烧 N」。
+ * 语义边界（刻意从窄）：只做提醒 + 控制台展示，**不改道也不拦截**——路由在
+ * resolveTarget 阶段还不知道最终选中哪个账号（pickAccount 在其后），要拦就得把
+ * 预算检查塞进请求热路径深处，误伤面大。全局 pause（T37）才是硬护栏。
+ */
+
+/** 某账号的每日预算（cfg.budget.accounts[accountId]），未设/非法返回 null。 */
+export function accountBudgetOf(cfg, accountId) {
+  const m = cfg?.budget?.accounts;
+  if (!m || typeof m !== 'object') return null;
+  const v = Number(m[accountId]);
+  return Number.isFinite(v) && v > 0 ? v : null;
+}
+
+/**
+ * 某账号今日预算状态；未设预算返回 null。
+ * spentMap 可注入（'site/accountId' → credit，todayAccountCredit 的返回形状），
+ * 匹配 'accountId' 或 'site/accountId' 两种键——调用方不必关心键形态。
+ */
+export function accountBudgetStatus(cfg, accountId, spentMap = null) {
+  const daily = accountBudgetOf(cfg, accountId);
+  if (daily == null) return null;
+  const map = spentMap || todayAccountCredit();
+  let spent = 0;
+  for (const [k, v] of Object.entries(map)) {
+    if (k === accountId || k.endsWith('/' + accountId)) spent += Number(v) || 0;
+  }
+  spent = Math.round(spent * 100) / 100;
+  const percent = Math.min(999, Math.round((spent / daily) * 100));
+  return {
+    daily,
+    spent,
+    percent,
+    exceeded: spent >= daily,
+    warn: percent >= (Number(cfg?.budget?.warnPercent) || 80),
+  };
+}
+
+/**
+ * 全部启用账号的预算状态（/bridge 每 20s 调用：返回值下发前端，超限顺带每天提醒一次）。
+ * accounts 形如 [{ site, id, label }]；spentMap 可注入（单测/调用方已有数据时免重读）。
+ * 门控是「配置了至少一条按账号预算」而非 budget.enabled——两个开关独立：
+ * 全局预算关着、单账号护栏照样要生效（否则账号卡徽标与预警条口径不一致）。
+ */
+export function accountBudgetCheckAndAnnounce(cfg, accounts, { spentMap = null } = {}) {
+  const m = cfg?.budget?.accounts;
+  if (!m || typeof m !== 'object' || !Object.keys(m).length) return [];
+  const map = spentMap || todayAccountCredit();
+  const today = new Date().toISOString().slice(0, 10);
+  const out = [];
+  for (const { site, id, label } of accounts || []) {
+    const st = accountBudgetStatus(cfg, id, map);
+    if (!st) continue;
+    out.push({ id, site, label: label || id, ...st });
+    if (st.exceeded && accountWarnedDay[id] !== today) {
+      accountWarnedDay[id] = today;
+      try {
+        recordEvent('credit', `账号预算超限：${label || id} 今日 ${st.spent}/${st.daily}（${st.percent}%）`);
+        notify(cfg, '账号每日预算超限 🔴', `${label || id}：今日已消耗 ${st.spent}/${st.daily} 积分（按账号预算）`, { key: `budget-acct-${id}` });
+      } catch { /* 旁观者不绊倒主流程 */ }
+    }
+  }
+  return out;
 }

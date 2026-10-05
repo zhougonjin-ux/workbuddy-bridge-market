@@ -105,6 +105,7 @@ function renderTasks(t) {
     }
   };
   one('签到', t.checkin);
+  one('连登管家（T50）', t.streak);
   one('成长任务', t.growth);
   return lines.join('\n');
 }

@@ -9,11 +9,15 @@ import { log } from './log.mjs';
 
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const FETCH_TIMEOUT_MS = 8000;
-// 与 wb-publish.cjs 的发布目标保持一致。GitHub raw 在本机网络常不可直连
-// （github.com HTTPS 被墙），故带一个 jsDelivr CDN 镜像兜底（国内可达，缓存几分钟）。
+// 与 wb-publish.cjs 的发布目标保持一致。
+// T65 源顺序（2026-10-05 调整）：GitHub raw 在本机网络常不可直连（github.com HTTPS
+// 被墙）；jsDelivr 各节点刷新不同步，发布后经常误报旧版本（0.3.14 时实测：curl 与
+// node fetch 同一时刻拿到不同版本）。GitHub API contents 端点（发布脚本一直在用）
+// 走 api.github.com，无 CDN 缓存、本机可达，提到第一位；raw 兜底、jsDelivr 垫底。
 const RAW_URLS = [
-  'https://raw.githubusercontent.com/zhougonjin-ux/workbuddy-bridge-market/main/marketplace.json',
-  'https://cdn.jsdelivr.net/gh/zhougonjin-ux/workbuddy-bridge-market@main/marketplace.json',
+  { url: 'https://api.github.com/repos/zhougonjin-ux/workbuddy-bridge-market/contents/marketplace.json', headers: { accept: 'application/vnd.github.raw' } },
+  { url: 'https://raw.githubusercontent.com/zhougonjin-ux/workbuddy-bridge-market/main/marketplace.json', headers: {} },
+  { url: 'https://cdn.jsdelivr.net/gh/zhougonjin-ux/workbuddy-bridge-market@main/marketplace.json', headers: {} },
 ];
 
 let cache = null; // { at, latest, note }
@@ -47,12 +51,12 @@ export function compareVersions(a, b) {
 
 async function fetchLatest() {
   let lastErr = null;
-  for (const url of RAW_URLS) {
+  for (const src of RAW_URLS) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(new Error('timeout')), FETCH_TIMEOUT_MS);
     try {
       // 市场清单同时含顶层 version 与插件条目 version（更新判定看后者），两者都报
-      const res = await fetch(url, { signal: ac.signal });
+      const res = await fetch(src.url, { signal: ac.signal, headers: src.headers });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const j = JSON.parse(await res.text());
       const entry = (j.plugins || []).find((p) => p.name === 'workbuddy-bridge') || j.plugins?.[0] || {};

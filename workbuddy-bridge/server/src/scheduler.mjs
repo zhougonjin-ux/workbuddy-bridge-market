@@ -186,7 +186,9 @@ export function bridgeStatus(cfg, { redact = false } = {}) {
     policy: cfg.pool?.policy || 'expiry-first',
     pinnedAccountId: cfg.pool?.pinnedAccountId || null,
     creditRefreshMinutes: cfg.creditRefreshMinutes,
-    tasks: cfg.tasks,
+    // tasks + budget 一起下发：任务页预算卡（T13/T63）输入框初值要用真实配置——
+    // 以前 tasks 里没有 budget，改过 dailyCredits/按账号预算后重开页面输入框永远显示默认值。
+    tasks: { ...cfg.tasks, budget: cfg.budget },
     sites,
   };
 }

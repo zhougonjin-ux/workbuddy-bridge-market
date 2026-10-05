@@ -215,6 +215,15 @@ export function usageSnapshot(days = 7) {
   };
 }
 
+/** T63：今日按账号的消耗（键 = `${site}/${accountId}`，与 day.accounts 维度同源）。
+ *  按账号预算的消耗读取口；无数据返回空对象，绝不抛错。 */
+export function todayAccountCredit() {
+  const t = data.days[todayKey()];
+  const out = {};
+  for (const [ak, a] of Object.entries(t?.accounts || {})) out[ak] = a.credit || 0;
+  return out;
+}
+
 export function resetUsage() {
   data = { days: {}, balance: {} };
   dirty = true;
