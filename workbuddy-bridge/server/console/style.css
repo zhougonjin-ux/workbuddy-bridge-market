@@ -942,3 +942,20 @@ body.wbpanel-open .wbtip{z-index:70}
 .stk.ready i { opacity: .8; }
 .stk.got i { opacity: 1; background: linear-gradient(90deg, var(--ok, #34D399), var(--cy, #22D3EE)); }
 .stk u { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; font-size: 9px; font-family: monospace; color: var(--tx, #E4ECFC); text-decoration: none; pointer-events: none; }
+
+/* ---- T67 使用说明页：两列 kv 表在窄屏堆叠（固定左列会把 470px 视口撑出横向滚动） ---- */
+#view-help table.helpkv { table-layout: fixed; }
+#view-help table.helpkv td { vertical-align: top; padding: 5px 8px 5px 0; word-break: break-word; }
+#view-help table.helpkv td.kvk { width: 190px; font-family: var(--mono, monospace); }
+@media (max-width: 720px) {
+  #view-help table.helpkv, #view-help table.helpkv tbody, #view-help table.helpkv tr { display: block; width: 100%; }
+  #view-help table.helpkv tr { margin-bottom: 10px; }
+  #view-help table.helpkv td { display: block; width: 100%; padding: 2px 0; }
+  #view-help table.helpkv td.kvk { width: 100%; color: var(--accent); font-weight: 600; }
+}
+
+/* ---- T67 补充：说明页的 kv 表不需要 T38 的 min-width:520px（那规则是给数据表横滑用的，
+ * 说明页两列表在窄屏改为堆叠，套用 min-width 会把布局撑破 470px 视口） ---- */
+@media (max-width: 720px) {
+  #view-help table.helpkv { min-width: 0; }
+}

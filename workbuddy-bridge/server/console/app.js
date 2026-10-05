@@ -157,14 +157,15 @@ function paint(el, html) {
 /* ---------- 0.3.24 视图路由：无页签，大屏(home)为唯一主页面，其余全部是下钻子页面 ----------
  * 导航模型：大屏面板/卡片点「详情」进子页面 → 返回条「← 返回大屏」或浏览器后退回大屏；
  * location.hash 同步（#/accounts 等），刷新/转发链接都能直接落到对应子页面。 */
-const VIEWS = ['home', 'accounts', 'models', 'tasks', 'usage', 'events', 'settings'];
+const VIEWS = ['home', 'accounts', 'models', 'tasks', 'usage', 'events', 'settings', 'help'];
 const VIEW_META = {
   accounts: ['账号与积分', '账号卡 · 到期批次 · 策略 · 扫码登录'],
   models: ['模型库', '清单 · 倍率 · 巡检 · 设为默认'],
-  tasks: ['任务中心', '签到 · 成长任务 · 猫猫旅行 · 日历'],
+  tasks: ['任务中心', '签到 · 连登 · 成长任务 · 猫猫旅行 · 日历'],
   usage: ['用量分析', '消耗图表 · 按模型/账号 · CSV 导出'],
   events: ['事件时间线', '任务 / 账号 / 策略 / 登录 回放'],
   settings: ['接入与运维', '接入配置 · 通知 · 备份 · 诊断 · 日志'],
+  help: ['使用说明', '快速上手 · 功能导览 · 常见问题 · 命令与端点'],
 };
 let active = 'home';
 
@@ -199,6 +200,8 @@ function enterView(name, focus = null) {
   if (name === 'usage') { loadUsage(); refreshTimer = setInterval(loadUsage, 60000); }
   if (name === 'events') { loadEvents(); refreshTimer = setInterval(loadEvents, 30000); }
   if (name === 'settings') { loadGuide(); loadHealth(); startLogs(); refreshTimer = setInterval(loadHealth, 30000); }
+  // T67 使用说明：纯静态内容，只在进入时渲染一次（没有轮询，避免无谓的 paint 比对）
+  if (name === 'help') { loadHelp(); }
 }
 window.__wbViews = () => VIEWS;
 window.__wbEnterView = enterView;
@@ -2013,7 +2016,101 @@ async function loadEvents() {
   } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
 
-/* ---------- Tab：健康（T17 账号健康 + T18 Key + T19 路由规则 + T20 时段路由 + T21 备份恢复） ---------- */
+/* ---------- T67 使用说明 ----------
+ * 纯静态文档：快速上手（三步接上 ZCode）、功能导览（按导航分组对照卡片）、
+ * 自动任务与积分玩法、常见问题、命令与端点速查。
+ * 写作原则：说「点哪里」而不是「有什么」；数值（时点/阈值）标注为默认值并指向设置位置，
+ * 避免文档与实际配置漂移。内容较长，整页用 <details> 分节默认展开前两节。 */
+function loadHelp() {
+  const el = $('#view-help');
+  if (!el) return;
+  const sec = (title, sub, inner, open) => `
+    <details class="secd" ${open ? 'open' : ''}>
+      <summary>${esc(title)} <span class="sub">${esc(sub)}</span></summary>
+      <div style="padding-bottom:14px">${inner}</div>
+    </details>`;
+  // 说明页的「左标签 + 右说明」两列表：窄屏（≤720px）改为上下堆叠——
+  // 固定 190px 左列在 470px 视口会把表格撑到 520px，触发页面横向溢出（T38 同款坑）。
+  const kv = (rows) => `<table class="helpkv" style="width:100%;font-size:13px"><tbody>${rows.map(([k, v]) =>
+    `<tr><td class="kvk">${esc(k)}</td><td>${v}</td></tr>`).join('')}</tbody></table>`;
+  const p = (t) => `<p style="margin:0 0 8px;line-height:1.75">${t}</p>`;
+  const li = (items) => `<ul style="margin:0 0 8px;padding-left:20px;line-height:1.8">${items.map((x) => `<li>${x}</li>`).join('')}</ul>`;
+  const tag = (t) => `<span class="badge acc" style="margin-right:4px">${esc(t)}</span>`;
+
+  el.innerHTML = `
+    <h2>使用说明 <span class="sub">T67 · 本机代理的使用手册；数值均为默认值，可在对应设置页调整</span></h2>
+    ${sec('三步接上 ZCode', '首次使用必看；已接好的可直接跳到「功能导览」', `
+      ${p(`本插件在<b>本机</b>跑一个 OpenAI/Anthropic 双协议代理，把 WorkBuddy / CodeBuddy 的积分与模型接进 ZCode（也兼容 Cherry Studio、Cline、Dify 等任何 OpenAI 客户端）。只监听 127.0.0.1，凭证不出本机。`)}
+      ${li([
+        `${tag('1')}在「资源池 → 账号」点 <b>＋ 添加账号</b>，微信扫码登录（国内版）；或点 <b>导入本机账号</b>一键导入已登录的 WorkBuddy 客户端。`,
+        `${tag('2')}在「系统设置 → 接入」点顶栏或卡片里的 <b>复制配置</b>，拿到 Base URL + API Key。`,
+        `${tag('3')}在 ZCode 的「管理模型」里新增自定义供应商：Base URL 填 <code class="mono">${esc((STATE && STATE.base_url) || 'http://127.0.0.1:8788/v1')}</code>，API Key 填复制到的 <code class="mono">sk-wb-…</code>，模型 ID 填 <code class="mono">default</code>（之后在控制台里切默认模型即可，不必回设置）。`,
+      ])}
+      ${p(`<b>为什么模型 ID 填 default：</b>插件的调度策略（到期优先 / 免费优先 / 固定账号等）在服务端生效，<code class="mono">default</code> 是一个哨兵名，会按当前策略解析成真实模型；也可以直接写具体模型名或带倍率后缀的名字（如 <code class="mono">glm-5.3-flash (x0.06)</code>）。`)}
+    `, true)}
+
+    ${sec('功能导览', '按左侧导航分组；卡片标题与页面一一对应', `
+      ${kv([
+        ['总控台', '一屏看全：今日调用/消耗、可用账号、积分总量、批次到期分布、24h 频谱、事件流；<b>连登三档进度条</b>显示 7/14/28 天档位；右上「复制配置」「🎨 主题」，右下悬浮 <b>⌘</b> 坞有 5 个快捷动作。KPI 卡可点击下钻。'],
+        ['资源池 · 账号', '账号卡：余额与各批次到期时间、<b>📌 固定使用</b>（策略切 pinned，再点取消）、启用/禁用、重置冷却耗尽状态、<b>同步昵称</b>（拉官方昵称更新显示名）、删除；顶部策略卡可切 5 种调度；批次到期条形按风险着色。'],
+        ['资源池 · 模型', '模型清单（倍率、上下文、能力标记）、一键设默认、<b>⟳ 手动同步到选择器</b>、巡检（可只巡免费模型省钱）、v3 目录补缺模型会标注来源。'],
+        ['运维中心 · 任务', '四个开关（总开关/签到/成长）、<b>立即签到 / 🔗 连登巡检 / 扫描成长任务 / 🐾 猫猫旅行</b> 手动触发；任务中心列表带缓存（每日自动刷新 + 手动刷新）；代打/领奖按钮；<b>官方热力图</b>与本地签到日历并排；连登快照与累计白嫖统计。'],
+        ['运维中心 · 用量', '今日/近 7 天消耗、24h 分布、按模型与按账号排行、上下文压缩统计、<b>⬇ CSV 导出</b>（三维度，带 BOM Excel 直开）。'],
+        ['运维中心 · 事件', '任务/账号/策略/登录/积分/巡检事件时间线，可按类型筛选；数据落盘重启不丢。'],
+        ['系统设置', '接入配置、预警阈值、通知通道（webhook/Bark/Server酱/飞书/钉钉/Telegram）、协议自检、用量周报、<b>数据备份</b>、一键诊断、实时日志、PIN 锁。'],
+        ['使用说明', '本页：快速上手、功能导览、自动任务与积分玩法、常见问题、命令与端点速查。'],
+      ])}
+    `, true)}
+
+    ${sec('自动任务与积分玩法', '关掉总开关全部不跑；错过时点会自动补跑', `
+      ${li([
+        `<b>每日签到</b>：默认时点在「任务 → 任务与预算设置」里改（初始为 09:00 / 21:00 一类）；签到本身收益小，但它保住<b>连登连续天数</b>。`,
+        `<b>🔗 连登管家（T50）</b>：连登 7/14/28 天可兑换积分/能量/补签卡/抽奖次数。流程：<b>补签保连登 → 新手礼包/补偿 → 逐档兑换 → 抽奖抽完</b>。搭签到同轮执行；若服务当时没运行错过时点，调度会<b>自动补跑</b>（连登断一天要重攒 7 天，这是主保护对象）。`,
+        `<b>成长任务</b>：自动报名所有可报名任务、领奖所有达标奖励；「体验指定模型 / 聊天 N 次」这类由插件发极小请求代打（单任务上限可调）；公众号关注等人工任务打不了，会每天<b>提醒你手动点一下</b>。`,
+        `<b>🐾 猫猫旅行</b>：到站自动领奖并<b>同轮再次出发</b>；每日 1 次上限由上游控制。`,
+        `<b>券码提醒</b>：活动抽中的第三方券码（KFC/瑞幸等）7 天内过期会推送提醒。`,
+        `<b>自动备份</b>：每天把配置 + 账号池 + 状态文件打包到数据目录 <code class="mono">backups/</code>（滚动保留 4 份）。账号池里是上游 token，<b>丢了要全部重扫</b>，这项别关。`,
+      ])}
+      ${p(`<b>省积分的三个开关：</b>①「调度策略 → 免费优先」让 default/auto 自动改道 x0 免费模型；②「模型 → 巡检」勾「只巡免费」避免巡检烧分；③「每日积分预算」设上限，超限可只提醒 / 自动切免费 / <b>暂停新请求</b>（防失控烧分）。多账号还可以在预算卡里给<b>单个账号</b>设每日上限（只提醒，不拦截）。`)}
+    `)}
+
+    ${sec('常见问题', '先看诊断：系统设置 → 一键诊断（或会话里敲 /wbp-doctor）', `
+      ${kv([
+        ['会话突然连不上', '先跑「一键诊断」。若是 0 个可用账号，多半是登录态失效（401）——到「资源池 → 账号」重新扫码或导入本机客户端；诊断里的「登录态失效」项会直接点名是哪个账号。'],
+        ['积分显示 0 / 目录空了', '点诊断里的「协议自检」。它比对上游响应的关键结构（模型目录、额度包、到期字段、v3/config），上游改版时会明确报出哪个字段变了。'],
+        ['某个模型不可用', '「模型 → 巡检」跑一轮，看延迟与可用性；倍率过高的模型可在「路由规则」里加黑名单，或把默认模型换成免费/低倍率的。'],
+        ['控制台打不开', '服务可能没起：会话里敲 <code class="mono">/wbp-start</code>，或用 <code class="mono">/wbp-doctor</code> 看诊断；插件也有 Windows 计划任务 <code class="mono">wb-bridge-watchdog</code> 每分钟兜底拉起。'],
+        ['控制台样式错乱', '强制刷新（Ctrl+F5）拿最新静态资源；控制台 HTML 是 no-store，刷新即生效。'],
+        ['修改配置不生效', '涉及 <code class="mono">config.json</code> 结构性改动（密钥/端口/站点）需要重启服务：系统设置里点「重启服务」（交棒重启，会话不断）。'],
+        ['误删了账号', '若做过数据备份：设置 → 数据备份的备份文件里含账号池，按说明解包回数据目录，或用「备份/恢复」导入。'],
+        ['想看请求细节', '「用量 → CSV 导出」按模型/账号/日期三个维度导出；会话里敲 <code class="mono">/wbp</code> 可看最近请求的 tok/s。'],
+      ])}
+    `)}
+
+    ${sec('命令与端点速查', '会话内斜杠命令（无需开浏览器）与本机端点', `
+      ${p(`<b>会话内斜杠命令</b>（在 ZCode 对话框输入）：`)}
+      ${kv([
+        ['/wbp', '交互面板：总览 + 操作菜单（回复编号执行操作）'],
+        ['/wbp-doctor', '一键诊断（只读体检）'],
+        ['/wbp-console', '在内置浏览器打开控制台'],
+        ['/wbp-login', '扫码登录账号（也可用 /wbp-import 导入本机登录态）'],
+        ['/wbp-status', '看调度策略与各账号余额/到期'],
+        ['/wbp-switch', '切换策略 / 固定账号'],
+        ['/wbp-start', '启动服务（停了之后用）'],
+      ])}
+      ${p(`<b>本机端点</b>（仅 127.0.0.1，鉴权用 config.json 里的 apiKey）：`)}
+      ${kv([
+        ['/health', '存活探测（免鉴权）'],
+        ['/v1/models', 'OpenAI 风格模型清单（客户端启动时拉）'],
+        ['/v1/chat/completions', 'OpenAI 兼容对话（图片输入已实测可用）'],
+        ['/v1/messages', 'Anthropic 兼容对话'],
+        ['/console', '控制台（本页）'],
+      ])}
+    `)}
+    <div class="muted" style="font-size:12px;margin-top:14px">说明随版本更新；如发现与实际界面不符，以界面为准并跑一次「一键诊断」。文档维护：控制台「使用说明」页（T67）。</div>`;
+}
+window.loadHelp = loadHelp;
+
 const fmtPct = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 's' : n + 'ms');
 /* 账号健康状态 —— 必须与 server/src/pool.mjs 的 isUsable() 同一套语义：
  * enabled=false 已禁用；lastError 含 401 登录态失效；exhaustedAt 6h TTL 内算额度耗尽；

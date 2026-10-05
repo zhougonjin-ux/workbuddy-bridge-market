@@ -4,7 +4,7 @@
     {
       "name": "workbuddy-bridge",
       "source": "./workbuddy-bridge",
-      "version": "0.3.29",
+      "version": "0.3.30",
       "description": "Bridge ZCode to WorkBuddy/CodeBuddy credits and models: local OpenAI/Anthropic-compatible proxy, expiry-first credit scheduling, multi-account switching, local client account auto-import, visual console, daily check-in automation, auto model-provider registration.",
       "displayName": "WorkBuddy Bridge",
       "displayName_i18n": {
@@ -16,5 +16,5 @@
       "category": "developer-tools"
     }
   ],
-  "version": "0.3.29"
+  "version": "0.3.30"
 }

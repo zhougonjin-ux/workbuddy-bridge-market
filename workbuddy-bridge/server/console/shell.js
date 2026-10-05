@@ -15,8 +15,9 @@
     res:  { name: '资源池', sub: '账号 / 模型 集中管理', views: ['accounts', 'models'], segs: [['accounts', '账号'], ['models', '模型']] },
     ops:  { name: '运维中心', sub: '任务 / 用量 / 事件', views: ['tasks', 'usage', 'events'], segs: [['tasks', '任务'], ['usage', '用量'], ['events', '事件']] },
     sys:  { name: '系统设置', sub: '接入 / 通知 / 备份 / 诊断 / 日志', views: ['settings'] },
+    help: { name: '使用说明', sub: '快速上手 · 功能导览 · 常见问题', views: ['help'] },
   };
-  var VIEW2NAV = { home: 'home', accounts: 'res', models: 'res', tasks: 'ops', usage: 'ops', events: 'ops', settings: 'sys' };
+  var VIEW2NAV = { home: 'home', accounts: 'res', models: 'res', tasks: 'ops', usage: 'ops', events: 'ops', settings: 'sys', help: 'help' };
   var curNav = 'home';
   var segBar = null;
 
