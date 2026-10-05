@@ -1223,10 +1223,24 @@ async function loadModels() {
       const mult = x.multiplier;
       const cap = [];
       if (x.free) cap.push('<span class="badge ok">0 扣费</span>');
+      const hm = (t) => new Date(t).toTimeString().slice(0, 5);
+      // 促销徽标（0.3.33）：上游 tags 的 badge:<文案>，是真实计费规则（夜间免费=夜间实付 0）
+      const badges = (x.badges || []).map((b) => `<span class="badge promo" title="上游促销：${esc(b)}（时段内实际扣费以徽标为准）">${esc(b)}</span>`).join(' ');
+      // 实测计费（0.3.33）：本插件最近一次请求的实际扣费（TTL 6h，跨窗不展示）
+      const obsCell = x.observed
+        ? `${x.observed.credit === 0 ? '<b class="ok">免费</b>' : `<b>x${x.observed.credit}</b>`} <span class="muted" style="font-size:11px">${hm(x.observed.at)}</span>`
+        : '<span class="muted">—</span>';
+      // 限流状态（0.3.33）：模型级冷却中 → 红徽标 + 最早恢复时间
+      const rlCell = x.rate_limit
+        ? `<span class="badge cool" title="${esc((x.rate_limit.accounts || []).map((a) => `${a.label} → ${hm(a.until)} 恢复`).join('；'))}">限流中 · ${hm(x.rate_limit.until)} 恢复${(x.rate_limit.accounts || []).length > 1 ? `（${x.rate_limit.accounts.length} 号）` : ''}</span>`
+        : '<span class="muted">—</span>';
       return `<tr>
         <td><b>${esc(x.id)}</b>${x.id === m.default_model ? ' <span class="badge acc">默认</span>' : ''}</td>
         <td>${esc(x.name)}</td><td><span class="badge">${esc(x.site)}</span></td>
         <td>${mult == null ? '—' : `<b>${mult === 0 ? '免费' : 'x' + mult}</b>`}</td>
+        <td>${badges || '<span class="muted">—</span>'}</td>
+        <td>${obsCell}</td>
+        <td>${rlCell}</td>
         <td>${fmtK(x.context)}</td><td>${fmtK(x.max_output)}</td>
         <td class="cap" title="图片输入">${capBadge(x, 'image')}</td>
         <td class="cap" title="工具调用">${capBadge(x, 'tool')}</td>
@@ -1243,14 +1257,15 @@ async function loadModels() {
       <td>${r.ok ? `<b class="ok">${r.ms} ms</b>` : `<span class="bad" title="${esc(r.msg || '')}">✗ ${esc((r.msg || '不可用').slice(0, 50))}</span>`}</td>
     </tr>`).join('');
     paint(el, `
-      <h2>模型清单 <span class="sub">来自上游目录 · 倍率越低越省积分 · 修改默认模型即时生效</span></h2>
+      <h2>模型清单 <span class="sub">来自上游目录 · 上游目录分钟级闪变，本页 60 秒采样一次并差量重绘（不闪屏）</span></h2>
       <div style="display:flex;align-items:center;gap:10px;margin:0 0 12px;flex-wrap:wrap">
+        <button class="btn" id="btnModelsRefresh">⟳ 同步上游模型池</button>
         <button class="btn" id="btnPoolSync">⟳ 手动同步到选择器</button>
-        <span class="muted" style="font-size:12px">自动每 30 分钟同步一次；上游刚加模型/改倍率时点这里立即写入 ZCode 模型选择器</span>
+        <span class="muted" style="font-size:12px">「同步上游模型池」绕过 5 分钟目录缓存立刻对齐上游（顺带写入选择器）；上游刚加模型/改倍率/促销切换时点它。选择器另有每 30 分钟自动同步。</span>
       </div>
       <div class="card" style="padding:0;overflow:auto">
-      <table><thead><tr><th>模型 ID</th><th>名称</th><th>站点</th><th>积分倍率</th><th>上下文容量</th><th>最大输出</th><th title="支持图片输入">🖼️</th><th title="支持工具调用">🔧</th><th title="支持推理模式">🧠</th><th></th></tr></thead>
-      <tbody>${rows || '<tr><td colspan="10" class="muted" style="text-align:center;padding:24px">还没有可用模型 —— 先添加账号</td></tr>'}</tbody></table></div>
+      <table><thead><tr><th>模型 ID</th><th>名称</th><th>站点</th><th>积分倍率</th><th title="上游 tags 的 badge 促销，是真实计费规则">促销</th><th title="本插件最近一次请求的实际扣费（6 小时内）">实测</th><th title="该模型正在限流冷却的账号与预计恢复时间">限流</th><th>上下文容量</th><th>最大输出</th><th title="支持图片输入">🖼️</th><th title="支持工具调用">🔧</th><th title="支持推理模式">🧠</th><th></th></tr></thead>
+      <tbody>${rows || '<tr><td colspan="13" class="muted" style="text-align:center;padding:24px">还没有可用模型 —— 先添加账号</td></tr>'}</tbody></table></div>
       <p class="muted" style="font-size:12px">ZCode 模型供应商里填任意模型 ID；这里的「设为默认」影响走 <code>default</code>/裸名自动路由的客户端。</p>
       <h2>健康巡检 <span class="sub">max_tokens=1 极小请求实测可用性与首帧延迟 · 排序：可用在前 → 倍率低优先 → 延迟低优先（性价比）</span></h2>
       <div class="card">
@@ -1277,6 +1292,20 @@ async function loadModels() {
         </div>
         <div style="overflow:auto">${hrows ? `<table><thead><tr><th>模型</th><th>站点</th><th>倍率</th><th>状态 / 延迟</th></tr></thead><tbody>${hrows}</tbody></table>` : '<div class="muted" style="padding:16px;text-align:center">还没有巡检结果 —— 点「▶ 全量巡检」实测所有模型（约 10~30 秒）</div>'}</div>
       </div>`);
+    $('#btnModelsRefresh').onclick = async () => {
+      const b = $('#btnModelsRefresh');
+      b.disabled = true; b.textContent = '同步中…';
+      try {
+        const r = await api('/models/refresh', { method: 'POST' });
+        if (r.ok) {
+          const ok = (r.results || []).filter((x) => !x.skipped && !x.error);
+          const parts = ok.map((x) => `${x.site} ${x.models} 个`).join('，');
+          toast(`上游模型池已刷新（${parts || '无已登录站点'}）`, 'ok');
+        } else toast('同步失败：' + (r.error || '未知错误'), 'bad');
+      } catch (e) { toast('同步失败：' + e.message, 'bad'); }
+      b.disabled = false; b.textContent = '⟳ 同步上游模型池';
+      loadModels();
+    };
     $('#btnPoolSync').onclick = async () => {
       const b = $('#btnPoolSync');
       b.disabled = true; b.textContent = '同步中…';

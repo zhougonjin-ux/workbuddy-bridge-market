@@ -4,7 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { paths } from './config.mjs';
 import { warn } from './log.mjs';
-import { getCatalog, parseMultiplier } from './router.mjs';
+import { getCatalog, parseMultiplier, setObservedCostProvider } from './router.mjs';
+
+// 观测成本注入（0.3.33）：router 的 free-first 选型与后缀展示需要读观测数据，
+// 但 router→budget→usage→router 成环——模块顶层注册会撞 router 侧 `let` 的 TDZ
+// （usage 先于 router 求值完成）。改为首次调用时惰性注册：那时所有模块都已初始化。
 
 /**
  * credit 统计：上游流式帧的 usage 里通常没有 credit 字段（只有非流式聚合偶尔带），
@@ -132,6 +136,11 @@ export function recordUsage({ site, model, mode, status, promptTokens = 0, compl
   m.credit += credit || 0;
   m.ms += ms || 0;
   m.tools += tools || 0;
+  // 观测成本（0.3.33）：记**最近一次**的实际计费与时间。不能用日均值当观测信号——
+  // 白天 x0.29 和夜间免费混在一起平均就不为 0 了；「最近一次实付」配上 TTL
+  // 才是「这个模型现在免不免费」的正确依据（时段性促销不跨窗，TTL 6h）。
+  m.lastCredit = credit || 0;
+  m.lastAt = Date.now();
   // 账号维度（T36）：同一个模型可能被多个账号轮流服务，报表要能按账号归集消耗。
   // 键用 站点/账号id —— 账号 id 全局唯一，但带上站点在导出时更直观。
   const ak = `${site}/${account || 'unknown'}`;
@@ -243,6 +252,43 @@ export function todayAvgCreditByModel() {
   if (!t) return out;
   for (const m of Object.values(t.models || {})) {
     if (m.calls > 0 && m.credit > 0) out[`${m.site}/${m.model}`] = m.credit / m.calls;
+  }
+  return out;
+}
+
+let observedRegistered = false;
+function ensureRegistered() {
+  if (observedRegistered) return;
+  observedRegistered = true;
+  try {
+    setObservedCostProvider(() => observedCostByModel());
+  } catch { /* router 未就绪就放弃注入：选型/后缀回落纯目录行为 */ }
+}
+
+/**
+ * 观测成本（0.3.33）：每个 (站点/模型) **最近一次实际计费**的值与时间。
+ *
+ * 数据来自 recordUsage 的 day.models（credit 是上游实报折算后的最终值），
+ * lastAt 供时段性促销判定新鲜度。TTL 语义与 Go 参考实现的 modelCostTTL 同款：
+ * 默认 6 小时——「夜间免费」这类时段优惠的观测不得跨时段生效。
+ * 允许跨天读：23:50 的观测在 00:10 读仍新鲜（扫描今天 + 昨天，TTL 自己淘汰过期项）。
+ */
+export function observedCostByModel(maxAgeMs = 6 * 60 * 60 * 1000) {
+  ensureRegistered();
+  ensureLoaded();
+  const out = {};
+  const cutoff = Date.now() - maxAgeMs;
+  const keys = Object.keys(data.days).sort().slice(-2);
+  for (const k of keys) {
+    const t = data.days[k];
+    for (const m of Object.values(t?.models || {})) {
+      if (!m.calls || m.lastAt == null || m.lastAt < cutoff) continue;
+      const key = `${m.site}/${m.model}`;
+      const prev = out[key];
+      if (!prev || m.lastAt > prev.at) {
+        out[key] = { credit: m.lastCredit ?? 0, at: m.lastAt, calls: m.calls };
+      }
+    }
   }
   return out;
 }

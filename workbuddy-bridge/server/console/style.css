@@ -959,3 +959,12 @@ body.wbpanel-open .wbtip{z-index:70}
 @media (max-width: 720px) {
   #view-help table.helpkv { min-width: 0; }
 }
+
+/* ---- 0.3.33 模型页徽标：促销（上游 badge，真实计费规则）与限流冷却 ---- */
+.badge.promo { color: #FF7A7A; border-color: rgba(255, 122, 122, .45); background: rgba(255, 122, 122, .1); }
+.badge.cool { color: #FFB86B; border-color: rgba(255, 184, 107, .45); background: rgba(255, 184, 107, .1); }
+/* 浅色主题下压深一档，保证对比度（新浅色主题必须同时补旧类，round-9 教训） */
+[data-theme="light"] .badge.promo, [data-theme="sand"] .badge.promo,
+[data-theme="guofeng"] .badge.promo, [data-theme="sakura"] .badge.promo { color: #B3261E; border-color: rgba(179, 38, 30, .4); background: rgba(179, 38, 30, .07); }
+[data-theme="light"] .badge.cool, [data-theme="sand"] .badge.cool,
+[data-theme="guofeng"] .badge.cool, [data-theme="sakura"] .badge.cool { color: #9A6B00; border-color: rgba(154, 107, 0, .4); background: rgba(154, 107, 0, .08); }

@@ -4,7 +4,7 @@
 //   - 模型清单（含积分倍率）、额度查询
 import crypto from 'node:crypto';
 import { getAuth, ensureToken } from './auth.mjs';
-import { markSuccess, markFailure, isQuotaError, isRateLimitError, usableCount } from './pool.mjs';
+import { markSuccess, markFailure, isQuotaError, isRateLimitError, usableCount, listModelCooldownAccounts } from './pool.mjs';
 import {
   fitMessages,
   estimateMessages,
@@ -515,11 +515,17 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
   if (res.status >= 400) {
     const text = res._text !== undefined ? res._text : await res.text().catch(() => '');
     cleanup();
-    return { ok: false, status: res.status, text, payload: 当前payload, site, accountId: usedAccount };
+    // Retry-After（0.3.33）：上游限流响应若带等待秒数，据此计算模型冷却的恢复时间；
+    // 支持秒数与 HTTP 日期两种形态，解析不了为 null（调用方回落缺省 60s）。
+    return {
+      ok: false, status: res.status, text, payload: 当前payload, site, accountId: usedAccount,
+      retryAfter: parseRetryAfter(res.headers.get('retry-after')),
+    };
   }
 
-  // 上游接受了这次请求 → 说明该账号可用，清掉它的失败计数
-  markSuccess(site, usedAccount);
+  // 上游接受了这次请求 → 说明该账号可用，清掉它的失败计数；
+  // 带 model 时顺带解除该模型的限流冷却（0.3.33：成功即证明该 (账号,模型) 对此刻可用）
+  markSuccess(site, usedAccount, model);
 
   bumpIdle();
   return {
@@ -754,6 +760,25 @@ export async function fetchV3ConfigRaw(cfg, site) {
   }
 }
 
+/**
+ * 从模型条目的 tags 里解析促销徽标（0.3.33）。
+ * 上游格式：tags: ["craft", "badge:限时免费:#FF0000"] —— badge:<文案>:<颜色>。
+ * 这些徽标是**真实计费促销**（实测：badge 夜间免费的 hy4-preview 目录倍率 x0.29，
+ * 夜间实际扣 0），客户端按它显示「限时免费 0.00x」，插件此前整字段丢弃导致不同步。
+ */
+export function parseBadges(tags) {
+  if (!Array.isArray(tags)) return [];
+  const out = [];
+  for (const t of tags) {
+    const s = String(t || '');
+    if (!s.startsWith('badge:')) continue;
+    const label = s.split(':')[1] || '';
+    if (label) out.push(label);
+    if (out.length >= 4) break; // 防异常数据撑爆展示
+  }
+  return out;
+}
+
 /** 拉取站点可用模型清单（含积分倍率）。
  *  T54：企业目录为主，/v3/config 补缺——实测（2026-10-05）CN 域 hy4-preview-f /
  *  minimax-m2.7 只从 v3 下发。v3 探测失败/结构异常不拖累主目录（静默降级）。 */
@@ -800,6 +825,7 @@ export async function fetchModels(cfg, site) {
       id: m.id,
       name: m.name || m.id,
       credits: m.credits || null, // 积分倍率，如 "x0.79 credits"；x0.00 表示不扣积分
+      badges: parseBadges(m.tags), // 促销徽标（限时免费/夜间免费…）——真实计费规则，0.3.33 起透传
       contextWindow: m.maxInputTokens || null,
       maxTokens: m.maxOutputTokens || null,
       supportsImages: Boolean(m.supportsImages),
@@ -820,6 +846,7 @@ export async function fetchModels(cfg, site) {
         id: d.id,
         name: d.name || d.id,
         credits: d.credits || null,
+        badges: parseBadges(d.tags),
         contextWindow: d.maxInputTokens || null,
         maxTokens: d.maxOutputTokens || null,
         supportsImages: Boolean(d.supportsImages),
@@ -948,6 +975,20 @@ export async function queryCredit(cfg, site, accountId = null) {
 }
 
 /**
+ * 解析 Retry-After 头：纯数字按秒；HTTP 日期折算成距现在的秒数（向上取整）。
+ * 无头 / 非法值返回 null，由调用方回落缺省冷却时长。
+ */
+export function parseRetryAfter(v) {
+  if (v == null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  if (/^\d+$/.test(s)) return Number(s);
+  const t = Date.parse(s);
+  if (Number.isFinite(t)) return Math.max(0, Math.ceil((t - Date.now()) / 1000));
+  return null;
+}
+
+/**
  * 带「账号轮换」的上游调用，三个协议入口（OpenAI / Anthropic / Responses）共用。
  *
  * 处理顺序（每一步都只在「还没成功」时继续）：
@@ -964,7 +1005,14 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
   let up = null;
 
   for (let i = 0; i < 上限; i++) {
-    up = await openChat(cfg, site, body, { signal, exclude: tried });
+    // 0.3.33 模型级限流避让：把「该模型正在限流冷却」的账号排到候选之外。
+    // 上游限流是 (账号×模型) 维度——同账号换个模型往往就能用。全池都在冷却时
+    // 照旧发（usableCount 守卫）：额度可能已重置，本地直接放弃反而更差。
+    const 模型冷却中 = listModelCooldownAccounts(site, String(body?.model || ''), tried);
+    const exclude = 模型冷却中.length && usableCount(site, undefined, [...tried, ...模型冷却中]) > 0
+      ? [...tried, ...模型冷却中]
+      : tried;
+    up = await openChat(cfg, site, body, { signal, exclude });
     if (up.ok) return { up, tried };
     if (!up.accountId) return { up, tried }; // 兼容模式（单账号），没有可换的
     if (tried.includes(up.accountId)) return { up, tried }; // 池里只剩它，别死循环
@@ -982,8 +1030,14 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
       }
     }
 
-    // 上报号池：额度类错误会被标记为「耗尽」，其余走冷却退避
-    markFailure(site, up.accountId, { status: up.status, message: up.text });
+    // 上报号池：额度类错误会被标记为「耗尽」，其余走冷却退避。
+    // 限流类顺带记 (账号, 模型) 冷却（0.3.33）：Retry-After 头优先，缺省 60s。
+    markFailure(site, up.accountId, {
+      status: up.status,
+      message: up.text,
+      model: String(body?.model || ''),
+      modelCooldownMs: up.retryAfter > 0 ? up.retryAfter * 1000 : 0,
+    });
     tried.push(up.accountId);
 
     const 还有号 = usableCount(site, undefined, tried) > 0;

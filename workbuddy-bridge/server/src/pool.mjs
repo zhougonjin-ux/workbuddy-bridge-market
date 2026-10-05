@@ -37,6 +37,13 @@ export const DEFAULT_ACCOUNT_ID = 'default';
 /** 额度耗尽后多久重新尝试（额度可能已重置）。默认 6 小时。 */
 const EXHAUST_TTL_MS = 6 * 60 * 60 * 1000;
 
+/**
+ * 模型级限流的缺省冷却时长（Retry-After 头缺失时兜底）。
+ * 60 秒：与 Go 参考实现的 SoftCooldown 默认值同档——实测上游 429 后
+ * 约 40 秒换号即恢复，60 秒足够覆盖一次「模型繁忙」窗口。
+ */
+const MODEL_RATE_LIMIT_COOLDOWN_MS = 60_000;
+
 /** 失败退避阶梯：连续失败 n 次后冷却多久。 */
 const COOLDOWN_STEPS_MS = [0, 30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000];
 
@@ -359,8 +366,14 @@ export function flushPool() {
 /**
  * 把「一次失败」应用到账号对象上。
  * 磁盘池与兼容模式的内存态覆盖共用这一套规则，避免两处逻辑漂移。
+ *
+ * model/modelCooldownMs（0.3.33）：上游限流是「账号 × 模型」维度的——同一个账号
+ * 换个模型往往就能用（14003 的 displayMsg 原话「模型繁忙，请换模型或稍后重试」）。
+ * 所以限流类失败除了账号级短冷却，再记一条 (账号, 模型) 粒度的 modelCooldowns，
+ * 轮换选号时把「该模型正在冷却」的账号排到后面。modelCooldownMs 由调用方传入
+ * （Retry-After 头优先，缺省 MODEL_RATE_LIMIT_COOLDOWN_MS）。
  */
-function applyFailure(a, { status = 0, message = '' } = {}) {
+function applyFailure(a, { status = 0, message = '', model = '', modelCooldownMs = 0 } = {}) {
   a.failCount = (a.failCount || 0) + 1;
   a.lastError = String(message || status || '').slice(0, 200);
   a.lastErrorAt = Date.now();
@@ -368,6 +381,18 @@ function applyFailure(a, { status = 0, message = '' } = {}) {
   if (isRateLimitError(status, message)) {
     // 限流：账号没坏，只是此刻太密。短窗冷却，不打额度耗尽标记。
     a.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+    if (model) {
+      if (!a.modelCooldowns || typeof a.modelCooldowns !== 'object') a.modelCooldowns = {};
+      // 顺手清掉已过期的旧条目，防止长期运行的池子里堆死数据
+      const now = Date.now();
+      for (const k of Object.keys(a.modelCooldowns)) {
+        if (!(a.modelCooldowns[k]?.until > now)) delete a.modelCooldowns[k];
+      }
+      a.modelCooldowns[model] = {
+        until: now + (modelCooldownMs > 0 ? modelCooldownMs : MODEL_RATE_LIMIT_COOLDOWN_MS),
+        at: now,
+      };
+    }
   } else if (isQuotaError(status, message)) {
     // 真·额度/配额不足：长时间不再选它，等余额轮询或 TTL 到期再恢复。
     a.exhaustedAt = Date.now();
@@ -379,30 +404,49 @@ function applyFailure(a, { status = 0, message = '' } = {}) {
   return a;
 }
 
+/** 该账号的某个模型是否正在限流冷却中（未过期才算）。 */
+export function isModelRateLimited(a, model, now = Date.now()) {
+  const entry = a?.modelCooldowns?.[model];
+  return Boolean(entry && entry.until > now);
+}
+
+/**
+ * 列出「该模型的限流还没恢复」的账号 id（启用 + 有 token + 不在 exclude 里）。
+ * 轮换选号用它把冷却中的 (账号, 模型) 对排到后面；调用方负责 usableCount 守卫——
+ * 全池都在冷却时不能全排除，否则没号可选。
+ */
+export function listModelCooldownAccounts(site, model, excludeIds = [], now = Date.now()) {
+  if (!model) return [];
+  const skip = new Set(excludeIds);
+  return loadPool(site).accounts
+    .filter((a) => a.enabled !== false && a.accessToken && !skip.has(a.id) && isModelRateLimited(a, model, now))
+    .map((a) => a.id);
+}
+
 /**
  * 记录一次成功：清掉失败计数与冷却，并解除「额度耗尽」标记。
+ * model（0.3.33）：传入时顺带解除该模型的限流冷却——一次成功即证明
+ * 这个 (账号, 模型) 对此刻可用，比等到期更准确。
  *
  * 兼容模式（还没有池文件）下改写内存态覆盖：不能落盘（否则会凭空建出池文件），
  * 但「成功即证明额度可用」这条信息必须留下，否则一次误判的耗尽标记会一直挂到 TTL。
  */
-export function markSuccess(site, id) {
-  if (!hasPoolFile(site)) {
-    return mutateLegacy(site, id, (a) => {
-      a.failCount = 0;
-      a.cooldownUntil = null;
-      a.lastError = null;
-      if (a.exhaustedAt) a.exhaustedAt = null;
-      a.lastUsedAt = Date.now();
-    });
-  }
-  return mutate(site, (pool) => {
-    const a = pool.accounts.find((x) => x.id === id);
-    if (!a) return null;
+export function markSuccess(site, id, model = '') {
+  const clear = (a) => {
     a.failCount = 0;
     a.cooldownUntil = null;
     a.lastError = null;
     if (a.exhaustedAt) a.exhaustedAt = null;
+    if (model && a.modelCooldowns) delete a.modelCooldowns[model];
     a.lastUsedAt = Date.now();
+  };
+  if (!hasPoolFile(site)) {
+    return mutateLegacy(site, id, clear);
+  }
+  return mutate(site, (pool) => {
+    const a = pool.accounts.find((x) => x.id === id);
+    if (!a) return null;
+    clear(a);
     return a;
   }, { immediate: false });
 }
@@ -414,11 +458,14 @@ export function markSuccess(site, id) {
  *   - 401/403：凭证失效，需要重新登录
  *   - 5xx/网络：退避冷却，过一会儿还能用
  *
+ * model/modelCooldownMs（0.3.33）：限流类失败时顺带记 (账号, 模型) 粒度冷却，
+ * modelCooldownMs 由调用方按 Retry-After 头计算（无头时省略 → 用缺省 60s）。
+ *
  * 兼容模式只有一个账号、没有可轮换的对象，也不必为它建池文件；
  * 但状态仍要记进内存态覆盖——否则 usableCount 永远说「可用」，
  * 路由就会一直把已经 429 的单账号站点当成健康站点（详见 legacyState 说明）。
  */
-export function markFailure(site, id, { status = 0, message = '' } = {}) {
+export function markFailure(site, id, { status = 0, message = '', model = '', modelCooldownMs = 0 } = {}) {
   // 事件时间线（T6）：账号失败/冷却进时间线。冷却阶梯会挡住连续重试，
   // 所以正常情况下不会刷屏；真刷屏本身就是「该账号在持续失败」的信号。
   recordEvent(
@@ -427,11 +474,12 @@ export function markFailure(site, id, { status = 0, message = '' } = {}) {
       + (isQuotaError(status, message) ? '，判定额度耗尽' : ''),
     { site, accountId: id },
   );
-  if (!hasPoolFile(site)) return mutateLegacy(site, id, (a) => applyFailure(a, { status, message }));
+  const extra = { status, message, model, modelCooldownMs };
+  if (!hasPoolFile(site)) return mutateLegacy(site, id, (a) => applyFailure(a, extra));
   return mutate(site, (pool) => {
     const a = pool.accounts.find((x) => x.id === id);
     if (!a) return null;
-    return applyFailure(a, { status, message });
+    return applyFailure(a, extra);
   });
 }
 

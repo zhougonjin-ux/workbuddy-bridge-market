@@ -3,8 +3,8 @@
 import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId } from './upstream.mjs';
 import { ensureToken } from './auth.mjs';
 import { isQuotaError } from './pool.mjs';
-import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText } from './router.mjs';
-import { recordUsage, estimateCredit } from './usage.mjs';
+import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText, effectiveSuffixText } from './router.mjs';
+import { recordUsage, estimateCredit, observedCostByModel } from './usage.mjs';
 import { startSSE, writeSSE, sendJson, sendError, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
 
@@ -354,6 +354,7 @@ export async function handleChatCompletions(ctx) {
 export async function handleModels(ctx) {
   const { cfg, res } = ctx;
   const merged = await mergedModels(cfg);
+  const obs = observedCostByModel(); // 观测成本（0.3.33）：最近一次实际计费，驱动后缀与实测展示
   const data = [];
   const seen = new Set();
 
@@ -389,6 +390,9 @@ export async function handleModels(ctx) {
       mult = parseMultiplier(info.credits);
       if (Number.isFinite(mult)) item.credits_multiplier = mult;
     }
+    if (info.badges?.length) item.badges = info.badges; // 促销徽标（限时免费/夜间免费…）
+    const observed = obs?.[`${m.site}/${m.id}`] || null;
+    if (observed) item.observed = { credit: observed.credit, at: observed.at };
     if (info.contextWindow) item.context_window = info.contextWindow;
     if (info.maxTokens) item.max_output_tokens = info.maxTokens;
     if (info.supportsImages) item.supports_images = true;
@@ -396,8 +400,9 @@ export async function handleModels(ctx) {
     if (m.aliasOf) item.alias_of = m.aliasOf;
     // 选择器倍率展示：把倍率编码进 ID 后缀（如 "glm-5.3-flash (x0.06)"），
     // 调用端 resolveTargetInner 会剥掉后缀，所以两种写法都能调。
+    // 0.3.33：有新鲜观测且实付 0 时后缀显示 (免费)——夜间免费模型的目录价只是日间价。
     if (cfg.pickerMultiplierSuffix !== false) {
-      const suffix = multiplierSuffixText(mult);
+      const suffix = effectiveSuffixText(mult, observed);
       if (suffix) {
         item.id = m.id + suffix;
         item.name = (info.name || m.id) + suffix;

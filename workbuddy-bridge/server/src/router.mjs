@@ -37,6 +37,35 @@ export function multiplierSuffixText(multiplier) {
   return multiplier === 0 ? ' (免费)' : ` (x${multiplier})`;
 }
 
+/* ---------- 观测成本（0.3.33） ----------
+ * 数据在 usage.mjs（day.models 的 lastCredit/lastAt），但 usage → router 是既有
+ * 依赖方向，router 不能反向 import（会成环）。usage 加载时把读取函数注册进来，
+ * router 侧拿不到注入（如单测只 import router）就回落纯目录行为，无副作用。
+ */
+let observedCostProvider = null;
+export function setObservedCostProvider(fn) {
+  observedCostProvider = typeof fn === 'function' ? fn : null;
+}
+function observedCosts() {
+  try {
+    return observedCostProvider?.() || null;
+  } catch {
+    return null; // 观测数据读不出来按没有处理，选号不能被它卡死
+  }
+}
+
+/**
+ * 有效倍率后缀：默认展示目录倍率；有新鲜观测且实付 0 时展示 (免费)。
+ * 只在「目录倍率 > 0」时采信观测 0——促销的形状恰好是目录说付费、实测免费；
+ * 目录倍率未知（Infinity）时不采信（estimateCredit 目录拉不到时也记 0，那种 0 不是真免费）。
+ */
+export function effectiveSuffixText(multiplier, observed = null) {
+  if (observed && observed.credit === 0 && Number.isFinite(multiplier) && multiplier > 0) {
+    return ' (免费)';
+  }
+  return multiplierSuffixText(multiplier);
+}
+
 /** 剥掉请求模型名上的倍率后缀，返回纯模型 ID。 */
 export function stripMultiplierSuffix(raw) {
   return String(raw || '').replace(后缀正则, '').trim();
@@ -253,6 +282,7 @@ export function pickFreeModelFromCatalogs(catalogs) {
 
 /** 收集所有启用站点的目录交给 pickFreeModelFromCatalogs 挑免费模型。 */
 async function findFreeModel(cfg) {
+  const obs = observedCosts();
   const catalogs = [];
   for (const s of siteKeys(cfg)) {
     if (cfg.sites?.[s]?.enabled === false) continue;
@@ -263,7 +293,20 @@ async function findFreeModel(cfg) {
       continue; // 目录拿不到的站点不参与免费选型
     }
     if (!cat?.models?.size) continue;
-    catalogs.push({ site: s, usable: 有可用账号(s), models: [...cat.models.values()] });
+    catalogs.push({
+      site: s,
+      usable: 有可用账号(s),
+      models: [...cat.models.values()].map((m) => {
+        // 观测免费（0.3.33）：目录说付费、最近实测扣 0（夜间免费这类时段促销）
+        // → 当免费模型参与选型。目录倍率未知（Infinity）时不采信——
+        // estimateCredit 在目录拉不到时也「如实记 0」，那种 0 不是真免费。
+        const o = obs?.[`${s}/${m.id}`];
+        if (o && o.credit === 0 && parseMultiplier(m.credits) > 0) {
+          return { ...m, credits: 'x0.00 credits' };
+        }
+        return m;
+      }),
+    });
   }
   return pickFreeModelFromCatalogs(catalogs);
 }

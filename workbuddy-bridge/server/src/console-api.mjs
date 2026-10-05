@@ -212,21 +212,37 @@ export async function handleConsoleApi(ctx) {
   // ---- 模型清单（含 default 虚拟模型） ----
   if (p === '/models' && method === 'GET') {
     const merged = await mergedModels(cfg);
-    const list = merged.map((m) => ({
-      id: m.id,
-      site: m.site,
-      name: m.info?.name || m.id,
-      credits: m.info?.credits || null,
-      multiplier: Number.isFinite(m.mult) ? m.mult : null,
-      context: m.info?.contextWindow || null,
-      max_output: m.info?.maxTokens || null,
-      alias_of: m.aliasOf || null,
-      free: m.mult === 0,
-      // workbuddy-bridge：能力标记（图片输入/工具调用/推理模式），控制台可视化用
-      supportsImages: Boolean(m.info?.supportsImages),
-      supportsToolCall: Boolean(m.info?.supportsToolCall),
-      supportsReasoning: Boolean(m.info?.supportsReasoning),
-    }));
+    // 0.3.33：徽标（上游促销，真实计费规则）+ 观测成本（最近一次实际计费）
+    // + 模型级限流状态（哪些账号的这个模型正在冷却、何时恢复），模型页展示用。
+    const { listAccounts, isModelRateLimited } = await import('./pool.mjs');
+    const { observedCostByModel } = await import('./usage.mjs');
+    const obs = observedCostByModel();
+    const list = merged.map((m) => {
+      const observed = obs?.[`${m.site}/${m.id}`] || null;
+      const cooling = (listAccounts(m.site) || [])
+        .filter((a) => isModelRateLimited(a, m.id))
+        .map((a) => ({ id: a.id, label: a.label || a.id, until: a.modelCooldowns?.[m.id]?.until || 0 }))
+        .sort((x, y) => x.until - y.until);
+      return {
+        id: m.id,
+        site: m.site,
+        name: m.info?.name || m.id,
+        credits: m.info?.credits || null,
+        multiplier: Number.isFinite(m.mult) ? m.mult : null,
+        context: m.info?.contextWindow || null,
+        max_output: m.info?.maxTokens || null,
+        alias_of: m.aliasOf || null,
+        free: m.mult === 0,
+        // workbuddy-bridge：能力标记（图片输入/工具调用/推理模式），控制台可视化用
+        supportsImages: Boolean(m.info?.supportsImages),
+        supportsToolCall: Boolean(m.info?.supportsToolCall),
+        supportsReasoning: Boolean(m.info?.supportsReasoning),
+        // 0.3.33：促销徽标 / 实测计费 / 限流恢复时间（仅在有时出现，省得前端判空）
+        ...(m.info?.badges?.length ? { badges: m.info.badges } : {}),
+        ...(observed ? { observed: { credit: observed.credit, at: observed.at, calls: observed.calls } } : {}),
+        ...(cooling.length ? { rate_limit: { until: cooling[0].until, accounts: cooling } } : {}),
+      };
+    });
     // 未登录站点的内置清单也列出来，方便用户知道有哪些可登
     for (const s of siteKeys(cfg)) {
       if (isLoggedIn(s)) continue;
@@ -243,6 +259,34 @@ export async function handleConsoleApi(ctx) {
       model_routes: cfg.modelRoutes || {},
       data: list,
     });
+  }
+
+  // ---- 手动同步上游模型池（0.3.33）：绕过 5 分钟目录缓存强拉各站点，
+  // 顺带把最新目录写进 ZCode 选择器。上游目录分钟级闪变，这给用户一个
+  // 「立刻对齐」的入口，而不用等下一轮自动采样。 ----
+  if (p === '/models/refresh' && method === 'POST') {
+    const { getCatalog } = await import('./router.mjs');
+    const results = [];
+    for (const s of siteKeys(cfg)) {
+      if (!isLoggedIn(s)) {
+        results.push({ site: s, skipped: true, reason: '未登录' });
+        continue;
+      }
+      try {
+        const cat = await getCatalog(cfg, s, { force: true });
+        results.push({ site: s, models: cat.models.size, source: cat.source, error: cat.error || null });
+      } catch (e) {
+        results.push({ site: s, models: 0, error: String(e.message || e).slice(0, 140) });
+      }
+    }
+    let picker = null;
+    try {
+      const { triggerProviderConfigSyncNow } = await import('./pickersync.mjs');
+      picker = await triggerProviderConfigSyncNow();
+    } catch (e) {
+      picker = { error: String(e.message || e).slice(0, 140) };
+    }
+    return sendJson(res, 200, { ok: true, results, picker });
   }
 
   // ---- 一键切换默认模型（Trae 侧只配 model=default） ----
