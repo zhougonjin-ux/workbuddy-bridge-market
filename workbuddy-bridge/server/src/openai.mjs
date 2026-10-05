@@ -73,7 +73,10 @@ export function isGatewayError(status) {
  *   1. 连接级失败（异常抛出）—— opener 抛错时判定
  *   2. 钉站点没有该模型（400 model not found）
  *   3. 网关 502/503/504
- *   4. 额度层 429/402/quota 文案（受 pool.switchSiteOnExhausted 开关控制）
+ *   4. 额度层 402/quota 文案（受 pool.switchSiteOnExhausted 开关控制）
+ *
+ * 第 4 条不再包含裸 429：上游的 429 是「限流/模型繁忙」（14003），换站治不了限流，
+ * 真正的兜底是 coordination.mjs 的全局冷静窗。带额度文案的 429 仍会命中。
  *
  * 返回 { up, site, model }；up.ok=false 时错误文案里同时带原站点与备用站点的原因。
  * 每条路径只重试一次：已降到备用站点后（site === fallback.site）不再重复触发。
@@ -115,8 +118,9 @@ export async function openWithSiteFallback(cfg, target, upstreamBody, signal, op
     site = r.site;
     model = r.model;
   }
-  // 额度层被挡（429 限流 / 402 积分不足 / quota 文案）→ 换还有额度的备用站点。
+  // 额度层被挡（402 积分不足 / quota 文案 / 带额度语义的 429）→ 换还有额度的备用站点。
   // 注意 openChatRotating 对 HTTP 错误是 return 而不是 throw，这类情况进不了上面的 catch。
+  // 裸 429（14003 限流/模型繁忙）刻意不进这里：换站治不了限流，交给上游冷静窗。
   if (!up.ok && target.fallback && site !== target.fallback.site && !signal?.aborted && isQuotaError(up.status, up.text)) {
     if (cfg.pool?.switchSiteOnExhausted !== false) {
       const r = await openWithFallback(cfg, target, upstreamBody, signal, `本站点额度受限（HTTP ${up.status}）`);

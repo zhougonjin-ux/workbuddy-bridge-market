@@ -4,7 +4,7 @@
 //   - 模型清单（含积分倍率）、额度查询
 import crypto from 'node:crypto';
 import { getAuth, ensureToken } from './auth.mjs';
-import { markSuccess, markFailure, isQuotaError, usableCount } from './pool.mjs';
+import { markSuccess, markFailure, isQuotaError, isRateLimitError, usableCount } from './pool.mjs';
 import {
   fitMessages,
   estimateMessages,
@@ -988,7 +988,9 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
 
     const 还有号 = usableCount(site, undefined, tried) > 0;
     if (!还有号) return { up, tried };
-    const 原因 = isQuotaError(up.status, up.text) ? '额度不足' : `HTTP ${up.status}`;
+    const 原因 = isRateLimitError(up.status, up.text)
+      ? '触发限流'
+      : isQuotaError(up.status, up.text) ? '额度不足' : `HTTP ${up.status}`;
     warn(`[${site}] 账号 ${up.accountId} ${原因}，切换下一个账号重试`);
   }
   return { up, tried };

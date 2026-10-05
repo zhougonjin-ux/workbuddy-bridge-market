@@ -40,6 +40,15 @@ const EXHAUST_TTL_MS = 6 * 60 * 60 * 1000;
 /** 失败退避阶梯：连续失败 n 次后冷却多久。 */
 const COOLDOWN_STEPS_MS = [0, 30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000];
 
+/**
+ * 上游限流（14003）的冷却时长：固定短窗，不随失败次数增长。
+ *
+ * 限流是「此刻太密」，不是「这个号坏了」——叠加重增长的阶梯会让一次流量高峰
+ * 把账号雪藏半小时。真正的兜底是 coordination.mjs 的全局冷静窗（指数退避到 30s 上限），
+ * 这里只需让开单账号一小会儿即可。
+ */
+const RATE_LIMIT_COOLDOWN_MS = 30_000;
+
 export function poolPathFor(site) {
   return path.join(getConfigDir(), `auth.${site}.pool.json`);
 }
@@ -356,8 +365,11 @@ function applyFailure(a, { status = 0, message = '' } = {}) {
   a.lastError = String(message || status || '').slice(0, 200);
   a.lastErrorAt = Date.now();
   a.lastUsedAt = Date.now();
-  if (isQuotaError(status, message)) {
-    // 429/额度类：直接判定额度耗尽，长时间不再选它
+  if (isRateLimitError(status, message)) {
+    // 限流：账号没坏，只是此刻太密。短窗冷却，不打额度耗尽标记。
+    a.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
+  } else if (isQuotaError(status, message)) {
+    // 真·额度/配额不足：长时间不再选它，等余额轮询或 TTL 到期再恢复。
     a.exhaustedAt = Date.now();
     a.cooldownUntil = null;
   } else {
@@ -500,16 +512,65 @@ export function setAccountManualExpiry(site, id, value) {
   });
 }
 
+/** 上游余额不足的关键词（大小写不敏感子串匹配）。 */
+const QUOTA_MARKERS = /insufficient credit|no credit|credit exhausted|credits exhausted|out of credit|quota exceeded|quota exhaust|payment required|credit not enough|not enough credit|insufficient\s+(balance|quota)|额度不足|余额不足|积分不足|积分用完|额度用尽|没有积分/i;
+
+/** 上游限流/节流的关键词。只收明确指向「速率/模型被节流」的措辞。 */
+const RATE_MARKERS = /rate[\s-]?limit|too many requests|usage limit|请求过于频繁|限流|模型繁忙/i;
+
+/** 账号级终态关键词：等不来自愈，短冷却救不活，必须让号退场。 */
+const ACCOUNT_FAULT_MARKERS = /request illegal|trial not activated|session not found|12153/i;
+
+/** 从报文里取结构化业务码（如 {"code":14003,…}）。 */
+function businessCode(m) {
+  const hit = /"code"\s*:\s*(\d{4,6})/.exec(m);
+  return hit ? hit[1] : '';
+}
+
+/**
+ * 判断错误是不是「上游限流」——账号还活着，只是此刻请求太密 / 模型繁忙。
+ *
+ * 分层依据 .ref/workbuddy2api-panel-main 的 Classify（2026-09 逆向，比本插件参考的版本新）：
+ * **状态码比文案权威**。上游 429 的 body 高频夹带「quota exceeded」「额度不足」这类
+ * 跨计费/限流两界的措辞，若先按关键词判额度，会把一次瞬时限流硬冷却到次日、白扔号约 12h。
+ *
+ * 必须与 isQuotaError 分开：限流若被当成额度耗尽，会给账号打上 6 小时 exhaustedAt。
+ * 本机真实事故——余额 4978、批次明细分毫未动的账号，被一次 14003 打掉，pinned 策略下
+ * 请求全部落到另一个余额更少的号上，余额消耗快了一倍多。
+ */
+export function isRateLimitError(status, message = '') {
+  const m = String(message || '');
+  const code = businessCode(m);
+
+  // 账号级终态等不来自愈，不能按限流短冷却（继续重试只会反复刷上游风控）。
+  if (ACCOUNT_FAULT_MARKERS.test(m)) return false;
+  // 14018 = 明确的账号积分耗尽业务码，语义优先于 429 的限流兜底。
+  if (code === '14018') return false;
+  if (code === '14003') return true;
+  // 裸 429：一律按限流处理（状态码比关键词权威）。
+  if (status === 429) return true;
+  // 非 429 状态码携带限流文案（200 业务信封 / 400 / 403 / 5xx 都出现过）。
+  return RATE_MARKERS.test(m) && !QUOTA_MARKERS.test(m);
+}
+
 /**
  * 判断错误是否属于「这个号没额度了」。
- * 上游把额度不足做成 429，或在 200 里回特定业务码，这里都覆盖到。
+ *
+ * 真·耗尽的可靠信号是余额轮询（scheduler.mjs 的 `credit.remain <= 0 → markExhausted`），
+ * 这里的报文判定只作补充，刻意从宽——宁可漏判（等轮询确认）也不误判（雪藏 6 小时）。
  */
 export function isQuotaError(status, message = '') {
-  if (status === 429) return true;
   const m = String(message || '');
-  if (/insufficient|quota|balance|credit|exceed|limit reached|no available/i.test(m)) return true;
-  if (/额度|余额|积分不足|已用完|超出/i.test(m)) return true;
-  return false;
+  const code = businessCode(m);
+
+  // 402 是最硬、最不可自愈的计费信号，最先判。
+  if (status === 402) return true;
+  // 14018：429 + 积分耗尽业务码，归硬额度而非可自愈的软限流。
+  if (code === '14018') return true;
+  // 其余一律交给 isRateLimitError 裁决（限流 / 账号级故障都不算额度耗尽）。
+  if (isRateLimitError(status, m)) return false;
+  // 非 429 状态码的额度措辞（200 业务信封、403 信封等）。
+  return QUOTA_MARKERS.test(m);
 }
 
 /* ---------------- 增删账号 ---------------- */
