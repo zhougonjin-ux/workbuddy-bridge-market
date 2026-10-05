@@ -14,6 +14,13 @@
 
 ---
 
+## 0. 前置条件
+
+- **Node.js 18 或更高版本（硬前置）** —— 代理服务、MCP 服务器、启动钩子全部以 `node` 命令拉起，
+  ZCode 桌面端**不自带 Node**，没装的话插件装了也起不来。先确认 `node -v` 有输出。
+- ZCode 桌面端。
+- 一个 WorkBuddy / CodeBuddy **国内版**账号（`cn-cli` 站点）。
+
 ## 1. 安装（ZCode 桌面端）
 
 ### 方式 A：插件市场 UI（推荐）
@@ -23,21 +30,36 @@
 2. 在市场里找到 **WorkBuddy 积分桥** → **安装**
 3. 安装后到 **设置 → 插件** 确认处于启用状态
 
+> 市场 ID 是 `dev-workbuddy-bridge-local`（取自 marketplace.json 的 `name`），
+> 下面方式 B 的 `@` 后面要用它，不是仓库名。
+
 ### 方式 B：命令行
 
+`zcode` 命令通常不在 PATH 里，CLI 实际在 ZCode 安装目录里（macOS/Linux 换对应路径）：
+
 ```bash
-zcode plugins marketplace add zhougonjin-ux/workbuddy-bridge-market
-zcode plugins install workbuddy-bridge@workbuddy-bridge-market
+# Windows
+node "C:\Program Files\ZCode\resources\glm\zcode.cjs" plugins marketplace add zhougonjin-ux/workbuddy-bridge-market
+node "C:\Program Files\ZCode\resources\glm\zcode.cjs" plugins install workbuddy-bridge@dev-workbuddy-bridge-local
 ```
+
+添加市场会先走 GitHub 公共仓库的 tarball 下载，**不需要本机装 git**（仅私有库、
+Git LFS 等特殊情况才回退到 `git clone`）。
 
 ## 2. 启动代理
 
 - 安装后**每次打开 ZCode 会话会自动拉起代理**（SessionStart hook，幂等、不阻塞）；
   也可在会话里运行 `/wbp-start` 手动启动。
 - 验证：浏览器打开可视化管理台 http://127.0.0.1:8788/console
-  （五个面板：**账号与积分**——策略切换/账号卡片/每批积分到期倒计时/微信扫码登录；**模型**——倍率、上下文容量、图片/工具/推理能力表；**自动任务**；**用量**；**日志**）
+  （侧栏五个入口：**总控台**——KPI 大屏 / 积分池双环 / 账号余额 / 到期时间轴 / 24h 频谱；
+  **资源池**——账号管理（策略切换/账号卡片/每批积分到期倒计时/微信扫码登录）与模型表（倍率、上下文容量、
+  图片·工具·推理能力、巡检、设默认）；**运维中心**——自动任务（签到/成长/连登/猫猫旅行/任务中心）、
+  用量（明细/24h 分布/压缩统计/CSV）、事件时间线；**系统设置**——接入配置、健康运维、日志；
+  **使用说明**——三步接上 ZCode、功能导览、常见问题。右上角可切 7 套主题）
 - 数据目录：`%USERPROFILE%\.zcode\workbuddy-bridge\`（配置、账号池、用量、任务状态都在这，
-  与插件代码分离，升级/重装插件不丢账号）
+  与插件代码分离，升级/重装插件不丢账号）。**首次启动会自动生成随机 `apiKey` 并落盘**，
+  第 4 步要用它。
+- 端口默认 `8788`，被占用时改数据目录 `config.json` 里的 `port`（会话钩子会读它）。
 - 关闭自动拉起：在数据目录放 `autostart.json` 内容 `{"enabled": false}`
 
 ## 3. 添加 WorkBuddy 账号（多账户）
@@ -80,6 +102,12 @@ node "<插件安装目录>/server/login.mjs" --site cn-cli --label 小号A
 Anthropic 兼容端点同样可用：Base URL `http://127.0.0.1:8788`（`/v1/messages`）。
 ZCode 自带 OpenAI 兼容探活的（`GET /v1/models`）无需鉴权也能同步模型列表。
 
+> **其实这一步也能省掉**：插件会在会话启动时自动把自己的供应商和模型清单写进 ZCode
+> 的模型目录（`provider_config.json`），**装好插件 + 加了账号后，模型选择器里就会直接
+> 出现 WorkBuddy 分组**，不必手动建供应商。想手动建（比如要改 Base URL 或用 Anthropic
+> 端点）再按上表填即可。模型池每 30 分钟自动同步一次，上游新增模型会自动出现；
+> 控制台模型页也有「⟳ 手动同步」按钮。
+
 ## 4.5 建议安装：开机自启（签到不漏）
 
 代理目前由 ZCode 会话拉起——哪天没开 ZCode，当天的自动签到就会漏。运行
@@ -97,6 +125,7 @@ ZCode 会话钩子检测到存活不会重复拉起。`/wbp-startup remove` 卸�
 | `expiry-first`（默认） | 最早到期且有余额的账号先用；同到期先耗余额少的 |
 | `balance-first` | 余额多的先用 |
 | `round-robin` | 最久未用的先用（原上游代理默认） |
+| `free-first` | 优先走 0 倍率（免费）模型，没有免费模型时回落到原行为 |
 | `pinned` | 固定用 `pool.pinnedAccountId` 指定的账号，不可用时回落 expiry-first |
 
 - 所有策略下：额度耗尽（429/余额 0）与连续失败的账号都会被自动跳过并冷却，对话不中断。
@@ -105,14 +134,22 @@ ZCode 会话钩子检测到存活不会重复拉起。`/wbp-startup remove` 卸�
 - **兜底**：若上游某天不再下发到期明细，可在账号池条目里手填
   `"manualExpireAt": "2026-10-15"`（支持 `YYYY-MM-DD`）。
 
-## 6. 自动签到与成长任务
+## 6. 自动任务（签到 / 成长 / 连登 / 猫猫旅行）
 
-- 每日签到（`/v2/billing/meter/daily-checkin`）：默认 9 点、21 点各尝试一轮，当天成功即停。
-- 成长任务（`/v2/activity/growth/tasks`）：自动**报名**可报名任务；进度达标的自动**领奖**；
-  「对话 N 次」这类进度任务靠真实使用点亮。默认 1 点、13 点各扫描一轮。
+全部可在控制台「运维中心 → 自动任务」改时点、逐类开关、立即执行、看执行记录：
+
+- **每日签到**（`/v2/billing/meter/daily-checkin`）：默认 9 点、21 点各尝试一轮，当天成功即停。
+- **成长任务**（`/v2/activity/growth/tasks`）：自动**报名**可报名任务；进度达标的自动**领奖**；
+  「对话 N 次」这类进度任务可由插件代打点亮。默认 1 点、13 点各扫描一轮。
+- **连登管家**：补签保连登（用补签卡补昨天）→ 逐档兑换连登奖励 → 抽奖，搭在签到同一轮里跑。
+- **猫猫旅行**：到站自动领奖并立即续派下一程。
+- **券码到期提醒**：探测 7 天内到期的券码并发通知。
+- **每日数据备份**、**每周用量周报**（可配通知推送）。
+- 时点到了但当时机器没开机？下次启动会**自动补跑**当天错过的任务。
 - 首次触发带随机延迟（`tasks.jitterMinutes`，默认 30 分钟内）避开整点高峰。
+- 通知走 Windows 气泡（仅 Windows）或 Webhook / Bark / Server酱 / 飞书 / 钉钉 / Telegram。
 - 总开关：`config.json → tasks.enabled`；分类开关 `tasks.checkin` / `tasks.growth`。
-- 手动执行：`wb_tasks_run` 工具；查状态：`wb_tasks_status` 或 `/console`。
+- 手动执行：`wb_tasks_run` 工具、`/console` 按钮；查状态：`wb_tasks_status` 或 `/console`。
 
 ## 7. 更新插件（GitHub 市场）
 
@@ -120,30 +157,38 @@ ZCode 会话钩子检测到存活不会重复拉起。`/wbp-startup remove` 卸�
 在客户端里添加一次，之后随版本发布即可在客户端内更新：
 
 1. **插件市场 → 添加 → 从 GitHub 仓库添加**：`zhougonjin-ux/workbuddy-bridge-market`
-   （市场名：`workbuddy-bridge-market`；本地目录市场可删除，避免重复）
+   （市场 ID：`dev-workbuddy-bridge-local`）
 2. 安装后，源码新版本发布时：**插件市场 → 齿轮 → 市场源 → 刷新该市场**，
-   回到插件详情点 **更新**（部分版本客户端会自动提示可更新）
-3. 命令行发布/更新工具：`.ref/publish-github.mjs`（走 GitHub API，无需本机 git）
+   回到插件详情点 **更新**。注意更新按钮只在「**浏览插件**」页出现，「已安装」页永远只有
+   卸载/开关；桌面端把市场列表缓存在内存，刷新市场后若没看到更新按钮，
+   把插件设置页完全关掉重开或重启桌面即可。
 
 ## 8. MCP 工具与命令一览
 
-MCP 服务器 `workbuddy-bridge`（装好插件自动连接）提供：
+MCP 服务器 `workbuddy-bridge`（装好插件自动连接）提供 13 个工具：
 
 `wb_status` · `wb_credit_plan` · `wb_switch` · `wb_models` · `wb_login_start` ·
-`wb_login_poll` · `wb_import_local` · `wb_refresh_credits` · `wb_tasks_run` · `wb_tasks_status`
+`wb_login_poll` · `wb_import_local` · `wb_refresh_credits` · `wb_tasks_run` ·
+`wb_tasks_status` · `wb_task_play`（成长任务单任务代打/领奖）· `wb_travel_patrol`（猫猫旅行巡逻）·
+`wb_recent_requests`（最近请求明细与速度）
 
-斜杠命令：`/wbp`（会话内总览面板，免浏览器）· `/wbp-start` · `/wbp-status` · `/wbp-switch` · `/wbp-login` · `/wbp-import` · `/wbp-console`（客户端内置浏览器打开管理台）
+斜杠命令：`/wbp`（会话内总览面板，免浏览器）· `/wbp-start` · `/wbp-status` · `/wbp-switch` · `/wbp-login` · `/wbp-import` · `/wbp-console`（客户端内置浏览器打开管理台）· `/wbp-doctor`（自检诊断）· `/wbp-startup`（开机自启）
 
 管理 API（本机 + apiKey）：`GET /admin/bridge` · `POST /admin/policy` ·
 `POST /admin/credit/refresh` · `GET /admin/tasks` · `POST /admin/tasks/run`
 
 ## 9. 测试
 
-```
+```bash
 cd <插件目录>/server
-node --test test/expiry.test.mjs    # 调度排序单测（14 项）
-set WB_CONFIG_DIR=%TEMP%\wb-t && node test/pick.smoke.mjs     # 选号链路
+npm test        # 单元测试（147 项）
+npm run smoke   # 冒烟测试（自带临时目录隔离）
 ```
+
+> ⚠️ **只跑 `npm test` / `npm run smoke`，不要裸跑 `node --test`**（会连 `*.smoke.mjs`
+> 一起执行）。冒烟脚本必须经 `run-smoke.mjs` 启动：它会 `mkdtemp` 注入
+> `WB_CONFIG_DIR` 再拉子进程，**直接跑 `node test/pick.smoke.mjs` 会写到真实的
+> `~/.zcode/workbuddy-bridge` 账号池，把生产账号覆盖掉**。
 
 ## 10. 来源与许可
 

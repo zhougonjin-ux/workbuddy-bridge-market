@@ -1,6 +1,6 @@
 {
   "name": "workbuddy-bridge-server",
-  "version": "0.3.30",
+  "version": "0.3.31",
   "private": true,
   "description": "workbuddy-bridge 本地代理：把 WorkBuddy / CodeBuddy（腾讯）积分与模型包装成本机 OpenAI + Anthropic 兼容接口，新增积分到期优先调度、多账号策略切换与自动签到/成长任务。核心移植自 workbuddy-openai-proxy（MIT）。",
   "type": "module",
