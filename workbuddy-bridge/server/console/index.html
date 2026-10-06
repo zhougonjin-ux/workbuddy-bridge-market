@@ -19,6 +19,51 @@
 })();
 </script>
 <link rel="stylesheet" href="/console/style.css">
+<script>
+/* ===== 0.3.35 自定义主题：在 style.css 之后、body 之前注入覆盖层 =====
+ * 设计：自定义不是新 data-theme 档，而是「基底（dark/light）上的令牌覆盖」——
+ * 注入 :root[data-theme=基底]（特异性 0-2-0 > style.css 的 0-1-0），基底的全部
+ * 表面规则（玻璃侧栏/网格/光效/亮色覆盖）原样继承。壁纸走 body 背景双层渐变遮罩。
+ * 本段定义构建与应用函数（供本处首帧注入 + shell.js 编辑器复用），并在首帧前应用，
+ * 避免刷新时闪默认色。换行等一律无转义依赖。 */
+(function () {
+  window.__wbBuildCustomCss = function (c) {
+    var t = c.tokens || {}, b = c.base === 'light' ? 'light' : 'dark';
+    var sel = ':root[data-theme="' + b + '"]';
+    var css = sel + '{' +
+      '--bg:' + t.bg + ';--panel:' + t.panel + ';--panel2:' + t.panel2 + ';--line:' + t.line + ';' +
+      '--text:' + t.text + ';--muted:' + t.muted + ';--accent:' + t.accent + ';--ok:' + t.ok + ';' +
+      '--warn:' + t.warn + ';--bad:' + t.bad + ';--chip:' + t.chip + ';--codebg:' + t.codebg + ';' +
+      '--hud-bg:' + t.hudBg + ';--edge:' + t.edge + ';--hair:' + t.hair + ';--tx:' + t.tx + ';' +
+      '--mu:' + t.mu + ';--ac:' + t.accent + ';--cy:' + t.cy + ';--vi:' + t.vi + ';' +
+      '--wn:' + t.warn + ';--bd:' + t.bad + ';--colorscheme:' + (b === 'light' ? 'light' : 'dark') + ';' +
+      'color-scheme:' + (b === 'light' ? 'light' : 'dark') + ';' +
+      '}';
+    if (c.wallpaper) {
+      var dim = Math.max(0, Math.min(0.85, c.dim == null ? 0.55 : c.dim));
+      var ov = (b === 'light' ? 'rgba(255,255,255,' : 'rgba(8,10,16,') + dim + ')';
+      css += '[data-theme="' + b + '"] body.hud-on{background-image:linear-gradient(' + ov + ',' + ov + '),url("' + c.wallpaper + '");background-size:cover;background-position:center;background-attachment:fixed;}';
+      // 壁纸在场时收掉网格与扫描线（叠加噪点）
+      css += '[data-theme="' + b + '"] .floor,[data-theme="' + b + '"] .scan{opacity:0}';
+    }
+    return css;
+  };
+  window.__wbApplyCustomTheme = function () {
+    var old = document.getElementById('wbCustomCss');
+    if (old) old.parentNode.removeChild(old);
+    var c = null;
+    try { c = JSON.parse(localStorage.getItem('wbCustomTheme') || 'null'); } catch (e) { /* 隐私模式等 */ }
+    if (!c || !c.enabled || !c.tokens) return false;
+    document.documentElement.dataset.theme = c.base === 'light' ? 'light' : 'dark'; // 自定义自带基底：注入的选择器要能命中
+    var st = document.createElement('style');
+    st.id = 'wbCustomCss';
+    st.textContent = window.__wbBuildCustomCss(c);
+    document.head.appendChild(st); // 在 style.css link 之后 → 同特异性时后位胜；选择器特异性本就更高
+    return true;
+  };
+  window.__wbApplyCustomTheme();
+})();
+</script>
 </head>
 <body>
 <!-- ===== 环境光层（HUD 重设计）：粒子 canvas / 透视网格 / 聚光灯 / 扫描线 / 暗角 ===== -->

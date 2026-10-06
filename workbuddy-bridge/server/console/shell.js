@@ -116,7 +116,7 @@
     document.getElementById('crumbSub').textContent = def.sub;
   }, 200);
 
-  /* ---------- 主题系统：四档主题面板（暗色 HUD/亮色/墨蓝/暖沙） ---------- */
+  /* ---------- 主题系统：七档主题面板 + 自定义主题（0.3.35：照片取色/壁纸/调色） ---------- */
   var THEMES = [
     { id: 'dark',     name: '暗色（默认）', sw: 'linear-gradient(135deg,#0e1014 50%,#4f8cff 50%)' },
     { id: 'light',    name: '亮色',        sw: 'linear-gradient(135deg,#f2f4f8 50%,#2f6de0 50%)' },
@@ -127,12 +127,24 @@
     { id: 'sakura',   name: '樱花',        sw: 'linear-gradient(135deg,#fbf0f3 50%,#e0527e 50%)' },
   ];
   var themePanel = document.getElementById('themePanel');
+  function customState() {
+    try { return JSON.parse(localStorage.getItem('wbCustomTheme') || 'null'); } catch (e) { return null; }
+  }
+  function customOn() { var c = customState(); return Boolean(c && c.enabled && c.tokens); }
   function applyTheme(id) {
+    // 选预设主题 → 自定义让位（✨ 自定义主题可再开）——否则基底语义互相打架
+    var c = customState();
+    if (c && c.enabled) { c.enabled = false; try { localStorage.setItem('wbCustomTheme', JSON.stringify(c)); } catch (e) { /* 隐私模式等 */ } }
     document.documentElement.dataset.theme = id;
     try { localStorage.setItem('wbTheme', id); } catch (e) { /* 隐私模式等 */ }
-    if (themePanel) themePanel.querySelectorAll('button').forEach(function (b) {
-      b.classList.toggle('on', b.getAttribute('data-theme-id') === id);
-    });
+    if (window.__wbApplyCustomTheme) window.__wbApplyCustomTheme(); // 已禁用 → 仅清理覆盖层；基底变化后也会重挂（0.3.35）
+    if (themePanel) {
+      themePanel.querySelectorAll('button[data-theme-id]').forEach(function (b) {
+        b.classList.toggle('on', b.getAttribute('data-theme-id') === id);
+      });
+      var ct = document.getElementById('wbCustomToggle');
+      if (ct) ct.classList.toggle('on', customOn());
+    }
     var th = document.getElementById('ovTheme');
     if (th) th.textContent = id === 'dark' ? '🌙 切暗色' : id === 'light' ? '☀️ 切亮色' : '🎨 主题';
   }
@@ -140,10 +152,25 @@
     if (!themePanel) return;
     themePanel.innerHTML = THEMES.map(function (t) {
       return '<button data-theme-id="' + t.id + '"><span class="sw" style="background:' + t.sw + '"></span>' + t.name + '</button>';
-    }).join('');
-    themePanel.querySelectorAll('button').forEach(function (b) {
+    }).join('')
+      + '<div class="thsep"></div>'
+      + '<button id="wbCustomToggle" title="开关自定义主题覆盖层（保留当前基底）">✨ 自定义主题</button>'
+      + '<button id="wbCustomEdit" title="上传照片取色生成配色，可选壁纸与暗度，微调强调/背景/文字">⚙ 调制自定义…</button>';
+    themePanel.querySelectorAll('button[data-theme-id]').forEach(function (b) {
       b.onclick = function () { applyTheme(b.getAttribute('data-theme-id')); themePanel.hidden = true; document.body.classList.remove('wbpanel-open'); };
     });
+    var ct = document.getElementById('wbCustomToggle');
+    if (ct) ct.onclick = function (e) {
+      e.stopPropagation();
+      var c = customState();
+      if (c && c.enabled) { c.enabled = false; try { localStorage.setItem('wbCustomTheme', JSON.stringify(c)); } catch (err) {} }
+      else if (c) { c.enabled = true; try { localStorage.setItem('wbCustomTheme', JSON.stringify(c)); } catch (err) {} }
+      else { openCustomEditor(); return; } // 还没有自定义 → 直接进调制器
+      if (window.__wbApplyCustomTheme) window.__wbApplyCustomTheme();
+      ct.classList.toggle('on', customOn());
+    };
+    var ce = document.getElementById('wbCustomEdit');
+    if (ce) ce.onclick = function (e) { e.stopPropagation(); openCustomEditor(); };
     applyTheme(document.documentElement.dataset.theme);
   }
   function toggleTheme() {
@@ -166,6 +193,235 @@
   document.addEventListener('click', function (e) {
     if (!themePanel.hidden && !themePanel.contains(e.target) && e.target.id !== 'navTheme' && !e.target.closest('#navTheme')) { themePanel.hidden = true; document.body.classList.remove('wbpanel-open'); }
   });
+
+  /* ---------- 自定义主题调制器（0.3.35）：照片取色 / 壁纸 / 调色 / 预览 ----------
+   * 覆盖层机制见 index.html 头部（:root[data-theme=基底] 令牌覆盖 + body 壁纸遮罩）。
+   * 这里只负责：取色（canvas 降采样分桶）、令牌派生（深/浅两套公式）、表单与预览。
+   * 预览直接写 #wbCustomCss（与应用器同 id），关闭不保存时由 __wbApplyCustomTheme 还原。 */
+  function cHex(r, g, b) {
+    var f = function (x) { return ('0' + Math.max(0, Math.min(255, Math.round(x))).toString(16)).slice(-2); };
+    return '#' + f(r) + f(g) + f(b);
+  }
+  function cHex2Rgb(hex) {
+    var h = String(hex || '').replace('#', '');
+    if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+    var n = parseInt(h.slice(0, 6), 16);
+    return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+  }
+  function cMix(hex, target, k) {
+    var a = cHex2Rgb(hex), t = cHex2Rgb(target);
+    return cHex(a[0] + (t[0] - a[0]) * k, a[1] + (t[1] - a[1]) * k, a[2] + (t[2] - a[2]) * k);
+  }
+  function cRgb2Hsl(r, g, b) {
+    r /= 255; g /= 255; b /= 255;
+    var mx = Math.max(r, g, b), mn = Math.min(r, g, b), h = 0, s = 0, l = (mx + mn) / 2;
+    if (mx !== mn) {
+      var d = mx - mn;
+      s = l > 0.5 ? d / (2 - mx - mn) : d / (mx + mn);
+      h = mx === r ? (g - b) / d + (g < b ? 6 : 0) : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+      h *= 60;
+    }
+    return [h, s, l];
+  }
+  function cHsl2Rgb(h, s, l) {
+    h = ((h % 360) + 360) % 360; s = Math.max(0, Math.min(1, s)); l = Math.max(0, Math.min(1, l));
+    var c = (1 - Math.abs(2 * l - 1)) * s, x = c * (1 - Math.abs((h / 60) % 2 - 1)), m = l - c / 2;
+    var rgb = h < 60 ? [c, x, 0] : h < 120 ? [x, c, 0] : h < 180 ? [0, c, x] : h < 240 ? [0, x, c] : h < 300 ? [x, 0, c] : [c, 0, x];
+    return [rgb[0] * 255 + m * 255, rgb[1] * 255 + m * 255, rgb[2] * 255 + m * 255];
+  }
+  function cHueShift(hex, deg, l) {
+    var rgb = cHex2Rgb(hex), hsl = cRgb2Hsl(rgb[0], rgb[1], rgb[2]);
+    var out = cHsl2Rgb(hsl[0] + deg, Math.max(0.45, hsl[1]), l == null ? hsl[2] : l);
+    return cHex(out[0], out[1], out[2]);
+  }
+  function cSat(hex, minS, l) {
+    var rgb = cHex2Rgb(hex), hsl = cRgb2Hsl(rgb[0], rgb[1], rgb[2]);
+    var out = cHsl2Rgb(hsl[0], Math.max(minS, hsl[1]), l);
+    return cHex(out[0], out[1], out[2]);
+  }
+  function extractPalette(img) {
+    var cv = document.createElement('canvas');
+    var W = 48, H = Math.max(1, Math.round(48 * (img.height || 1) / (img.width || 1)));
+    cv.width = W; cv.height = H;
+    var cx = cv.getContext('2d');
+    cx.drawImage(img, 0, 0, W, H);
+    var d;
+    try { d = cx.getImageData(0, 0, W, H).data; } catch (e) { return null; } // 跨域图无 CORS：不炸，放弃取色
+    var buckets = {}, total = 0, lumSum = 0;
+    for (var i = 0; i < d.length; i += 4) {
+      var r = d[i], g = d[i + 1], b = d[i + 2];
+      lumSum += 0.2126 * r + 0.7152 * g + 0.0722 * b; total++;
+      var k = ((r >> 4) << 8) | ((g >> 4) << 4) | (b >> 4);
+      var bk = buckets[k] || (buckets[k] = { r: 0, g: 0, b: 0, n: 0 });
+      bk.r += r; bk.g += g; bk.b += b; bk.n++;
+    }
+    var list = Object.keys(buckets).map(function (k) {
+      var b = buckets[k], r = b.r / b.n, g = b.g / b.n, bl = b.b / b.n;
+      var mx = Math.max(r, g, bl), mn = Math.min(r, g, bl);
+      return { r: r, g: g, b: bl, n: b.n, sat: mx ? (mx - mn) / mx : 0, hex: cHex(r, g, bl) };
+    }).sort(function (a, b) { return b.n - a.n; });
+    return { list: list, avgLum: lumSum / (total || 1) };
+  }
+  function deriveTokens(list, base) {
+    // 主强调色：饱和度×√出现数最高（权重兼顾「显眼」与「占比」）；锁最低饱和/亮度档
+    var acc = list.slice().sort(function (a, b) { return (b.sat * Math.sqrt(b.n)) - (a.sat * Math.sqrt(a.n)); })[0] || { r: 79, g: 140, b: 255 };
+    var accHex = cSat(cHex(acc.r, acc.g, acc.b), 0.55, base === 'light' ? 0.45 : 0.62);
+    var bgB = null;
+    for (var i = 0; i < list.length; i++) { if (list[i].sat < 0.3) { bgB = list[i]; break; } }
+    if (!bgB) bgB = list[0] || { r: 14, g: 16, b: 20 };
+    var bg0 = cHex(bgB.r, bgB.g, bgB.b);
+    if (base === 'dark') {
+      var bg = cMix(bg0, '#000000', 0.82);
+      var text = cMix(bg, '#ffffff', 0.9);
+      return { bg: bg, panel: cMix(bg, '#ffffff', 0.05), panel2: cMix(bg, '#ffffff', 0.09),
+        line: 'rgba(255,255,255,.13)', text: text, muted: cMix(bg, '#ffffff', 0.56),
+        accent: accHex, ok: '#34D399', warn: '#F5A524', bad: '#F87171',
+        chip: cMix(bg, '#ffffff', 0.1), codebg: cMix(bg, '#000000', 0.35),
+        hudBg: cMix(bg, '#000000', 0.3), edge: 'rgba(255,255,255,.15)', hair: 'rgba(255,255,255,.1)',
+        tx: text, mu: cMix(bg, '#ffffff', 0.56),
+        cy: cHueShift(accHex, 42, 0.62), vi: cHueShift(accHex, -46, 0.6) };
+    }
+    var bg = cMix(bg0, '#ffffff', 0.88);
+    var text = cMix(bg0, '#000000', 0.82);
+    return { bg: bg, panel: '#ffffff', panel2: cMix(bg0, '#ffffff', 0.76),
+      line: 'rgba(0,0,0,.13)', text: text, muted: cMix(bg0, '#000000', 0.46),
+      accent: accHex, ok: '#1e9352', warn: '#a97413', bad: '#cc3f3f',
+      chip: cMix(bg0, '#ffffff', 0.62), codebg: cMix(bg0, '#ffffff', 0.95),
+      hudBg: bg, edge: 'rgba(0,0,0,.13)', hair: 'rgba(0,0,0,.09)',
+      tx: text, mu: cMix(bg0, '#000000', 0.46),
+      cy: cHueShift(accHex, 42, 0.42), vi: cHueShift(accHex, -46, 0.44) };
+  }
+  var wbCModal = null, wbCSt = null;
+  function wbPreview() {
+    var old = document.getElementById('wbCustomCss');
+    if (old) old.parentNode.removeChild(old);
+    document.documentElement.dataset.theme = wbCSt.base === 'light' ? 'light' : 'dark'; // 预览连基底一起切，所见即所得
+    var st = document.createElement('style');
+    st.id = 'wbCustomCss';
+    st.textContent = window.__wbBuildCustomCss({ enabled: true, base: wbCSt.base, tokens: wbCSt.tokens, wallpaper: wbCSt.wallpaper, dim: wbCSt.dim });
+    document.head.appendChild(st);
+  }
+  function wbSyncForm() {
+    var m = wbCModal;
+    m.querySelector('[name=acc]').value = wbCSt.tokens.accent;
+    m.querySelector('[name=bgc]').value = wbCSt.tokens.bg;
+    m.querySelector('[name=txt]').value = wbCSt.tokens.text;
+    m.querySelector('[name=dimr]').value = Math.round((wbCSt.dim == null ? 0.55 : wbCSt.dim) * 100);
+    m.querySelector('[name=wallon]').checked = Boolean(wbCSt.wallpaper);
+    m.querySelectorAll('[name=cbase]').forEach(function (r) { r.checked = (r.value === wbCSt.base); });
+    var pal = m.querySelector('.wbc-pal');
+    pal.innerHTML = ['bg', 'panel', 'panel2', 'accent', 'text', 'muted'].map(function (k) {
+      return '<span title="' + k + '" style="background:' + wbCSt.tokens[k] + '"></span>';
+    }).join('');
+  }
+  function ensureCustomModal() {
+    if (wbCModal) return;
+    wbCModal = document.createElement('div');
+    wbCModal.id = 'wbCustomModal';
+    wbCModal.hidden = true;
+    wbCModal.innerHTML =
+      '<div class="wbc-box">'
+      + '<div class="wbc-head">🎨 自定义主题 <button type="button" class="wbc-x" title="关闭">×</button></div>'
+      + '<div class="wbc-body">'
+      + '<label class="wbc-row">照片取色：<input type="file" accept="image/*" name="photo"></label>'
+      + '<div class="wbc-row"><span class="wbc-lb">色板</span><span class="wbc-pal"></span></div>'
+      + '<div class="wbc-row"><span class="wbc-lb">基底</span><label><input type="radio" name="cbase" value="dark">深色</label> <label><input type="radio" name="cbase" value="light">浅色</label></div>'
+      + '<div class="wbc-row"><span class="wbc-lb">强调</span><input type="color" name="acc">'
+      + ' <span class="wbc-lb">背景</span><input type="color" name="bgc">'
+      + ' <span class="wbc-lb">文字</span><input type="color" name="txt"></div>'
+      + '<div class="wbc-row"><label class="wbc-lb"><input type="checkbox" name="wallon"> 用照片当背景壁纸</label>'
+      + ' <span class="wbc-lb">遮罩暗度</span><input type="range" name="dimr" min="0" max="85" step="5"></div>'
+      + '<div class="wbc-tip">保存后写入本机浏览器（localStorage），不上传服务器；壁纸自动压缩到 1280px。</div>'
+      + '<div class="wbc-row wbc-act">'
+      + '<button type="button" class="wbc-save">保存并应用</button>'
+      + '<button type="button" class="wbc-clear">清除自定义</button>'
+      + '<span class="wbc-msg"></span></div>'
+      + '</div></div>';
+    document.body.appendChild(wbCModal); // fixed 面板一律 body 直系（round-7 教训）
+    var m = wbCModal;
+    m.querySelector('.wbc-x').onclick = function () { wbCModal.hidden = true; if (window.__wbApplyCustomTheme) window.__wbApplyCustomTheme(); document.body.classList.remove('wbpanel-open'); };
+    m.querySelector('[name=photo]').onchange = function (e) {
+      var f = e.target.files && e.target.files[0];
+      if (!f) return;
+      var rd = new FileReader();
+      rd.onload = function () {
+        var img = new Image();
+        img.onload = function () {
+          var p = extractPalette(img);
+          if (p) { wbCSt.tokens = deriveTokens(p.list, wbCSt.base); wbCSt.fromPhoto = img; }
+          wbSyncForm(); wbPreview();
+        };
+        img.src = rd.result;
+      };
+      rd.readAsDataURL(f);
+    };
+    m.querySelectorAll('[name=cbase]').forEach(function (r) {
+      r.onchange = function () {
+        wbCSt.base = r.value;
+        if (wbCSt.fromPhoto) { var p = extractPalette(wbCSt.fromPhoto); if (p) wbCSt.tokens = deriveTokens(p.list, wbCSt.base); }
+        wbSyncForm(); wbPreview();
+      };
+    });
+    m.querySelector('[name=acc]').oninput = function (e) { wbCSt.tokens.accent = e.target.value; wbCSt.tokens.ac = e.target.value; wbCSt.tokens.cy = cHueShift(e.target.value, 42, wbCSt.base === 'light' ? 0.42 : 0.62); wbCSt.tokens.vi = cHueShift(e.target.value, -46, wbCSt.base === 'light' ? 0.44 : 0.6); wbPreview(); };
+    m.querySelector('[name=bgc]').oninput = function (e) { wbCSt.tokens.bg = e.target.value; wbCSt.tokens.hudBg = cMix(e.target.value, '#000000', wbCSt.base === 'light' ? 0 : 0.3); wbPreview(); };
+    m.querySelector('[name=txt]').oninput = function (e) { wbCSt.tokens.text = e.target.value; wbCSt.tokens.tx = e.target.value; wbPreview(); };
+    m.querySelector('[name=wallon]').onchange = function (e) { if (!e.target.checked) wbCSt.wallpaper = null; wbPreview(); };
+    m.querySelector('[name=dimr]').oninput = function (e) { wbCSt.dim = Number(e.target.value) / 100; wbPreview(); };
+    m.querySelector('.wbc-save').onclick = function () {
+      var msg = m.querySelector('.wbc-msg');
+      var done = function (t) { msg.textContent = t; setTimeout(function () { msg.textContent = ''; }, 2400); };
+      var finish = function (c2) {
+        c2.enabled = true;
+        try { localStorage.setItem('wbCustomTheme', JSON.stringify(c2)); }
+        catch (e1) {
+          c2.wallpaper = null; // 配额超限：退掉壁纸保配色
+          try { localStorage.setItem('wbCustomTheme', JSON.stringify(c2)); done('已保存（壁纸过大被省略）'); }
+          catch (e2) { done('保存失败：浏览器存储不足'); return; }
+        }
+        if (window.__wbApplyCustomTheme) window.__wbApplyCustomTheme();
+        var ct = document.getElementById('wbCustomToggle');
+        if (ct) ct.classList.toggle('on', customOn());
+        wbCModal.hidden = true; document.body.classList.remove('wbpanel-open');
+      };
+      if (wbCSt.wallpaper == null && wbCSt.fromPhoto && m.querySelector('[name=wallon]').checked) {
+        // 首次挂壁纸：把原图压到 1280px JPEG 再存
+        var img = wbCSt.fromPhoto, w = Math.min(1280, img.width || 1280), h = Math.round((img.height || 720) * w / (img.width || 1280));
+        var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+        cv.getContext('2d').drawImage(img, 0, 0, w, h);
+        wbCSt.wallpaper = cv.toDataURL('image/jpeg', 0.72);
+      }
+      if (!m.querySelector('[name=wallon]').checked) wbCSt.wallpaper = null;
+      finish(JSON.parse(JSON.stringify({ enabled: true, base: wbCSt.base, tokens: wbCSt.tokens, wallpaper: wbCSt.wallpaper, dim: wbCSt.dim })));
+    };
+    m.querySelector('.wbc-clear').onclick = function () {
+      try { localStorage.removeItem('wbCustomTheme'); } catch (e) {}
+      wbCSt = null;
+      if (window.__wbApplyCustomTheme) window.__wbApplyCustomTheme();
+      var ct = document.getElementById('wbCustomToggle');
+      if (ct) ct.classList.toggle('on', customOn());
+      var msg = m.querySelector('.wbc-msg'); msg.textContent = '已清除';
+      setTimeout(function () { msg.textContent = ''; wbCModal.hidden = true; document.body.classList.remove('wbpanel-open'); }, 900);
+    };
+  }
+  function openCustomEditor() {
+    ensureCustomModal();
+    if (!wbCSt) {
+      var c = customState();
+      if (c && c.tokens) {
+        wbCSt = JSON.parse(JSON.stringify(c));
+      } else {
+        // 首开：以「当前主题的计算值」为起点——从哪儿调都行
+        var cs = getComputedStyle(document.documentElement);
+        var g = function (n) { var v = (cs.getPropertyValue(n) || '').trim(); return v || '#888888'; };
+        wbCSt = { base: document.documentElement.dataset.theme === 'light' ? 'light' : 'dark',
+          tokens: { bg: g('--bg'), panel: g('--panel'), panel2: g('--panel2'), line: g('--line'), text: g('--text'), muted: g('--muted'), accent: g('--accent'), ok: g('--ok'), warn: g('--warn'), bad: g('--bad'), chip: g('--chip'), codebg: g('--codebg'), hudBg: g('--hud-bg'), edge: g('--edge'), hair: g('--hair'), tx: g('--tx'), mu: g('--mu'), cy: g('--cy'), vi: g('--vi') },
+          wallpaper: null, dim: 0.55 };
+      }
+    }
+    wbSyncForm(); wbPreview();
+    wbCModal.hidden = false;
+    document.body.classList.add('wbpanel-open');
+  }
   // localStorage 旧值兼容：非法值才回默认；合法值（含七档）原样保留不再洗掉
   (function () {
     var cur = document.documentElement.dataset.theme;
