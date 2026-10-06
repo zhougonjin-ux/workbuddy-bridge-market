@@ -358,7 +358,14 @@
     m.querySelectorAll('[name=cbase]').forEach(function (r) {
       r.onchange = function () {
         wbCSt.base = r.value;
-        if (wbCSt.fromPhoto) { var p = extractPalette(wbCSt.fromPhoto); if (p) wbCSt.tokens = deriveTokens(p.list, wbCSt.base); }
+        // 切基底必须重派令牌（0.3.35 手操抓到：只翻基底不重派 = 深色令牌配浅色基底）。
+        // 有照片用照片；没有就从当前强调色合成伪色板（低饱和背景桶搜索会落到它，色相连贯）。
+        var p = wbCSt.fromPhoto ? extractPalette(wbCSt.fromPhoto) : null;
+        if (!p) {
+          var a = cHex2Rgb(wbCSt.tokens.accent);
+          p = { list: [{ r: a[0], g: a[1], b: a[2], n: 100, sat: 0.8, hex: wbCSt.tokens.accent }], avgLum: 0 };
+        }
+        wbCSt.tokens = deriveTokens(p.list, wbCSt.base);
         wbSyncForm(); wbPreview();
       };
     });
