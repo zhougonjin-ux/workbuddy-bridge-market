@@ -1225,7 +1225,8 @@ async function loadModels() {
       if (x.free) cap.push('<span class="badge ok">0 扣费</span>');
       const hm = (t) => new Date(t).toTimeString().slice(0, 5);
       // 促销徽标（0.3.33）：上游 tags 的 badge:<文案>，是真实计费规则（夜间免费=夜间实付 0）
-      const badges = (x.badges || []).map((b) => `<span class="badge promo" title="上游促销：${esc(b)}（时段内实际扣费以徽标为准）">${esc(b)}</span>`).join(' ');
+      // 配色对齐官方客户端（0.3.34）：免费类红、折扣类蓝
+      const badges = (x.badges || []).map((b) => `<span class="badge ${b.includes('折扣') ? 'disc' : 'promo'}" title="上游促销：${esc(b)}（时段内实际扣费以徽标为准）">${esc(b)}</span>`).join(' ');
       // 实测计费（0.3.33）：本插件最近一次请求的实际扣费（TTL 6h，跨窗不展示）
       const obsCell = x.observed
         ? `${x.observed.credit === 0 ? '<b class="ok">免费</b>' : `<b>x${x.observed.credit}</b>`} <span class="muted" style="font-size:11px">${hm(x.observed.at)}</span>`

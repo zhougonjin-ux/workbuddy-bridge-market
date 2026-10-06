@@ -17,9 +17,14 @@ import { getCatalog, parseMultiplier, setObservedCostProvider } from './router.m
  *
  * 口径：倍率 x0.06 表示每 token 扣 0.06 credit，所以 credit ≈ (prompt+completion) × mult。
  * 估算值只进用量统计，不代表上游真实扣费；目录拉不到（Infinity）时不估，如实记 0。
+ *
+ * ⚠️ 0 是有效实报（0.3.34 修）：上游对夜间免费/限时免费模型实扣就是 0——
+ * 旧守卫 `> 0` 把真 0 当「没报」再用倍率估算，观测成本、后缀翻转与用量统计
+ * 全部被估算值污染（实测：hy4-preview 夜间上游实报 0，桥接记成估算 0.02）。
+ * 只有「没报」（undefined/null/NaN）才回落估算。
  */
 export async function estimateCredit(cfg, site, model, upstreamCredit, promptTokens, completionTokens) {
-  if (Number.isFinite(upstreamCredit) && upstreamCredit > 0) return upstreamCredit;
+  if (Number.isFinite(upstreamCredit)) return upstreamCredit;
   try {
     const cat = await getCatalog(cfg, site);
     const info = cat.models.get(model);

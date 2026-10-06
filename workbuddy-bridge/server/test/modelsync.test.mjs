@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { parseBadges, parseRetryAfter } from '../src/upstream.mjs';
 import { markFailure, markSuccess, listModelCooldownAccounts, isModelRateLimited, getAccount } from '../src/pool.mjs';
-import { recordUsage, observedCostByModel, usageDays } from '../src/usage.mjs';
+import { recordUsage, observedCostByModel, usageDays, estimateCredit } from '../src/usage.mjs';
 import { effectiveSuffixText } from '../src/router.mjs';
 import { setConfigDir } from '../src/config.mjs';
 
@@ -181,6 +181,15 @@ test('effectiveSuffixText：观测免费只在「目录倍率>0」时采信（�
   assert.equal(effectiveSuffixText(0.29, null), ' (x0.29)');
   // 目录倍率未知（Infinity，estimateCredit 目录拉不到时也记 0）→ 不采信观测 0
   assert.equal(effectiveSuffixText(Number.POSITIVE_INFINITY, { credit: 0, at: Date.now() }), '');
+});
+
+/* ==================== estimateCredit：0 是有效实报（0.3.34 修） ==================== */
+
+test('estimateCredit：上游实报 0 必须原样返回（夜间免费实扣就是 0，不得回落估算）', async () => {
+  assert.equal(await estimateCredit({}, 's', 'm', 0, 10, 1), 0, '实报 0 → 0（旧守卫 >0 会估算出 2.9）');
+  assert.equal(await estimateCredit({}, 's', 'm', 0.02, 10, 1), 0.02, '实报 0.02 原样返回');
+  assert.equal(await estimateCredit({}, 's', 'm', undefined, 10, 1) >= 0, true, '没报 → 回落估算路径（不抛错）');
+  assert.equal(await estimateCredit({}, 's', 'm', null, 10, 1) >= 0, true);
 });
 
 /* ==================== Retry-After 解析 ==================== */
