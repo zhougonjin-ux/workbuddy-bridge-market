@@ -144,10 +144,13 @@ ZCode 会话钩子检测到存活不会重复拉起。`/wbp-startup remove` 卸�
 - **连登管家**：补签保连登（用补签卡补昨天）→ 逐档兑换连登奖励 → 抽奖，搭在签到同一轮里跑。
 - **猫猫旅行**：到站自动领奖并立即续派下一程。
 - **券码到期提醒**：探测 7 天内到期的券码并发通知。
+- **每日自动体检**（`tasks.doctorTimes`，默认 10:00）：自动跑一遍全桥体检（登录态、模型目录、
+  数据文件、协议签名等），有 fail 项推一条汇总通知，全绿只记事件时间线不打扰；
+  上游改版/登录态失效这类「静默故障」第二天上午就会被告知。`[]` 关闭。
 - **每日数据备份**、**每周用量周报**（可配通知推送）。
-- 时点到了但当时机器没开机？下次启动会**自动补跑**当天错过的任务。
+- 时点到了但当时机器没开机？下次启动会**自动补跑**当天错过的任务（体检同样补跑）。
 - 首次触发带随机延迟（`tasks.jitterMinutes`，默认 30 分钟内）避开整点高峰。
-- 通知走 Windows 气泡（仅 Windows）或 Webhook / Bark / Server酱 / 飞书 / 钉钉 / Telegram。
+- 通知走 Windows 气泡（仅 Windows，**点击气泡直达控制台**）或 Webhook / Bark / Server酱 / 飞书 / 钉钉 / Telegram。
 - 总开关：`config.json → tasks.enabled`；分类开关 `tasks.checkin` / `tasks.growth`。
 - 手动执行：`wb_tasks_run` 工具、`/console` 按钮；查状态：`wb_tasks_status` 或 `/console`。
 
@@ -181,7 +184,7 @@ MCP 服务器 `workbuddy-bridge`（装好插件自动连接）提供 13 个工�
 
 ```bash
 cd <插件目录>/server
-npm test        # 单元测试（147 项）
+npm test        # 单元测试（178 项）
 npm run smoke   # 冒烟测试（自带临时目录隔离）
 ```
 

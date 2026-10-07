@@ -224,6 +224,7 @@ export function defaultConfig() {
       growthTimes: [],        // 同上，精确到分钟
       travelTimes: ['09:00', '15:00', '21:00'], // 猫猫旅行巡逻时点（状态机幂等，一天可多次）
       listTimes: ['09:00', '15:00', '21:00'],  // 控制台任务中心列表的每日自动刷新时点（预取缓存）
+      doctorTimes: ['10:00'], // 每日自动体检时点：有 fail 项推通知，全绿只记时间线；空数组=关闭
       travelLocationId: 4,    // 派出地点（参考实现实测 4 个地点收益/时长区间相同）
       jitterMinutes: 30,      // 时点上的随机延迟（分钟），避开整点高峰
       autoComplete: true,     // 成长任务里的「对话体验类」由桥接代打极小请求点亮进度
@@ -566,7 +567,7 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
       }
     }
     // 精确时点 ["HH:MM"]：非空时优先于 *Hours
-    for (const k of ['checkinTimes', 'growthTimes', 'travelTimes', 'listTimes']) {
+    for (const k of ['checkinTimes', 'growthTimes', 'travelTimes', 'listTimes', 'doctorTimes']) {
       if (cfg.tasks[k] === undefined) { cfg.tasks[k] = defaults.tasks[k]; continue; }
       if (!Array.isArray(cfg.tasks[k])) cfg.tasks[k] = structuredClone(defaults.tasks[k]);
       else {

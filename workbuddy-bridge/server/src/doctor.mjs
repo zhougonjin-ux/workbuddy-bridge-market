@@ -9,6 +9,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { paths, siteKeys, authKeys } from './config.mjs';
+import { writeJsonFileAtomic } from './util.mjs';
+import { log, warn } from './log.mjs';
+import { recordEvent } from './events.mjs';
+import { notify } from './notify.mjs';
 import { isLoggedIn, getAuth } from './auth.mjs';
 import { listAccounts } from './pool.mjs';
 import { getCatalog, mergedModels } from './router.mjs';
@@ -248,4 +252,101 @@ export async function runDiagnostics(cfg) {
   const summary = { pass: 0, warn: 0, fail: 0 };
   for (const c of checks) summary[c.level]++;
   return { at: new Date().toISOString(), version: updatecheckLocalVersion(), summary, checks };
+}
+
+/* ---------------- 每日自动体检（T67） ----------------
+ * 上游是非官方接口，最怕的不是报错而是静默失效：腾讯改了端点，签到/对话
+ * 默默失败好几天没人发现。本循环每天在 tasks.doctorTimes 时点自动跑一遍
+ * runDiagnostics，有 fail 项就推一条汇总通知；全绿只记事件时间线，不打扰。
+ * 模式照抄 weekly.mjs：状态落盘（doctor.json，补跑判定）、依赖注入（离线单测）、
+ * 60s tick。与手动 /wbp-doctor 的区别只在于「自动 + 有异常才说话」。 */
+
+const autoTimers = { tick: null };
+
+function autoStateFile() {
+  return path.join(paths.root, 'doctor.json');
+}
+
+function loadAutoState(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return {}; }
+}
+
+function saveAutoState(file, data) {
+  try { writeJsonFileAtomic(file, data); } catch (e) {
+    // 状态写不进去只影响补跑判定（同一天可能重跑一次），不值得绊倒体检本身
+    warn('每日体检状态保存失败：', e.message);
+  }
+}
+
+const p2 = (n) => String(n).padStart(2, '0');
+const dateKey = (d) => `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())}`;
+
+/**
+ * 每日体检 tick（依赖可注入，单测不碰生产数据目录与真实通知）。
+ * 返回 { ok, skipped?, summary?, notified?, fails? }；
+ * skipped: 'disabled'（时点数组为空）| 'no-account' | 'not-time' | 'already-run'。
+ */
+export async function doctorAutoTick(cfg, now = new Date(), {
+  stateFile = null,
+  diagnose = runDiagnostics,
+  sendNotify = notify,
+  fireEvent = recordEvent,
+  hasAccount = null,
+} = {}) {
+  const times = Array.isArray(cfg.tasks?.doctorTimes) ? cfg.tasks.doctorTimes : ['10:00'];
+  if (!times.length) return { ok: false, skipped: 'disabled' };
+  // 没有任何已登录站点时跳过：裸服务（还没加账号）必然「模型目录为空」，天天报狼来了
+  const has = hasAccount || (() => siteKeys(cfg).some((s) => isLoggedIn(s)));
+  if (!has()) return { ok: false, skipped: 'no-account' };
+  const today = dateKey(now);
+  const hhmm = `${p2(now.getHours())}:${p2(now.getMinutes())}`;
+  const st = loadAutoState(stateFile || autoStateFile());
+  if (st.lastRun === today) return { ok: false, skipped: 'already-run' };
+  // 已过最早时点即跑——同 weekly 的补跑语义：60s tick 恰好命中那一分钟太脆弱，
+  // 服务那一刻没活着（关机/重启），启动后第一条 tick 就把当天体检补上
+  if (!times.some((t) => hhmm >= String(t).trim())) return { ok: false, skipped: 'not-time' };
+
+  const report = await diagnose(cfg);
+  const fails = report.checks.filter((c) => c.level === 'fail');
+  let notified = false;
+  if (fails.length) {
+    // 气泡正文 180 字上限：逐条「名称：详情」，超出的靠控制台时间线回看
+    const text = fails.map((c) => `${c.name}：${String(c.detail).slice(0, 60)}`).join('；');
+    try {
+      sendNotify(cfg, `每日体检 🔴 ${fails.length} 项异常`, text, { key: `doctor-${today}` });
+      notified = true;
+    } catch { /* 通知失败不绊倒体检 */ }
+  }
+  try {
+    fireEvent('system', fails.length
+      ? `每日体检：${fails.length}/${report.checks.length} 项异常（${fails.map((c) => c.name).slice(0, 4).join('、')}）`
+      : `每日体检通过：${report.checks.length} 项全部正常`);
+  } catch { /* 时间线失败不影响主流程 */ }
+  saveAutoState(stateFile || autoStateFile(), {
+    lastRun: today,
+    at: report.at,
+    summary: report.summary,
+    failNames: fails.map((c) => c.name),
+  });
+  const s = report.summary;
+  log(`每日体检完成：${s.pass} 过 / ${s.warn} 警告 / ${s.fail} 不及格${notified ? '（已通知）' : ''}`);
+  return { ok: true, summary: report.summary, notified, fails: fails.map((c) => c.name) };
+}
+
+/** 启动每日体检调度（60s tick，与任务/周报循环同节奏；幂等）。 */
+export function startDoctorLoop(cfg) {
+  if (autoTimers.tick) return;
+  if (Array.isArray(cfg.tasks?.doctorTimes) && cfg.tasks.doctorTimes.length === 0) {
+    log('每日自动体检已关闭（tasks.doctorTimes=[]）');
+    return;
+  }
+  autoTimers.tick = setInterval(() => {
+    void doctorAutoTick(cfg).catch((e) => warn('每日体检调度异常：', e.message));
+  }, 60_000);
+  autoTimers.tick.unref?.();
+}
+
+export function stopDoctorLoop() {
+  if (autoTimers.tick) clearInterval(autoTimers.tick);
+  autoTimers.tick = null;
 }

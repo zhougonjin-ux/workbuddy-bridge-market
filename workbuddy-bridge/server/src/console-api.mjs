@@ -36,7 +36,7 @@ import { weeklyTick } from './weekly.mjs';
 import { burnoutReport, predictAccount } from './burnout.mjs';
 import { recentDailyCreditAvg } from './usage.mjs';
 import { checkForUpdate } from './updatecheck.mjs';
-import { runDiagnostics } from './doctor.mjs';
+import { runDiagnostics, startDoctorLoop } from './doctor.mjs';
 import { flushLearned } from './compress.mjs';
 import { flushEvents } from './events.mjs';
 
@@ -437,6 +437,7 @@ export async function handleConsoleApi(ctx) {
       growthTimes: body.growthTimes !== undefined ? parseTimes(body.growthTimes) : null,
       travelTimes: body.travelTimes !== undefined ? parseTimes(body.travelTimes) : null,
       listTimes: body.listTimes !== undefined ? parseTimes(body.listTimes) : null,
+      doctorTimes: body.doctorTimes !== undefined ? parseTimes(body.doctorTimes) : null,
     };
     for (const [k, arr] of Object.entries(norm)) {
       if (arr === null) continue;
@@ -467,6 +468,9 @@ export async function handleConsoleApi(ctx) {
       stopTaskLoop();
       if (cfg.tasks.enabled !== false) startTaskLoop(cfg);
     }
+    // T67：doctorTimes 从 [] 改回非空时补挂体检循环（幂等；tick 内每分钟现读时点，
+    // 其余改动天然热生效；时点非空时启动循环、空数组由 tick 判 disabled）
+    if (body.doctorTimes !== undefined) startDoctorLoop(cfg);
     return sendJson(res, 200, {
       ok: true,
       saved: {
@@ -477,6 +481,7 @@ export async function handleConsoleApi(ctx) {
         growthTimes: cfg.tasks.growthTimes,
         travelTimes: cfg.tasks.travelTimes,
         listTimes: cfg.tasks.listTimes,
+        doctorTimes: cfg.tasks.doctorTimes,
         autoComplete: cfg.tasks.autoComplete,
         maxChatsPerTask: cfg.tasks.maxChatsPerTask,
       },

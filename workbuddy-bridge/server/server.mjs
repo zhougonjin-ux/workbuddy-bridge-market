@@ -27,6 +27,7 @@ import { runTasks, taskStatus, startTaskLoop, stopTaskLoop } from './src/tasks.m
 import { startHealthLoop, stopHealthLoop } from './src/health.mjs';
 import { startWeeklyLoop, stopWeeklyLoop } from './src/weekly.mjs';
 import { startBackupLoop, stopBackupLoop } from './src/backup.mjs';
+import { startDoctorLoop, stopDoctorLoop } from './src/doctor.mjs';
 import { importLocalAccounts } from './src/localimport.mjs';
 import { startProviderConfigSync, stopProviderConfigSync, triggerProviderConfigSyncNow } from './src/pickersync.mjs';
 
@@ -784,12 +785,13 @@ server.listen(cfg.port, cfg.host, () => {
   startHealthLoop(cfg);
   startWeeklyLoop(cfg);
   startBackupLoop(cfg);
+  startDoctorLoop(cfg);
   startProviderConfigSync(cfg, (e) => warn('模型池自动同步失败：', e.message));
   // 生命周期依赖注入：交棒重启（/admin/restart、/console/api/service/restart 共用）
   // 需要活跃计数与各循环的 stop/flush 函数；onClose 走 server.close → 进程退出。
   bootLifecycle({
     activeRequestsRef: () => activeRequests,
-    stoppers: [stopCreditLoop, stopTaskLoop, stopHealthLoop, stopWeeklyLoop, stopBackupLoop, stopProviderConfigSync],
+    stoppers: [stopCreditLoop, stopTaskLoop, stopHealthLoop, stopWeeklyLoop, stopBackupLoop, stopDoctorLoop, stopProviderConfigSync],
     flushers: [flushUsage, flushPool, flushLearned, flushEvents],
   });
   setRestartHandler(doRestart);

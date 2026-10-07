@@ -37,23 +37,34 @@ export function rollbackNotify(key, store = lastFired) {
   store.delete(key);
 }
 
-function firePS(title, text) {
+function firePS(title, text, url = '') {
   if (process.platform !== 'win32') return false;
   if (psBusy) return false;
   psBusy = true;
   try {
-    // -NoProfile 加速启动；STA 是 NotifyIcon 的要求；stdin 喂参数避免命令行中文乱码
+    // -NoProfile 加速启动；STA 是 NotifyIcon 的要求；stdin 喂参数避免命令行中文乱码。
+    // T68：消息循环（Application.Run + 12s 自毁 Timer）替代原来的 Start-Sleep——
+    // 没有消息循环气泡照样弹，但 BalloonTipClicked 永远不会回调；点击事件里用
+    // $sender.Tag 取 URL（scriptblock 闭包变量作用域不可靠，挂在控件上最稳）。
+    // Win10/11 把气泡转成操作中心 toast 后点击 toast 主体仍触发该事件；
+    // 被专注助手拦截时点击无效，属于可接受降级，不影响通知本身。
     const child = spawn('powershell.exe', ['-NoProfile', '-STA', '-Command', `
 $input_json = [Console]::In.ReadToEnd() | ConvertFrom-Json
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 $n = New-Object System.Windows.Forms.NotifyIcon
 $n.Icon = [System.Drawing.SystemIcons]::Information
 $n.Visible = $true
+if ($input_json.url) { $n.Tag = $input_json.url }
+$n.add_BalloonTipClicked({ param($sender, $e) if ($sender.Tag) { Start-Process $sender.Tag } })
 $n.ShowBalloonTip(8000, $input_json.title, $input_json.text, [System.Windows.Forms.ToolTipIcon]::Info)
-Start-Sleep -Seconds 9
+$t = New-Object System.Windows.Forms.Timer
+$t.Interval = 12000
+$t.add_Tick({ [System.Windows.Forms.Application]::Exit() })
+$t.Start()
+[System.Windows.Forms.Application]::Run()
 $n.Dispose()
 `], { detached: true, stdio: ['pipe', 'ignore', 'ignore'], windowsHide: true });
-    child.stdin.end(JSON.stringify({ title: String(title).slice(0, 60), text: String(text).slice(0, 180) }));
+    child.stdin.end(JSON.stringify({ title: String(title).slice(0, 60), text: String(text).slice(0, 180), url: String(url || '') }));
     child.on('error', () => { psBusy = false; });
     child.on('exit', () => { psBusy = false; });
     child.unref?.();
@@ -82,7 +93,10 @@ export function notify(cfg, title, text, { key = null, force = false, _fire = fi
   try {
     if (process.platform !== 'win32') return false;
     if (!force && key && !shouldNotify(key)) return false;
-    const ok = _fire(title, text);
+    // T68 气泡点击直达控制台：URL 由 cfg 现算，调用方零改动；port 缺省回落 8788，
+    // host 不参与构造——本机浏览器访问 127.0.0.1 永远可达（host 可能是 0.0.0.0）
+    const url = `http://127.0.0.1:${Number(cfg?.port) || 8788}/console`;
+    const ok = _fire(title, text, url);
     if (ok) log(`桌面通知：${title} — ${String(text).slice(0, 80)}`);
     else if (!force && key) rollbackNotify(key); // psBusy 丢掉的气泡不消耗节流窗口
     return ok;
