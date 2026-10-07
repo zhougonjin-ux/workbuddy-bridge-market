@@ -165,14 +165,20 @@
       var c = customState();
       if (c && c.enabled) { c.enabled = false; try { localStorage.setItem('wbCustomTheme', JSON.stringify(c)); } catch (err) {} }
       else if (c) { c.enabled = true; try { localStorage.setItem('wbCustomTheme', JSON.stringify(c)); } catch (err) {} }
-      else { openCustomEditor(); return; } // 还没有自定义 → 直接进调制器
+      else { themePanel.hidden = true; document.body.classList.remove('wbpanel-open'); openCustomEditor(); return; } // 还没有自定义 → 直接进调制器
       if (window.__wbApplyCustomTheme) window.__wbApplyCustomTheme();
       ct.classList.toggle('on', customOn());
     };
     var ce = document.getElementById('wbCustomEdit');
-    if (ce) ce.onclick = function (e) { e.stopPropagation(); openCustomEditor(); };
-    // 构建面板时不要调 applyTheme：它会顺手禁用自定义主题——用户只是点开面板看看，
-    // 调好的自定义主题就被静默卸载了。按钮高亮态按当前状态同步即可。
+    if (ce) ce.onclick = function (e) { e.stopPropagation(); themePanel.hidden = true; document.body.classList.remove('wbpanel-open'); openCustomEditor(); };
+    // 构建面板时按当前状态同步高亮：自定义启用时预设全灭（只有 ✨ 亮），否则亮当前基底。
+    // 之前只写注释没写代码，首次打开面板看不到当前主题选中态（0.3.39 实测）。
+    var cur = customOn() ? null : document.documentElement.dataset.theme;
+    themePanel.querySelectorAll('button[data-theme-id]').forEach(function (b) {
+      b.classList.toggle('on', b.getAttribute('data-theme-id') === cur);
+    });
+    var ct0 = document.getElementById('wbCustomToggle');
+    if (ct0) ct0.classList.toggle('on', customOn());
   }
   function toggleTheme() {
     if (!themePanel.innerHTML) buildThemePanel();
@@ -293,13 +299,24 @@
       cy: cHueShift(accHex, 42, 0.42), vi: cHueShift(accHex, -46, 0.44) };
   }
   var wbCModal = null, wbCSt = null;
+  function wbMakeWallpaper(img) {
+    // 壁纸统一压到 1280px JPEG（0.72）再入 localStorage，原图 dataURL 会爆配额
+    var w = Math.min(1280, img.width || 1280), h = Math.round((img.height || 720) * w / (img.width || 1280));
+    var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
+    cv.getContext('2d').drawImage(img, 0, 0, w, h);
+    return cv.toDataURL('image/jpeg', 0.72);
+  }
   function wbPreview() {
     var old = document.getElementById('wbCustomCss');
     if (old) old.parentNode.removeChild(old);
     document.documentElement.dataset.theme = wbCSt.base === 'light' ? 'light' : 'dark'; // 预览连基底一起切，所见即所得
+    // 壁纸按勾选框实时算，不读 wbCSt.wallpaper：取消勾选只影响预览不销毁数据，
+    // 重新勾选立即恢复——否则「关掉再打开」保存一次壁纸就永久丢了（0.3.39 实测）。
+    var wcb = wbCModal && wbCModal.querySelector('[name=wallon]');
+    var wp = (wcb && wcb.checked) ? wbCSt.wallpaper : null;
     var st = document.createElement('style');
     st.id = 'wbCustomCss';
-    st.textContent = window.__wbBuildCustomCss({ enabled: true, base: wbCSt.base, tokens: wbCSt.tokens, wallpaper: wbCSt.wallpaper, dim: wbCSt.dim });
+    st.textContent = window.__wbBuildCustomCss({ enabled: true, base: wbCSt.base, tokens: wbCSt.tokens, wallpaper: wp, dim: wbCSt.dim });
     document.head.appendChild(st);
   }
   function wbSyncForm() {
@@ -350,6 +367,9 @@
         img.onload = function () {
           var p = extractPalette(img);
           if (p) { wbCSt.tokens = deriveTokens(p.list, wbCSt.base); wbCSt.fromPhoto = img; }
+          // 换图时若壁纸勾着，立即用新图重生成壁纸——保存分支只在「还没有壁纸」时
+          // 兜底生成，旧逻辑会一直挂着上一张图的壁纸（0.3.39 实测换图壁纸不更新）。
+          if (m.querySelector('[name=wallon]').checked) wbCSt.wallpaper = wbMakeWallpaper(img);
           wbSyncForm(); wbPreview();
         };
         img.src = rd.result;
@@ -373,7 +393,12 @@
     m.querySelector('[name=acc]').oninput = function (e) { wbCSt.tokens.accent = e.target.value; wbCSt.tokens.ac = e.target.value; wbCSt.tokens.cy = cHueShift(e.target.value, 42, wbCSt.base === 'light' ? 0.42 : 0.62); wbCSt.tokens.vi = cHueShift(e.target.value, -46, wbCSt.base === 'light' ? 0.44 : 0.6); wbPreview(); };
     m.querySelector('[name=bgc]').oninput = function (e) { wbCSt.tokens.bg = e.target.value; wbCSt.tokens.hudBg = cMix(e.target.value, '#000000', wbCSt.base === 'light' ? 0 : 0.3); wbPreview(); };
     m.querySelector('[name=txt]').oninput = function (e) { wbCSt.tokens.text = e.target.value; wbCSt.tokens.tx = e.target.value; wbPreview(); };
-    m.querySelector('[name=wallon]').onchange = function (e) { if (!e.target.checked) wbCSt.wallpaper = null; wbPreview(); };
+    m.querySelector('[name=wallon]').onchange = function (e) {
+      // 勾选瞬间就生成壁纸并进预览（旧逻辑要到保存才生成，调制器里始终看不到照片背景）。
+      // 取消勾选不清数据：wbPreview 按勾选状态实时决定壁纸是否上场。
+      if (e.target.checked && !wbCSt.wallpaper && wbCSt.fromPhoto) wbCSt.wallpaper = wbMakeWallpaper(wbCSt.fromPhoto);
+      wbPreview();
+    };
     m.querySelector('[name=dimr]').oninput = function (e) { wbCSt.dim = Number(e.target.value) / 100; wbPreview(); };
     m.querySelector('.wbc-save').onclick = function () {
       var msg = m.querySelector('.wbc-msg');
@@ -391,15 +416,14 @@
         if (ct) ct.classList.toggle('on', customOn());
         wbCModal.hidden = true; document.body.classList.remove('wbpanel-open');
       };
-      if (wbCSt.wallpaper == null && wbCSt.fromPhoto && m.querySelector('[name=wallon]').checked) {
-        // 首次挂壁纸：把原图压到 1280px JPEG 再存
-        var img = wbCSt.fromPhoto, w = Math.min(1280, img.width || 1280), h = Math.round((img.height || 720) * w / (img.width || 1280));
-        var cv = document.createElement('canvas'); cv.width = w; cv.height = h;
-        cv.getContext('2d').drawImage(img, 0, 0, w, h);
-        wbCSt.wallpaper = cv.toDataURL('image/jpeg', 0.72);
+      // 壁纸去留由勾选框决定；没生成过且手头有照片才兜底压一张（正常路径已在
+      // 选图/勾选时生成）。这里不再把 wbCSt.wallpaper 置 null——数据留在内存，
+      // 用户「取消勾选又改主意」重新勾上时预览与保存都能原样恢复。
+      if (m.querySelector('[name=wallon]').checked && !wbCSt.wallpaper && wbCSt.fromPhoto) {
+        wbCSt.wallpaper = wbMakeWallpaper(wbCSt.fromPhoto);
       }
-      if (!m.querySelector('[name=wallon]').checked) wbCSt.wallpaper = null;
-      finish(JSON.parse(JSON.stringify({ enabled: true, base: wbCSt.base, tokens: wbCSt.tokens, wallpaper: wbCSt.wallpaper, dim: wbCSt.dim })));
+      var wp = m.querySelector('[name=wallon]').checked ? wbCSt.wallpaper : null;
+      finish(JSON.parse(JSON.stringify({ enabled: true, base: wbCSt.base, tokens: wbCSt.tokens, wallpaper: wp, dim: wbCSt.dim })));
     };
     m.querySelector('.wbc-clear').onclick = function () {
       try { localStorage.removeItem('wbCustomTheme'); } catch (e) {}
