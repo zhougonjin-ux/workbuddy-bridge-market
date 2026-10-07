@@ -11,11 +11,10 @@
 //   credit  积分刷新失败
 //   login   账号登录成功
 //   health  模型健康巡检结果
-import fs from 'node:fs';
 import path from 'node:path';
 import { paths } from './config.mjs';
 import { warn } from './log.mjs';
-import { writeJsonFileAtomic } from './util.mjs';
+import { writeJsonFileAtomic, readJsonFileWithBackup } from './util.mjs';
 
 const MAX_EVENTS = 300;
 const SAVE_DELAY_MS = 3000;
@@ -27,17 +26,14 @@ let loadedFrom = null;
 let dirty = false;
 let timer = null;
 
-/** 惰性加载（配置目录可能在运行期被切换，与 usage.mjs 同一套约定）。 */
+/** 惰性加载（配置目录可能在运行期被切换，与 usage.mjs 同一套约定）。
+ *  坏文件先备份成 .corrupt-* 再从空开始——历史事件还有手工抢救的机会。 */
 function ensureLoaded() {
   const f = file();
   if (loadedFrom === f) return;
   loadedFrom = f;
-  try {
-    if (fs.existsSync(f)) events = JSON.parse(fs.readFileSync(f, 'utf8'));
-  } catch (e) {
-    warn('events.json 读取失败，事件时间线重新开始：', e.message);
-  }
-  if (!Array.isArray(events)) events = [];
+  const disk = readJsonFileWithBackup(f);
+  events = Array.isArray(disk) ? disk : [];
 }
 
 function saveNow() {
@@ -64,6 +60,13 @@ export function flushEvents() {
   if (timer) clearTimeout(timer);
   timer = null;
   if (dirty) saveNow();
+}
+
+/** 供控制台「恢复备份」在写回 events.json 后强制重读（否则内存旧态会把恢复内容覆盖回去）。 */
+export function reloadEvents() {
+  loadedFrom = null;
+  events = null;
+  ensureLoaded();
 }
 
 /**

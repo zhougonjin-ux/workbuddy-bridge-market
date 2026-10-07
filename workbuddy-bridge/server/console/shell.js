@@ -171,7 +171,8 @@
     };
     var ce = document.getElementById('wbCustomEdit');
     if (ce) ce.onclick = function (e) { e.stopPropagation(); openCustomEditor(); };
-    applyTheme(document.documentElement.dataset.theme);
+    // 构建面板时不要调 applyTheme：它会顺手禁用自定义主题——用户只是点开面板看看，
+    // 调好的自定义主题就被静默卸载了。按钮高亮态按当前状态同步即可。
   }
   function toggleTheme() {
     if (!themePanel.innerHTML) buildThemePanel();
@@ -461,7 +462,22 @@
     chipEp.textContent = (st.base_url || '').replace('http://', '');
     chipEp.title = '点击复制 Base URL：' + (st.base_url || '');
     chipEp.style.cursor = 'pointer';
-    chipEp.onclick = function () { navigator.clipboard?.writeText(st.base_url || '').then(function () { window.toast && window.toast('已复制 Base URL', 'ok'); }); };
+    chipEp.onclick = function () {
+      var url = st.base_url || '';
+      var done = function () { window.toast && window.toast('已复制 Base URL', 'ok'); };
+      var fail = function () {
+        // clipboard API 在后台标签页会因 "Document not focused" 拒绝：降级 execCommand
+        try {
+          var ta = document.createElement('textarea');
+          ta.value = url; ta.style.cssText = 'position:fixed;opacity:0';
+          document.body.appendChild(ta); ta.select();
+          document.execCommand('copy') ? done() : (window.toast && window.toast('复制失败：请手动选中复制', 'bad'));
+          ta.remove();
+        } catch (e3) { window.toast && window.toast('复制失败：请手动选中复制', 'bad'); }
+      };
+      if (!navigator.clipboard?.writeText) { fail(); return; }
+      navigator.clipboard.writeText(url).then(done).catch(fail);
+    };
     const chipDoc = document.getElementById('chipDoctor');
     chipDoc.title = '一键诊断结果（通过/警告/失败）· 与 /wbp-doctor 同源 · 点击到系统设置运行诊断';
     chipDoc.style.cursor = 'pointer';
@@ -469,7 +485,9 @@
     const chipRun2 = document.getElementById('chipRun');
     chipRun2.title = anyLogin ? '至少一个站点已登录，服务可正常代理' : '还没有已登录账号：到资源池扫码或导入本机登录态';
     document.getElementById('chipRun').innerHTML = '<span class="dot' + (anyLogin ? '' : ' off') + '"></span>' + (anyLogin ? '运行中' : '未登录');
-    document.getElementById('chipModel').innerHTML = '默认 <b>' + (st.default_model || '—') + '</b>';
+    document.getElementById('chipModel').innerHTML = '默认 <b></b>';
+    // default_model 来自上游目录：用 textContent 而不是字符串拼接进 innerHTML
+    document.querySelector('#chipModel b').textContent = st.default_model || '—';
     document.getElementById('chipModel').onclick = function () { if (window.showView) window.showView('models'); };
     if (doc && doc.summary) {
       document.getElementById('chipDoctor').innerHTML =
@@ -554,8 +572,15 @@
       if (act === 'tasks') {
         window.toast && window.toast('正在执行一轮任务…');
         var r = await api('/tasks/run', { method: 'POST', body: { kind: 'all' } });
+        if (r.results?.busy) { window.toast && window.toast(r.results.msg || '任务正在进行中', 'ok'); return; }
+        // results 的值是数组（每账号一条 {id,label,ok,skipped,...}），与 app.js 任务页同一口径
         var parts = [];
-        for (var k in (r.results || {})) parts.push(k + ' 成功' + (r.results[k].ok || 0));
+        for (var k in (r.results || {})) {
+          var list = r.results[k] || [];
+          var okN = list.filter(function (x) { return x && x.ok && !x.skipped; }).length;
+          var badN = list.filter(function (x) { return x && x.ok === false; }).length;
+          parts.push(k.split(':')[0] + ' 成功 ' + okN + (badN ? ' / 失败 ' + badN : ''));
+        }
         window.toast && window.toast('任务完成 —— ' + parts.join('；'), 'ok');
         if (window.loadOverview) window.loadOverview();
       } else if (act === 'doctor') {
@@ -566,7 +591,9 @@
         window.toast && window.toast('积分明细已刷新', 'ok');
         if (window.loadOverview) window.loadOverview();
       } else if (act === 'csv') {
-        var res = await fetch('/console/api/usage/export?days=30', { headers: { 'X-Console-Token': (window.__WB_TOKEN_REF || '') } });
+        // __WB_TOKEN_REF 是 getter 对象（app.js 续期 token 后这里必须拿到最新值）
+        var tok = (window.__WB_TOKEN_REF && window.__WB_TOKEN_REF.token) || '';
+        var res = await fetch('/console/api/usage/export?days=30', { headers: { 'X-Console-Token': tok } });
         if (!res.ok) throw new Error('HTTP ' + res.status);
         var blob = await res.blob();
         var url = URL.createObjectURL(blob);

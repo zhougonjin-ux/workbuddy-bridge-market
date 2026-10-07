@@ -142,6 +142,12 @@ function describeType(v) {
 export function evaluateSignatures(responses) {
   const results = [];
   for (const sig of PROTOCOL_SIGNATURES) {
+    // 该签名所属探针域本次探测失败（端点不可用/网络问题）：跳过而不判漂移——
+    // 「端点暂时不可用」报成「上游改版」会训练用户忽略真漂移的告警
+    if (responses?.[`${sig.probe}Failed`]) {
+      results.push({ key: sig.key, what: sig.what, path: sig.path, ok: true, skipped: true, detail: `探针失败（${String(responses[`${sig.probe}Failed`]).slice(0, 80)}），本次跳过、不计漂移` });
+      continue;
+    }
     const json = responses?.[sig.probe];
     let out;
     try {
@@ -155,6 +161,7 @@ export function evaluateSignatures(responses) {
     total: results.length,
     ok: results.filter((r) => r.ok).length,
     drifted: results.filter((r) => !r.ok).length,
+    skipped: results.filter((r) => r.skipped).length,
     results,
   };
 }
@@ -198,16 +205,16 @@ async function probeSite(cfg, site) {
     try {
       responses.credit = await rawCredit(cfg, site);
     } catch (e) {
-      // 额度接口挂了不阻塞模型侧签名判定，把 credit 留空由签名判成「取不到样」
-      responses.creditError = e.message;
+      // 探针失败不算漂移：显式标记失败域，签名判定时跳过该域（见 evaluateSignatures）
+      responses.creditFailed = e.message;
     }
   }
   // T54：v3/config 探针（独立目录家族）。探测失败不算漂移（端点可能只是该站不可用），
-  // 留空由签名判成「取不到样」；doctor 的登录态检查负责报网络问题。
+  // doctor 的登录态检查负责报网络问题。
   try {
     responses.v3config = await rawV3Config(cfg, site);
   } catch (e) {
-    responses.v3configError = e.message;
+    responses.v3configFailed = e.message;
   }
   return { ok: true, responses };
 }
@@ -257,11 +264,12 @@ export async function runProtocolCheck(cfg, { force = false } = {}) {
         out.sites[site] = {
           checkedAt: new Date().toISOString(),
           skipped: false,
-          ...(r.responses.creditError ? { creditError: r.responses.creditError } : {}),
-          ...(r.responses.v3configError ? { v3configError: r.responses.v3configError } : {}),
+          ...(r.responses.creditFailed ? { creditError: r.responses.creditFailed } : {}),
+          ...(r.responses.v3configFailed ? { v3configError: r.responses.v3configFailed } : {}),
           results: ev.results,
           drifted: ev.drifted,
           total: ev.total,
+          skippedSigs: ev.skipped,
         };
         s.sites[site] = out.sites[site];
       }

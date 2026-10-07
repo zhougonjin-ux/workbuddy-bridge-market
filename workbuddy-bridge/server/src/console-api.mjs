@@ -16,20 +16,20 @@ import {
   markExhausted,
   updateCreditDetail,
 } from './pool.mjs';
-import { getCatalog, mergedModels, parseMultiplier } from './router.mjs';
+import { getCatalog, mergedModels } from './router.mjs';
 import { queryCredit, supportsCreditQuery } from './upstream.mjs';
-import { probeModel, runHealthScan, healthStatus } from './health.mjs';
+import { probeModel, runHealthScan, healthStatus, reloadHealthState } from './health.mjs';
 import { startLogin, pollLogin } from './device-login.mjs';
-import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel, usageCsv } from './usage.mjs';
-import { recentLogs, recentRequests, log } from './log.mjs';
-import { recentEvents } from './events.mjs';
-import { compressionStats } from './compress.mjs';
-import { sendJson } from './util.mjs';
+import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel, usageCsv, reloadUsage } from './usage.mjs';
+import { recentLogs, recentRequests } from './log.mjs';
+import { recentEvents, recordEvent, reloadEvents } from './events.mjs';
+import { compressionStats, reloadLearned } from './compress.mjs';
+import { sendJson, writeJsonFileAtomic } from './util.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
-import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask, startTaskLoop, stopTaskLoop, heatmapView, syncAccountNickname } from './tasks.mjs';
+import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask, startTaskLoop, stopTaskLoop, heatmapView, syncAccountNickname, reloadTasksState } from './tasks.mjs';
 import { importLocalAccounts } from './localimport.mjs';
 import { budgetStatus, budgetCheckAndAnnounce, accountBudgetCheckAndAnnounce, accountBudgetStatus } from './budget.mjs';
-import { backupList, backupNow, backupTick } from './backup.mjs';
+import { backupList, backupNow, startBackupLoop, stopBackupLoop } from './backup.mjs';
 import { testChannels } from './notify.mjs';
 import { runProtocolCheck, protocolCheckBrief } from './protocol.mjs';
 import { weeklyTick } from './weekly.mjs';
@@ -37,7 +37,6 @@ import { burnoutReport, predictAccount } from './burnout.mjs';
 import { recentDailyCreditAvg } from './usage.mjs';
 import { checkForUpdate } from './updatecheck.mjs';
 import { runDiagnostics } from './doctor.mjs';
-import { flushPool } from './pool.mjs';
 import { flushLearned } from './compress.mjs';
 import { flushEvents } from './events.mjs';
 
@@ -294,6 +293,11 @@ export async function handleConsoleApi(ctx) {
     const body = ctx.body || {};
     const model = String(body.model || '').trim();
     if (!model) return sendJson(res, 400, { error: '缺少 model' });
+    // 校验模型确实存在（含别名解析后的目录），防止把任意字符串写成默认模型导致后续请求全部路由失败。
+    // 别名本身也是合法的默认模型值（路由层 expandAlias 会解析），不能只对目录 id 校验
+    const catalog = await mergedModels(cfg);
+    const known = model === 'default' || catalog.some((m) => m.id === model) || (cfg.modelAliases && cfg.modelAliases[model] != null);
+    if (!known) return sendJson(res, 400, { error: `未知模型 ${model}（可用：${catalog.slice(0, 8).map((m) => m.id).join('、')}…）` });
     cfg.defaultModel = model;
     if (body.site) cfg.defaultSite = String(body.site);
     saveConfig(cfg);
@@ -307,7 +311,16 @@ export async function handleConsoleApi(ctx) {
     if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
     if (typeof body.enabled === 'boolean') cfg.sites[site].enabled = body.enabled;
     if (body.label) cfg.sites[site].label = String(body.label);
-    if (Array.isArray(body.seedModels)) cfg.sites[site].seedModels = body.seedModels;
+    if (Array.isArray(body.seedModels)) {
+      // 只保留 {id,name,contextWindow} 白名单字段：contextWindow 是压缩上限学习的种子数据，剥掉会退化
+      cfg.sites[site].seedModels = body.seedModels
+        .filter((m) => m && typeof m.id === 'string' && m.id.trim())
+        .map((m) => ({
+          id: m.id.trim(),
+          name: typeof m.name === 'string' && m.name ? m.name : m.id.trim(),
+          ...(Number.isFinite(Number(m.contextWindow)) && Number(m.contextWindow) > 0 ? { contextWindow: Number(m.contextWindow) } : {}),
+        }));
+    }
     saveConfig(cfg);
     return sendJson(res, 200, { ok: true, site: cfg.sites[site] });
   }
@@ -316,7 +329,7 @@ export async function handleConsoleApi(ctx) {
   if (p === '/aliases' && method === 'POST') {
     const body = ctx.body || {};
     const aliases = body.aliases;
-    if (!aliases || typeof aliases !== 'object') return sendJson(res, 400, { error: '缺少 aliases 对象' });
+    if (!isPlainObj(aliases)) return sendJson(res, 400, { error: '缺少 aliases 对象' });
     cfg.modelAliases = aliases;
     saveConfig(cfg);
     return sendJson(res, 200, { ok: true, aliases: cfg.modelAliases });
@@ -339,8 +352,9 @@ export async function handleConsoleApi(ctx) {
           if (typeof c.remain === 'number') recordBalance(`${site}/${a.label}`, c.remain);
           // workbuddy-bridge：把含到期时间的明细写进账号池条目，供到期优先调度选号
           updateCreditDetail(site, a.id, c);
-          // 余额为 0 且活动仍开启 → 直接标记耗尽，下次请求就会跳过它
-          if (c.remain <= 0) markExhausted(site, a.id, '余额为 0');
+          // 余额为 0 且活动仍开启 → 直接标记耗尽，下次请求就会跳过它。
+          // 明细为空（上游计费接口偶发返回空列表）时 remain 恒为 0，不能据此判耗尽。
+          if (Array.isArray(c.detail) && c.detail.length > 0 && c.remain <= 0) markExhausted(site, a.id, '余额为 0');
         } catch (e) {
           a.credit_error = e.message.slice(0, 160);
         }
@@ -499,10 +513,13 @@ export async function handleConsoleApi(ctx) {
     if (!getAccount(site, accountId)) return sendJson(res, 404, { error: `账号不存在：${accountId}` });
     if (!code) return sendJson(res, 400, { error: '缺少 code' });
     try {
-      const r = await runSingleTask(cfg, site, accountId, code, { times: body.times != null ? Number(body.times) : null });
+      const n = body.times != null ? Number(body.times) : null;
+      if (n != null && !Number.isFinite(n)) return sendJson(res, 400, { error: 'times 必须是数字' });
+      const r = await runSingleTask(cfg, site, accountId, code, { times: n });
       return sendJson(res, 200, r);
     } catch (e) {
-      return sendJson(res, e.status === 404 ? 404 : 502, { error: String(e.message || e).slice(0, 160) });
+      // 参数错误（400）不该被映射成 502「上游故障」，那会把排障方向带偏
+      return sendJson(res, e.status === 404 ? 404 : e.status === 400 ? 400 : 502, { error: String(e.message || e).slice(0, 160) });
     }
   }
   // 单任务领奖（body: { site?, accountId, code }）
@@ -592,6 +609,9 @@ export async function handleConsoleApi(ctx) {
       cfg.backup.keep = n;
     }
     saveConfig(cfg);
+    // 启动时 disabled 的备份循环从未建过定时器，这里必须重启循环，控制台里的开关才真正生效
+    stopBackupLoop();
+    startBackupLoop(cfg);
     return sendJson(res, 200, { ok: true, config: cfg.backup });
   }
 
@@ -638,7 +658,10 @@ export async function handleConsoleApi(ctx) {
 
   // 事件时间线（T6）：系统/任务/账号/策略等结构化事件的统一视图，前端过滤 kind
   if (p === '/events' && method === 'GET') {
-    const limit = Math.min(300, Number(url.searchParams.get('limit')) || 300);
+    // 缺参 ≠ 0：Number(null)===0，直接 clamp 会把缺省 300 钳成 1（回归过一次）
+    const raw = url.searchParams.get('limit');
+    const n = raw == null || raw === '' ? NaN : Number(raw);
+    const limit = Math.min(300, Math.max(1, Number.isFinite(n) ? Math.trunc(n) : 300));
     return sendJson(res, 200, { ok: true, events: recentEvents({ limit }) });
   }
 
@@ -850,13 +873,16 @@ export async function handleConsoleApi(ctx) {
 
   // ---- 日志 ----
   if (p === '/logs' && method === 'GET') {
-    const after = Number(url.searchParams.get('after') || 0);
+    const n = Number(url.searchParams.get('after'));
+    const after = Number.isFinite(n) ? n : 0;
     return sendJson(res, 200, recentLogs(after));
   }
 
   // ---- 用量统计 ----
   if (p === '/usage' && method === 'GET') {
-    const days = Number(url.searchParams.get('days') || 7);
+    const raw = url.searchParams.get('days'); // 缺参 ≠ 0（Number(null)===0 的坑，见 /events）
+    const n = raw == null || raw === '' ? NaN : Number(raw);
+    const days = Math.min(365, Math.max(1, Number.isFinite(n) ? Math.trunc(n) : 7));
     return sendJson(res, 200, usageSnapshot(days));
   }
   if (p === '/usage/reset' && method === 'POST') {
@@ -1101,17 +1127,28 @@ export async function handleConsoleApi(ctx) {
     for (const [name, val] of Object.entries(files)) {
       if (!known.has(name)) { skipped.push(name); continue; }
       if (val === null || typeof val !== 'object') { skipped.push(name); continue; }
-      // 先把要被覆盖的文件备份成 .prestore-<ts>，恢复错了还能手工救回来
       try {
         const f = name.startsWith('auth.') ? poolPathFor(name.replace(/^auth\.(.*)\.pool\.json$/, '$1')) : path.join(paths.root, name);
+        // usage/events/learned 是模块级内存态 + 防抖回写，恢复顺序必须是：
+        // ① flush 把内存态落盘（.prestore 副本才有恢复前的完整数据）→
+        // ② 拷 .prestore 备份 → ③ 写入恢复内容 → ④ reload 强制重读。
+        // 顺序错了 flush 会把刚写进去的恢复内容用旧内存态原样盖掉（假生效）。
+        if (name === 'usage.json') flushUsage();
+        else if (name === 'events.json') flushEvents();
+        else if (name === 'learned.json') flushLearned();
         if (fs.existsSync(f)) fs.copyFileSync(f, `${f}.prestore-${Date.now()}`);
         writeJsonFileAtomic(f, val, { mode: name.startsWith('auth.') ? 0o600 : undefined });
         accepted.push(name);
+        if (name === 'usage.json') reloadUsage();
+        else if (name === 'events.json') reloadEvents();
+        else if (name === 'learned.json') reloadLearned();
+        else if (name === 'tasks-state.json') reloadTasksState();
+        else if (name === 'health.json') reloadHealthState();
       } catch (e) {
         skipped.push(`${name}（${String(e.message || e).slice(0, 60)}）`);
       }
     }
-    return sendJson(res, 200, { ok: accepted.length > 0, accepted, skipped, note: '恢复的 config.json 需重启服务生效（下方「重启服务」按钮）；账号池/统计类文件已被新流程即时读取' });
+    return sendJson(res, 200, { ok: accepted.length > 0, accepted, skipped, note: '恢复的 config.json 需重启服务生效（下方「重启服务」按钮）；账号池与统计类文件已即时重载生效' });
   }
 
   // ---- T22：插件自更新检查 ----

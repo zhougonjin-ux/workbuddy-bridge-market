@@ -26,16 +26,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { getConfigDir, authPathFor, loadConfig } from './config.mjs';
-import { orderAccounts } from './expiry.mjs';
+import { orderAccounts, EXHAUST_TTL_MS } from './expiry.mjs';
 import { warn } from './log.mjs';
 import { writeJsonFileAtomic, readJsonFileWithBackup } from './util.mjs';
 import { recordEvent } from './events.mjs';
 
 /** 池文件里代表「旧版单账号凭证」的固定 id。 */
 export const DEFAULT_ACCOUNT_ID = 'default';
-
-/** 额度耗尽后多久重新尝试（额度可能已重置）。默认 6 小时。 */
-const EXHAUST_TTL_MS = 6 * 60 * 60 * 1000;
 
 /**
  * 模型级限流的缺省冷却时长（Retry-After 头缺失时兜底）。
@@ -326,21 +323,30 @@ function mutate(site, fn, { immediate = true } = {}) {
   const pool = loadPool(site);
   const r = fn(pool);
   if (immediate) savePool(site, pool);
-  else scheduleSave(site, pool);
+  else scheduleSave(site);
   return r;
 }
 
-/** 延迟合并写：同一站点的多次改动合并成一次磁盘写。 */
+/**
+ * 延迟合并写：同一站点的多次改动合并成一次磁盘写。
+ *
+ * fire 时重读而不是捕获调度时的 pool 对象：login.mjs / 控制台是独立进程，
+ * 会直接改写池文件——用 2 秒前的内存快照落盘会把那些改动整体回滚
+ * （实测：扫码加号后新账号凭据从磁盘上静默消失）。loadPool 返回的是共享
+ * 缓存对象，本进程内的改动天然都在；重读只为了接住跨进程的写入。
+ * 没有池文件时保持跳过（只读场景不产生写副作用，见 mutate 注释）。
+ */
 const saveTimers = new Map();
 const SAVE_DELAY_MS = 2000;
 
-function scheduleSave(site, pool) {
+function scheduleSave(site) {
   const key = cacheKey(site);
   if (saveTimers.has(key)) return;
   const t = setTimeout(() => {
     saveTimers.delete(key);
     try {
-      savePool(site, pool);
+      if (!hasPoolFile(site)) return;
+      savePool(site, loadPool(site));
     } catch (e) {
       warn(`[${site}] 账号池写入失败：`, e.message);
     }
@@ -355,6 +361,8 @@ export function flushPool() {
     clearTimeout(t);
     const site = key.slice(key.indexOf('\u0000') + 1);
     try {
+      // 与 scheduleSave 的 fire 路径同口径：没有池文件就不写（只读场景不产生写副作用）
+      if (!hasPoolFile(site)) continue;
       savePool(site, loadPool(site));
     } catch {
       /* 忽略 */
@@ -522,6 +530,11 @@ export function resetAccountState(site, id) {
     a.cooldownUntil = null;
     a.failCount = 0;
     a.lastError = null;
+    // 「重置」就该重置干净：模型级限流冷却不清的话，该账号在这些模型上
+    // 仍会被避让到冷却自然过期（≤60s，带 Retry-After 时更长）
+    if (a.modelCooldowns && typeof a.modelCooldowns === 'object') {
+      for (const k of Object.keys(a.modelCooldowns)) delete a.modelCooldowns[k];
+    }
     return a;
   });
 }

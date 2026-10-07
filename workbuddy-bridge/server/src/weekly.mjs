@@ -9,6 +9,7 @@
 //     单测里绝不触发真实通知或写生产数据目录。
 import fs from 'node:fs';
 import path from 'node:path';
+import { writeJsonFileAtomic } from './util.mjs';
 import { paths } from './config.mjs';
 import { log } from './log.mjs';
 import { recordEvent } from './events.mjs';
@@ -110,7 +111,7 @@ function loadState(stateFile) {
 function saveState(stateFile, st) {
   try {
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
-    fs.writeFileSync(stateFile, JSON.stringify(st, null, 2));
+    writeJsonFileAtomic(stateFile, st);
   } catch (e) { log('周报状态写入失败：', e.message); }
 }
 
@@ -134,9 +135,12 @@ export async function weeklyTick(cfg, now = new Date(), {
     if (now.getDay() !== 1) return { ok: false, skipped: 'not-monday' };
     const times = Array.isArray(w.times) && w.times.length ? w.times : ['09:00'];
     const hhmm = `${p2(now.getHours())}:${p2(now.getMinutes())}`;
-    if (!times.includes(hhmm)) return { ok: false, skipped: 'not-time' };
     const st = loadState(file);
     if (st.lastSent === thisMonday) return { ok: false, skipped: 'already-sent' };
+    // 未到最早时点跳过；**已过时点且今天没发过 → 补跑**：60s tick 恰好命中那一分钟太脆弱，
+    // 服务那一刻没活着/卡顿，这周周报就永远丢了（与任务调度的 missedRunToday 同思路）
+    const reached = times.some((t) => hhmm >= t);
+    if (!reached) return { ok: false, skipped: 'not-time' };
   }
   const { from, to } = lastWeekRange(now);
   const summary = weeklySummary(loadDays(), { from, to });

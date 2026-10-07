@@ -15,6 +15,7 @@
 // 自动静默重扫一次。若同 uid 账号在池里已有 refreshToken（扫码登录的），
 // 不覆盖——能自动续期的凭证更优。
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { hydrateFromToken, jwtClaims } from './auth.mjs';
@@ -35,7 +36,8 @@ function siteByIss(iss) {
 
 /** 收集候选配置文件（.codebuddy 下的 settings*.json，兼容未来更多文件名）。 */
 function candidateFiles() {
-  const dir = path.join(process.env.USERPROFILE || '', '.codebuddy');
+  // USERPROFILE 只在 Windows 有：macOS/Linux 跑代理时回落 homedir，别静默扫出 0 个文件
+  const dir = path.join(process.env.USERPROFILE || os.homedir(), '.codebuddy');
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return []; }
   return names

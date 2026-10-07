@@ -134,14 +134,18 @@ test('observedCostByModel：最近一次实际计费（不是日均值）', () =
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-obs-'));
   const restore = setConfigDir(dir);
   try {
-    recordUsage({ site: 'cn-cli', model: 'hy4-preview', status: 200, promptTokens: 10, completionTokens: 1, credit: 0.29, account: 'acc_a' });
+    // 0.3.37：只有上游实报（upstreamCredit，含 0）才进观测样本；估算值不写 lastCredit
+    recordUsage({ site: 'cn-cli', model: 'hy4-preview', status: 200, promptTokens: 10, completionTokens: 1, credit: 0.29, account: 'acc_a', upstreamCredit: 0.29 });
     // 夜间免费时段再来一发：日均值会被稀释成 ~0.19，观测值必须是最近一次的 0
-    recordUsage({ site: 'cn-cli', model: 'hy4-preview', status: 200, promptTokens: 10, completionTokens: 1, credit: 0, account: 'acc_a' });
-    recordUsage({ site: 'cn-cli', model: 'hy3', status: 200, promptTokens: 5, completionTokens: 1, credit: 0, account: 'acc_a' });
+    recordUsage({ site: 'cn-cli', model: 'hy4-preview', status: 200, promptTokens: 10, completionTokens: 1, credit: 0, account: 'acc_a', upstreamCredit: 0 });
+    recordUsage({ site: 'cn-cli', model: 'hy3', status: 200, promptTokens: 5, completionTokens: 1, credit: 0, account: 'acc_a', upstreamCredit: 0 });
+    // 无实报（上游没发 usage 帧）→ 估算 0 不得污染观测样本
+    recordUsage({ site: 'cn-cli', model: 'hy5-estimated', status: 200, promptTokens: 10, completionTokens: 1, credit: 0, account: 'acc_a' });
 
     const obs = observedCostByModel();
     assert.equal(obs['cn-cli/hy4-preview'].credit, 0, '观测取最近一次实付（0），不是日均值');
     assert.equal(obs['cn-cli/hy3'].credit, 0);
+    assert.equal(obs['cn-cli/hy5-estimated'], undefined, '估算 0 不是实报，不进观测');
     assert.ok(obs['cn-cli/hy4-preview'].at > Date.now() - 60_000, '带观测时间');
     assert.equal(obs['cn-cli/不存在'], undefined);
   } finally {
@@ -154,7 +158,7 @@ test('observedCostByModel：TTL 之外的观测被淘汰（时段促销不跨窗
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-obs2-'));
   const restore = setConfigDir(dir);
   try {
-    recordUsage({ site: 'cn-cli', model: 'paid-model', status: 200, promptTokens: 10, completionTokens: 1, credit: 0, account: 'acc_a' });
+    recordUsage({ site: 'cn-cli', model: 'paid-model', status: 200, promptTokens: 10, completionTokens: 1, credit: 0, account: 'acc_a', upstreamCredit: 0 });
     // 把内存态的 lastAt 拨回 7 小时前（模拟「上次观测在另一个时段」）——
     // 直接改 usageDays() 的活对象：落盘是 2 秒节流延迟写，读盘断言会撞空。
     const days = usageDays();

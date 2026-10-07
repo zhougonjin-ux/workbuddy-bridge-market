@@ -21,7 +21,7 @@ import { getAuth, ensureToken } from './auth.mjs';
 import { log, warn } from './log.mjs';
 import { recordEvent } from './events.mjs';
 import { notify, notifyTask } from './notify.mjs';
-import { withRetryOnce } from './util.mjs';
+import { withRetryOnce, writeJsonFileAtomic } from './util.mjs';
 
 /* ---------------- 状态落盘 ---------------- */
 
@@ -53,10 +53,15 @@ function loadState() {
 
 function saveState() {
   try {
-    fs.writeFileSync(statePath(), JSON.stringify(state, null, 2) + '\n', 'utf8');
+    writeJsonFileAtomic(statePath(), state);
   } catch (e) {
     warn('tasks-state.json 写入失败：', e.message);
   }
+}
+
+/** 供控制台「恢复备份」在写回 tasks-state.json 后强制重读（否则内存旧态会把恢复内容覆盖回去）。 */
+export function reloadTasksState() {
+  state = null;
 }
 
 const KIND_LABEL = { checkin: '每日签到', growth: '成长任务', travel: '猫猫旅行', streak: '连登管家', 'growth-manual': '任务操作' };
@@ -491,7 +496,10 @@ async function refreshAfterGain(cfg, site, accountId) {
   try {
     const c = await queryCredit(cfg, site, accountId);
     updateCreditDetail(site, accountId, c);
-    if (typeof c.remain === 'number' && c.remain <= 0) markExhausted(site, accountId, '余额为 0');
+    // 明细为空时 remain 恒为 0，不能据此判耗尽（与 scheduler 同口径）
+    if (Array.isArray(c.detail) && c.detail.length > 0 && typeof c.remain === 'number' && c.remain <= 0) {
+      markExhausted(site, accountId, '余额为 0');
+    }
   } catch {
     /* 刷新失败不影响任务结果 */
   }
@@ -904,10 +912,11 @@ async function runForSite(cfg, site, kind) {
         result = await withRetryOnce(() => checkinAccount(cfg, site, a.id));
         record('checkin', uid, { ok: true, site, msg: result.msg });
       } else if (kind === 'travel') {
-        // T11 通知：猫猫到站领奖值得弹（旅行要数小时，不看控制台根本不知道）
+        // T11 通知：猫猫到站领奖值得弹（旅行要数小时，不看控制台根本不知道）。
+        // claimed_and_departed（领到积分并再出发）是 T59 之后的最常见结局，同属领奖
         result = await travelScanAccount(cfg, site, a.id);
         record('travel', uid, { ok: true, site, action: result.action, msg: result.msg, credit: result.credit });
-        if (result.action === 'claimed') {
+        if (/^claimed/.test(result.action)) {
           notifyTask(cfg, '猫猫归来 🐾', `${a.label || a.id}：${result.msg}`, a.id);
         }
       } else if (kind === 'streak') {
@@ -944,30 +953,42 @@ async function runForSite(cfg, site, kind) {
   return out;
 }
 
-/** 手动/调度共用的任务入口。kind: 'checkin' | 'growth' | 'travel' | 'streak' | 'all' */
+/** 手动/调度共用的任务入口。kind: 'checkin' | 'growth' | 'travel' | 'streak' | 'all'
+ *  同一 kind 有进行中的运行时直接拒绝重入：手动触发与调度/补跑并发双跑会对
+ *  同一账号重复代打、重复领奖尝试（上游幂等兜底得住，但没有必要打两遍）。 */
+const runningTasks = new Set();
+
 export async function runTasks(cfg, kind = 'all', site = null) {
-  const sites = site ? [site] : siteKeys(cfg);
-  const result = {};
-  const wantStreak = kind === 'streak' || kind === 'all';
-  const wantCheckin = kind === 'checkin' || kind === 'all';
-  for (const s of sites) {
-    if (!cfg.sites[s]) continue;
-    if (wantCheckin && cfg.tasks?.checkin !== false) {
-      result[`checkin:${s}`] = await runForSite(cfg, s, 'checkin');
-    }
-    // T50 连登管家搭签到同一轮（签到可能补上连登链），也支持 kind='streak' 单独触发。
-    // 一天内跟每次 checkin/all 触发重跑一遍（幂等），不设独立时点配置。
-    if ((wantStreak || (kind === 'checkin' && cfg.tasks?.checkin !== false)) && cfg.tasks?.enabled !== false) {
-      result[`streak:${s}`] = await runForSite(cfg, s, 'streak');
-    }
-    if ((kind === 'growth' || kind === 'all') && cfg.tasks?.growth !== false) {
-      result[`growth:${s}`] = await runForSite(cfg, s, 'growth');
-    }
-    if ((kind === 'travel' || kind === 'all') && cfg.tasks?.travel !== false) {
-      result[`travel:${s}`] = await runForSite(cfg, s, 'travel');
-    }
+  if (runningTasks.has(kind)) {
+    return { busy: true, msg: `${KIND_LABEL[kind] || kind}任务正在进行中，请稍后再试` };
   }
-  return result;
+  runningTasks.add(kind);
+  try {
+    const sites = site ? [site] : siteKeys(cfg);
+    const result = {};
+    const wantStreak = kind === 'streak' || kind === 'all';
+    const wantCheckin = kind === 'checkin' || kind === 'all';
+    for (const s of sites) {
+      if (!cfg.sites[s]) continue;
+      if (wantCheckin && cfg.tasks?.checkin !== false) {
+        result[`checkin:${s}`] = await runForSite(cfg, s, 'checkin');
+      }
+      // T50 连登管家搭签到同一轮（签到可能补上连登链），也支持 kind='streak' 单独触发。
+      // 一天内跟每次 checkin/all 触发重跑一遍（幂等），不设独立时点配置。
+      if ((wantStreak || (kind === 'checkin' && cfg.tasks?.checkin !== false)) && cfg.tasks?.enabled !== false) {
+        result[`streak:${s}`] = await runForSite(cfg, s, 'streak');
+      }
+      if ((kind === 'growth' || kind === 'all') && cfg.tasks?.growth !== false) {
+        result[`growth:${s}`] = await runForSite(cfg, s, 'growth');
+      }
+      if ((kind === 'travel' || kind === 'all') && cfg.tasks?.travel !== false) {
+        result[`travel:${s}`] = await runForSite(cfg, s, 'travel');
+      }
+    }
+    return result;
+  } finally {
+    runningTasks.delete(kind);
+  }
 }
 
 /** 任务状态视图（/admin/tasks 用）。 */
@@ -1068,8 +1089,27 @@ export async function runSingleTask(cfg, site, accountId, taskCode, { times = nu
     return { ok: false, chats: 0, msg: j.why || '该任务类型不支持代打（人工任务）', task: t };
   }
   const cap = Number(cfg.tasks?.maxChatsPerTask) || 5;
-  const attempts = Math.max(0, Math.min(Number(times) || (t.target - t.current), cap, t.target - t.current));
-  if (!attempts) return { ok: true, chats: 0, msg: '进度已达标，可直接领奖', task: t };
+  // times 显式传了就按它（含 0/负数报参数错），没传才补齐到 target——
+  // 旧写法 Number("0")||target 会把 "0" 当「没传」处理，语义与直觉相反
+  let attempts;
+  if (times != null) {
+    const n = Number(times);
+    if (!Number.isFinite(n) || n < 0) {
+      throw Object.assign(new Error(`times 必须是非负数字（收到 ${JSON.stringify(times)}）`), { status: 400 });
+    }
+    attempts = Math.max(0, Math.min(Math.trunc(n), cap, t.target - t.current));
+  } else {
+    attempts = Math.max(0, Math.min(cap, t.target - t.current));
+  }
+  if (!attempts) {
+    return {
+      ok: true,
+      chats: 0,
+      // 显式要求 0 次与「进度已达标」是两回事，文案别撒谎
+      msg: times != null ? '按要求执行 0 次代打（未执行任何对话）' : '进度已达标，可直接领奖',
+      task: t,
+    };
+  }
   const r = await autoplayChats(cfg, site, accountId, t, attempts, j.model);
   // 打完重拉进度，前端立即看到新进度
   const fresh = (await listGrowthTasks(cfg, site, accountId)).find((x) => x.code === taskCode) || t;
@@ -1105,6 +1145,7 @@ export async function claimSingleTask(cfg, site, accountId, taskCode) {
 
 const timers = { tasks: null };
 const firedDay = { checkin: null, growth: null };
+const retryFailAt = { checkin: 0, growth: 0 }; // 上次失败回滚的时间戳（补跑 15 分钟冷却用）
 
 function hoursHit(hours) {
   return Array.isArray(hours) && hours.includes(new Date().getHours());
@@ -1182,9 +1223,10 @@ export function startTaskLoop(cfg) {
       }
       // T55 补跑：今天的时点已错过（服务那一刻没活着）且今天还没跑过 → 立即补跑。
       // 连登管家搭 checkin 的车，签到补跑时连登一起补——连登断一天要重攒 7 天，这是主保护对象。
+      // 失败回滚后的重试有 15 分钟冷却：上游/token 持续故障时不能变成全天分钟级重试轰炸
       for (const k of ['checkin', 'growth']) {
         if (cfg.tasks?.[k] === false) continue;
-        if (firedDay[k] !== today && missedRunToday(cfg, k)) {
+        if (firedDay[k] !== today && missedRunToday(cfg, k) && Date.now() - (retryFailAt[k] || 0) > 15 * 60_000) {
           firedDay[k] = today;
           log(`${KIND_LABEL[k] || k}的时点已过且今天未执行，补跑一次`);
           void runAndLog(cfg, k);
@@ -1222,7 +1264,24 @@ async function runAndLog(cfg, kind) {
   const label = { checkin: '每日签到', growth: '成长任务扫描', travel: '猫猫旅行巡逻' }[kind] || kind;
   log(`执行${label}…`);
   const r = await runTasks(cfg, kind);
+  if (r?.busy) {
+    warn(`${label}：${r.msg}`);
+    return r;
+  }
+  // 有账号失败时回滚 firedDay（改回昨天），让补跑机制（missedRunToday）在
+  // 冷却（15 分钟，见任务循环）过后自动再试——否则调度时点恰逢上游抖动就丢掉一整天
+  const results = Object.values(r || {});
+  const hasFailure = results.some((list) => Array.isArray(list) && list.some((x) => x?.ok === false));
+  if (hasFailure && ['checkin', 'growth'].includes(kind)) {
+    retryFailAt[kind] = Date.now();
+    const yest = new Date(Date.now() - 24 * 3600_000);
+    const p2 = (n) => String(n).padStart(2, '0');
+    firedDay[kind] = `${yest.getFullYear()}-${p2(yest.getMonth() + 1)}-${p2(yest.getDate())}`;
+    // 失败的账号在 tasks-state 里有 ok:false 记录，账号粒度「今天已成功即跳过」兜底
+    // 会保证成功的账号不会被重复跑（见 runForSite 的 doneToday 判断）
+  }
   log(`${label}完成：`, JSON.stringify(summarize(r)));
+  return r;
 }
 
 export function stopTaskLoop() {

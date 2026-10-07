@@ -32,7 +32,9 @@ const main = async () => {
     try {
       const cfg = JSON.parse(fs.readFileSync(path.join(dataDir, 'config.json'), 'utf8'));
       if (Number.isInteger(cfg.port) && cfg.port > 0) port = cfg.port;
+      // apiKey 支持字符串或字符串数组（config 一等格式，多客户端多密钥）：数组时取第一个有效值
       if (typeof cfg.apiKey === 'string' && cfg.apiKey) apiKey = cfg.apiKey;
+      else if (Array.isArray(cfg.apiKey)) apiKey = cfg.apiKey.find((k) => typeof k === 'string' && k) || null;
       if (Array.isArray(cfg.models)) {
         fallbackModels = cfg.models
           .map((m) => (typeof m === 'string' ? m : m?.id))

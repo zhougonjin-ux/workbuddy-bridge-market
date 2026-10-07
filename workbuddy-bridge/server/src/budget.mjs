@@ -43,7 +43,11 @@ export function budgetStatus(cfg) {
 export function budgetCheckAndAnnounce(cfg) {
   const st = budgetStatus(cfg);
   if (!st.enabled) return st;
-  const today = new Date().toISOString().slice(0, 10);
+  // 本地日键（与 usage.mjs 的统计日切同口径）：toISOString() 给 UTC 日期，
+  // 东八区 0:00~8:00 的新一天预警会被并入前一天的去重窗口，漏发当日预警
+  const now = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  const today = `${now.getFullYear()}-${p2(now.getMonth() + 1)}-${p2(now.getDate())}`;
   if (st.warn && warnedDay !== today) {
     warnedDay = today;
     const action = st.mode === 'pause' ? '，新请求将被拒绝' : st.mode === 'free' ? '，default/auto 已改道免费模型' : '';
@@ -156,7 +160,11 @@ export function accountBudgetCheckAndAnnounce(cfg, accounts, { spentMap = null }
   const m = cfg?.budget?.accounts;
   if (!m || typeof m !== 'object' || !Object.keys(m).length) return [];
   const map = spentMap || todayAccountCredit();
-  const today = new Date().toISOString().slice(0, 10);
+  // 本地日键（与 budgetCheckAndAnnounce 同口径）：toISOString 的 UTC 日会让
+  // 东八区 0:00~8:00 的次日提醒被并进前一天的去重窗口
+  const now = new Date();
+  const p2 = (n) => String(n).padStart(2, '0');
+  const today = `${now.getFullYear()}-${p2(now.getMonth() + 1)}-${p2(now.getDate())}`;
   const out = [];
   for (const { site, id, label } of accounts || []) {
     const st = accountBudgetStatus(cfg, id, map);

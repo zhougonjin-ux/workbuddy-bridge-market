@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { paths } from './config.mjs';
 import { warn } from './log.mjs';
+import { writeJsonFileAtomic } from './util.mjs';
 import { getCatalog, parseMultiplier, setObservedCostProvider } from './router.mjs';
 
 // 观测成本注入（0.3.33）：router 的 free-first 选型与后缀展示需要读观测数据，
@@ -79,7 +80,7 @@ ensureLoaded();
 function saveNow() {
   dirty = false;
   try {
-    fs.writeFileSync(file(), JSON.stringify(data, null, 2) + '\n', 'utf8');
+    writeJsonFileAtomic(file(), data);
   } catch (e) {
     warn('usage.json 写入失败：', e.message);
   }
@@ -101,6 +102,12 @@ export function flushUsage() {
   if (dirty) saveNow();
 }
 
+/** 供控制台「恢复备份」在写回 usage.json 后强制重读（否则内存旧态会把恢复内容覆盖回去）。 */
+export function reloadUsage() {
+  loadedFrom = null;
+  ensureLoaded();
+}
+
 function dayOf(key = todayKey()) {
   ensureLoaded();
   if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, hours: {}, models: {}, accounts: {} };
@@ -109,8 +116,9 @@ function dayOf(key = todayKey()) {
   return data.days[key];
 }
 
-/** 记录一次调用。account = 实际出力的账号 id（T36 报表的账号维度；缺失时记 'unknown'）。 */
-export function recordUsage({ site, model, mode, status, promptTokens = 0, completionTokens = 0, credit = 0, ms = 0, tools = 0, account = null }) {
+/** 记录一次调用。account = 实际出力的账号 id（T36 报表的账号维度；缺失时记 'unknown'）。
+ *  upstreamCredit = 上游 usage 实报的 credit（未实报传 null）——只有实报值（含 0）才能进观测样本。 */
+export function recordUsage({ site, model, mode, status, promptTokens = 0, completionTokens = 0, credit = 0, ms = 0, tools = 0, account = null, upstreamCredit = null }) {
   const day = dayOf();
   const ok = status >= 200 && status < 400;
   day.calls += 1;
@@ -144,8 +152,13 @@ export function recordUsage({ site, model, mode, status, promptTokens = 0, compl
   // 观测成本（0.3.33）：记**最近一次**的实际计费与时间。不能用日均值当观测信号——
   // 白天 x0.29 和夜间免费混在一起平均就不为 0 了；「最近一次实付」配上 TTL
   // 才是「这个模型现在免不免费」的正确依据（时段性促销不跨窗，TTL 6h）。
-  m.lastCredit = credit || 0;
-  m.lastAt = Date.now();
+  // ⚠️ 只有上游实报（含 0，0.3.34）才能进 lastCredit：上游没发 usage 帧时 credit
+  // 是本地估算值，估算落 0 会被观测当成「实测免费」，6 小时内误导 free-first 与
+  // 预算模式把 default 流量改道到实际付费的模型（0.3.37 修，与 0.3.34 的守卫互补）。
+  if (Number.isFinite(upstreamCredit)) {
+    m.lastCredit = upstreamCredit;
+    m.lastAt = Date.now();
+  }
   // 账号维度（T36）：同一个模型可能被多个账号轮流服务，报表要能按账号归集消耗。
   // 键用 站点/账号id —— 账号 id 全局唯一，但带上站点在导出时更直观。
   const ak = `${site}/${account || 'unknown'}`;
@@ -319,10 +332,13 @@ export function recentDailyCreditAvg(days = 7) {
 
 /* ---------------- T36：用量报表导出 CSV ---------------- */
 
-/** 单个字段的 CSV 转义（纯函数）。含分隔符/引号/换行时用双引号包起来，内部引号翻倍。 */
+/** 单个字段的 CSV 转义（纯函数）。含分隔符/引号/换行时用双引号包起来，内部引号翻倍；
+ *  以 = + - @ Tab 开头且不是纯数值的单元格加 ' 前缀，防 Excel 公式注入（label 是用户可控输入）。 */
 export function csvCell(v) {
-  const s = v === null || v === undefined ? '' : String(v);
-  return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  let s = v === null || v === undefined ? '' : String(v);
+  if (/[",\r\n]/.test(s)) s = `"${s.replace(/"/g, '""')}"`;
+  if (/^[=+\-@\t]/.test(s) && !Number.isFinite(Number(s))) s = `'${s}`;
+  return s;
 }
 
 /** 一行 → 一行 CSV（纯函数）。 */

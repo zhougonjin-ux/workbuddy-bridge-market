@@ -56,12 +56,15 @@ export async function waitForUpstreamSlot(signal = null) {
       resolve: () => {
         const i = waiters.indexOf(entry);
         if (i >= 0) waiters.splice(i, 1);
+        // 放行后 abort 监听已完成使命：不移除的话监听器悬挂到请求对象 GC
+        if (signal && onAbort) signal.removeEventListener('abort', onAbort);
         resolve(waitMs);
       },
     };
+    let onAbort = null;
     waiters.push(entry);
     if (signal) {
-      const onAbort = () => entry.resolve();
+      onAbort = () => entry.resolve();
       if (signal.aborted) { entry.resolve(); return; }
       signal.addEventListener('abort', onAbort, { once: true });
     }

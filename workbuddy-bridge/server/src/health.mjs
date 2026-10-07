@@ -78,6 +78,11 @@ function saveState() {
   }
 }
 
+/** 供控制台「恢复备份」在写回 health.json 后强制重读（否则内存旧态会把恢复内容覆盖回去）。 */
+export function reloadHealthState() {
+  state = null;
+}
+
 /**
  * T35 巡检省钱模式的候选筛选（纯函数，便于单测）。
  *

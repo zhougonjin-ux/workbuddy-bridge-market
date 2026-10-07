@@ -13,7 +13,8 @@ import { log, warn } from './log.mjs';
 import { recordEvent } from './events.mjs';
 import { notify } from './notify.mjs';
 
-const timers = { credit: null, soon: null };
+const timers = { credit: null, soon: null, boot: null };
+let creditLoopStopped = true;
 let lastSoonRun = 0;
 
 /**
@@ -51,7 +52,9 @@ export async function refreshCreditsOnce(cfg, site) {
     try {
       const credit = await queryCredit(cfg, site, a.id);
       updateCreditDetail(site, a.id, credit);
-      if (typeof credit.remain === 'number' && credit.remain <= 0) {
+      // 明细为空（计费接口偶发返回空 Accounts）时 remain 恒为 0，不能据此判耗尽——
+      // 否则健康账号被误标 6 小时 exhaustedAt，且每轮刷新周而复始
+      if (Array.isArray(credit.detail) && credit.detail.length > 0 && typeof credit.remain === 'number' && credit.remain <= 0) {
         markExhausted(site, a.id, '余额为 0');
       }
       results.push({ id: a.id, label: a.label || a.id, ok: true, remain: credit.remain });
@@ -114,6 +117,7 @@ export function startCreditLoop(cfg) {
   };
 
   const scheduleNext = (minutes) => {
+    if (creditLoopStopped) return; // stop 之后在途的 tick 不得复活循环
     if (timers.credit) clearTimeout(timers.credit);
     timers.credit = setTimeout(tick, minutes * 60_000);
     timers.credit.unref?.();
@@ -121,16 +125,21 @@ export function startCreditLoop(cfg) {
 
   bumpCreditActivity = () => { lastRequestAt = Date.now(); };
   // 启动 15 秒后先刷一轮，避免和启动期的登录刷新挤在一起
+  creditLoopStopped = false;
   const boot = setTimeout(tick, 15_000);
   boot.unref?.();
+  timers.boot = boot;
   log(`积分/到期明细刷新已启动（自适应 TTL：活跃 ${minMin} 分钟 / 空闲最多 ${baseMin * 3} 分钟）`);
 }
 
 export function stopCreditLoop() {
+  creditLoopStopped = true;
   if (timers.credit) clearTimeout(timers.credit);
   if (timers.soon) clearTimeout(timers.soon);
+  if (timers.boot) clearTimeout(timers.boot);
   timers.credit = null;
   timers.soon = null;
+  timers.boot = null;
 }
 
 /**

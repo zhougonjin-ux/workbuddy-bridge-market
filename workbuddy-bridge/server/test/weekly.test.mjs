@@ -76,6 +76,20 @@ test('weeklyTick：非周一 / 时点未命中 / 已发送 都跳过', async () 
   assert.equal((await weeklyTick(cfg, mon, { stateFile: file, fireEvent: noop, sendNotify: noop })).skipped, 'already-sent');
 });
 
+test('weeklyTick：周一错过时点（服务那一刻没活着）→ 下一个 tick 补发（0.3.37）', async () => {
+  const dir = mkTmp();
+  const file = path.join(dir, 'weekly.json');
+  const cfg = { weekly: { enabled: true, times: ['09:00'] } };
+  const noop = () => {};
+  // 周一 09:07：09:00 的 tick 没赶上，但今天没发过 → 应补发而不是丢一周
+  const monLate = D('2026-09-28'); monLate.setHours(9, 7, 0, 0);
+  const r = await weeklyTick(cfg, monLate, { stateFile: file, fireEvent: noop, sendNotify: noop });
+  assert.equal(r.ok, true, '已过时点且未发送应补发');
+  // 补发后本周不再重复
+  const again = D('2026-09-28'); again.setHours(18, 0, 0, 0);
+  assert.equal((await weeklyTick(cfg, again, { stateFile: file, fireEvent: noop, sendNotify: noop })).skipped, 'already-sent');
+});
+
 test('weeklyTick：disabled 关闭 / force 绕过周几与时点 / 通知与事件被调用', async () => {
   const dir = mkTmp();
   const file = path.join(dir, 'weekly.json');

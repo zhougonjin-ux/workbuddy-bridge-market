@@ -314,7 +314,11 @@ function deepMerge(base, over) {
     return over === undefined ? base : over;
   }
   const out = { ...base };
-  for (const [k, v] of Object.entries(over)) out[k] = deepMerge(base[k], v);
+  for (const [k, v] of Object.entries(over)) {
+    // JSON.parse 产出的自有 __proto__ 键经赋值会触发原型 setter，把 cfg 的原型换掉
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
+    out[k] = deepMerge(base[k], v);
+  }
   return out;
 }
 
@@ -354,10 +358,12 @@ const isBool = (v) => typeof v === 'boolean';
 /** T33 认可的外部通知通道类型（与 notify.mjs 的 CHANNEL_TYPES 保持一致）。 */
 export const NOTIFY_CHANNEL_TYPES = ['webhook', 'bark', 'serverchan', 'feishu', 'dingtalk', 'telegram'];
 
-/** 有限正数（端口允许 0，表示随机端口）。 */
+/** 正整数端口。不允许 0（随机端口）：hooks/status/stop 全部按固定端口探测，
+ *  配 0 会让会话钩子每次都认为服务没起、再拉一个新实例，进程无限堆积。 */
 function isPort(v) {
-  return Number.isInteger(v) && v >= 0 && v <= 65535;
+  return Number.isInteger(v) && v >= 1 && v <= 65535;
 }
+const PORT_HINT = 'port 必须是 1-65535 的整数（不允许 0：钩子按固定端口探测）';
 
 function isPositiveMs(v) {
   return Number.isFinite(v) && v > 0;
@@ -377,7 +383,7 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     cfg.host = defaults.host;
   }
   if (!isPort(cfg.port)) {
-    fix(`port 必须是 0-65535 的整数（当前 ${JSON.stringify(cfg.port)}），已回退为 ${defaults.port}`);
+    fix(`${PORT_HINT}（当前 ${JSON.stringify(cfg.port)}），已回退为 ${defaults.port}`);
     cfg.port = defaults.port;
   }
 
@@ -847,6 +853,8 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     if (fallback) {
       fix(`defaultSite "${cfg.defaultSite}" 不存在或已禁用，已改用 "${fallback}"`);
       cfg.defaultSite = fallback;
+    } else {
+      fix('所有站点都已禁用：服务将空转，请在控制台启用至少一个站点');
     }
   }
 
@@ -908,7 +916,8 @@ function loadConfigFrom(dir) {
     // 必须先建目录（原版写项目根目录天然存在，没有这一步会在首启时 ENOENT 崩掉）
     fs.mkdirSync(dir, { recursive: true });
     const cfg = defaultConfig();
-    fs.writeFileSync(configFile, JSON.stringify(cfg, null, 2) + '\n', 'utf8');
+    // 原子写：写一半被杀会留下坏 JSON，下次启动直接 INVALID_CONFIG_JSON 硬错误
+    writeJsonFileAtomic(configFile, cfg);
     lastIssues = [];
     return cfg;
   }

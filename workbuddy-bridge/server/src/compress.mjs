@@ -76,6 +76,19 @@ export function flushLearned() {
   saveLearnedNow();
 }
 
+/** 供控制台「恢复备份」在写回 learned.json 后强制重读（Map 与统计是累加的，必须先清再读）。 */
+export function reloadLearned() {
+  learnedLoadedFrom = null;
+  learnedLimits.clear();
+  estimateCalibration.clear();
+  compressTotals.count = 0;
+  compressTotals.dropped = 0;
+  compressTotals.truncated = 0;
+  compressTotals.savedTokens = 0;
+  compressEvents.length = 0;
+  loadLearned();
+}
+
 /**
  * 中文字符判定（CJK 统一表意文字 + 扩展 A + 兼容表意 + 中文标点）。
  *

@@ -112,13 +112,29 @@ const copy = (text, tip) => {
  * 只暴露引用，不改任何原有逻辑。 */
 window.__wbApi = api;
 window.toast = toast;
-window.__WB_TOKEN_REF = TOKEN;
+// getter 对象而不是快照值：token 被 401 续期逻辑更新后，shell.js 读的永远是最新值
+window.__WB_TOKEN_REF = { get token() { return TOKEN; } };
+
+/* localStorage 安全封装：浏览器禁用存储时裸访问 localStorage 属性直接抛 SecurityError，
+ * 顶层抛错会让整个 app.js 不执行（控制台全挂）。index.html/shell.js 早已包了 try/catch，
+ * 这里统一走安全读写。 */
+const store = {
+  get(k) { try { return store.get(k); } catch { return null; } },
+  set(k, v) { try { store.set(k, v); } catch { /* 禁用存储时静默 */ } },
+};
 
 /* ---------- 时间/格式化 ---------- */
 const fmtDays = (t) => {
   if (!t) return null;
   const d = Math.round((t - Date.now()) / 86400000);
   return d;
+};
+// 月/日显示：手动拼而不用 toLocaleDateString().slice(5)——后者依赖本地化格式，
+// en-US 下 "10/15/2026".slice(5) 会变成 "5/2026"
+const fmtMonthDay = (t) => {
+  const d = new Date(t);
+  if (isNaN(d)) return '';
+  return `${d.getMonth() + 1}/${d.getDate()}`;
 };
 const expiryColor = (t) => {
   const d = fmtDays(t);
@@ -221,7 +237,7 @@ function focusAcct(id) {
 window.addEventListener('hashchange', () => { const v = parseHash(); if (v !== active) showView(v); });
 $('#btnHome').onclick = () => showView('home');
 $('#logPause').onclick = () => { logPaused = !logPaused; $('#logPause').textContent = logPaused ? '继续滚动' : '暂停滚动'; };
-$('#logClear').onclick = () => { $('#logBox').textContent = ''; logSeq = 0; };
+$('#logClear').onclick = () => { $('#logBox').textContent = ''; }; // 只清 DOM：logSeq 归零会让下次轮询把整段历史灌回来
 
 /* ---------- 顶栏 ---------- */
 async function loadHeader() {
@@ -230,10 +246,13 @@ async function loadHeader() {
   $('#ver').textContent = 'v' + (STATE.version || '?');
   $('#srvMeta').innerHTML =
     `<span class="pill"><span class="dot ${anyLogin ? 'ok' : ''}"></span>${anyLogin ? '运行中' : '未登录账号'}</span>` +
-    `<span class="pill" title="点击复制 Base URL" onclick='copy(${JSON.stringify(STATE.base_url)},"Base URL")'>${esc(STATE.base_url)}</span>` +
+    `<span class="pill" title="点击复制 Base URL" id="copyBase">${esc(STATE.base_url)}</span>` +
     `<span class="pill" style="color:#9fc4ff" title="复制 ZCode 模型供应商接入配置" id="copyCfg">⧉ 复制 ZCode 配置</span>` +
-    `<span class="pill" style="cursor:pointer" title="点击到模型库修改默认模型" onclick='showView("models")'>默认：${esc(STATE.default_model)}</span>` +
+    `<span class="pill" style="cursor:pointer" title="点击到模型库修改默认模型" id="goModels">默认：${esc(STATE.default_model)}</span>` +
     `<span class="pill" title="本次服务运行时长">已运行 ${dur(STATE.uptime_ms || 0)}</span>`;
+  // 渲染后绑定而不是 onclick 属性内插 JSON：值含引号时会逃逸属性形成注入点
+  $('#copyBase').onclick = () => copy(STATE.base_url, '已复制 Base URL');
+  $('#goModels').onclick = () => showView('models');
   $('#copyCfg').onclick = async () => {
     try {
       const c = await api('/zcode-config');
@@ -333,7 +352,7 @@ function renderTcOverview() {
         const key = line.dataset.tcrow;
         if (![...sel.options].some((o) => o.value === key)) { toast('该账号不在任务中心列表里', 'bad'); return; }
         sel.value = key;
-        localStorage.setItem('wbTcAccount', key);
+        store.set('wbTcAccount', key);
         loadTaskCenter({ spinner: true });
         const card = $('#tcList') && $('#tcList').closest('.card');
         if (card) { card.classList.add('flash'); setTimeout(() => card.classList.remove('flash'), 2200); card.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
@@ -381,9 +400,8 @@ async function loadOverview() {
     const spark = (vals, color, gid) => {
       const vs = vals.length ? vals : [1, 1];
       const max = Math.max(1, ...vs);
-      const pts = vs.map((v, i) => [`M${Math.round(i / Math.max(1, vs.length - 1) * 120)} ${Math.round(24 - (v / max) * 21)}`].join(''));
-      const d = pts.length ? 'M' + vs.map((v, i) => `${Math.round(i / Math.max(1, vs.length - 1) * 120)} ${Math.round(24 - (v / max) * 21)}`).join(' L') : 'M0 24 L120 24';
-      const last = d.split(' ').pop().split('L').pop();
+      // 只用一条路径：pts 变量算完不用的旧实现已删
+      const d = 'M' + vs.map((v, i) => `${Math.round(i / Math.max(1, vs.length - 1) * 120)} ${Math.round(24 - (v / max) * 21)}`).join(' L');
       return `<svg class="spark" viewBox="0 0 120 26" preserveAspectRatio="none" aria-hidden="true">
         <defs><linearGradient id="${gid}" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="${color}" stop-opacity=".35"/><stop offset="100%" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
         <path d="${d} L120 26 L0 26Z" fill="url(#${gid})"/>
@@ -408,13 +426,13 @@ async function loadOverview() {
       <div class="card hv tilt an" data-go="accounts" title="各账号健康状态（冷却/失效/耗尽）· 点击进入账号管理" style="--c:#34D399;animation-delay:120ms;cursor:pointer">
         <div class="k">可用账号</div>
         <div class="v">${healthAcc} <span style="font-size:14px;color:var(--mu)">/ ${enabled.length}</span></div>
-        <div class="muted">${enabled.length - healthAcc ? (enabled.length - healthAcc) + ' 个冷却/失效' : '全部健康'} · 站点 ${(state.sites || []).filter((s) => s.logged_in).map((s) => s.site).join(' ') || '—'}</div>
+        <div class="muted">${enabled.length - healthAcc ? (enabled.length - healthAcc) + ' 个冷却/失效' : '全部健康'} · 站点 ${(state.sites || []).filter((s) => s.logged_in).map((s) => esc(s.site)).join(' ') || '—'}</div>
         ${spark(enabled.map((x) => 1), '#34D399', 'spk3')}
       </div>
       <div class="card hv tilt an" data-go="accounts" title="全部启用账号的可用积分合计 · 点击查看账号与批次明细" style="--c:#7B5CFF;animation-delay:180ms;cursor:pointer">
         <div class="k">积分总量${totalDays !== null ? ' · ≈' + totalDays + ' 天' : ''}</div>
         <div class="v"><span data-count="${Math.round(totalRemain)}">0</span></div>
-        <div class="muted">${totalBatches} 个有效批次${earliest ? ' · 最早 ' + new Date(earliest).toLocaleDateString().slice(5) + ' 到期' : ''}${dailyAvg > 0 ? ' · 日均 ' + fmtCredit(dailyAvg) : ''}</div>
+        <div class="muted">${totalBatches} 个有效批次${earliest ? ' · 最早 ' + fmtMonthDay(earliest) + ' 到期' : ''}${dailyAvg > 0 ? ' · 日均 ' + fmtCredit(dailyAvg) : ''}</div>
         ${spark(recent.map((d) => d.credit || 0).reverse(), '#7B5CFF', 'spk4')}
       </div>`;
 
@@ -433,7 +451,7 @@ async function loadOverview() {
       <circle cx="70" cy="70" r="50" fill="var(--ring-core)" stroke="rgba(140,170,230,.28)" stroke-width="1"/>
       <text x="70" y="64" text-anchor="middle" fill="var(--tx)" font-size="25" font-weight="700" font-family="monospace">${fmtCredit(Math.round(totalRemain))}</text>
       <text x="70" y="81" text-anchor="middle" fill="#B9C6DE" font-size="9.5" font-family="monospace">${enabled.length} 账号 · ${totalBatches} 批</text>
-      ${earliest ? `<text x="70" y="95" text-anchor="middle" fill="#F5A524" font-size="9.5" font-family="monospace">最早到期 ${new Date(earliest).toLocaleDateString().slice(5)}</text>` : ''}
+      ${earliest ? `<text x="70" y="95" text-anchor="middle" fill="#F5A524" font-size="9.5" font-family="monospace">最早到期 ${fmtMonthDay(earliest)}</text>` : ''}
     </svg>`;
 
     /* ---- 账号余额条 ---- */
@@ -470,7 +488,7 @@ async function loadOverview() {
     }
     const segSum = seg.reduce((s, x) => s + x.w, 0) || 1;
     const tl = seg.map((s) => `<i class="${s.cls}" style="flex:${Math.max(1, s.w)}" title="${s.label}：${fmtCredit(s.w)} 积分"></i>`).join('');
-    const tlx = seg.map((s) => `<span style="flex:1 1 0">(${s.label})${s.w > 0 ? '.' : '.'}</span>`).join('');
+    const tlx = seg.map((s) => `<span style="flex:1 1 0">(${esc(s.label)})</span>`).join('');
 
     /* ---- 24h 频谱（§5.2：待发生压暗区 + 现在分界 + 峰值标注） ---- */
     const hours = usage.todayHours || [];
@@ -572,15 +590,16 @@ async function loadOverview() {
     const dsum = (doctor && doctor.summary) || { pass: '—', warn: '—', fail: 0 };
     const concerns = [];
     for (const x of enabled) {
-      if (String(x.a.lastError || '').includes('401')) concerns.push({ cls: 'bd', tag: '重登', text: `${accNames[x.a.id] || x.a.id} · 登录态失效（401）` });
-      if (x.a.cooldownUntil && x.a.cooldownUntil > Date.now()) concerns.push({ cls: 'wn', tag: '冷却', text: `${accNames[x.a.id] || x.a.id} · 冷却至 ${new Date(x.a.cooldownUntil).toLocaleTimeString()}` });
+      // 账号名来自上游昵称/用户 label，进 innerHTML 前必须 esc（存储型 XSS 主入口）
+      if (String(x.a.lastError || '').includes('401')) concerns.push({ cls: 'bd', tag: '重登', text: `${esc(accNames[x.a.id] || x.a.id)} · 登录态失效（401）` });
+      if (x.a.cooldownUntil && x.a.cooldownUntil > Date.now()) concerns.push({ cls: 'wn', tag: '冷却', text: `${esc(accNames[x.a.id] || x.a.id)} · 冷却至 ${new Date(x.a.cooldownUntil).toLocaleTimeString()}` });
       if (x.a.tokenExpiresAt || x.a.expiresAt) {
         const d = fmtDays(x.a.expiresAt);
-        if (d !== null && d >= 0 && d <= 7) concerns.push({ cls: 'wn', tag: '重登', text: `${accNames[x.a.id] || x.a.id} · token ${d} 天后到期` });
+        if (d !== null && d >= 0 && d <= 7) concerns.push({ cls: 'wn', tag: '重登', text: `${esc(accNames[x.a.id] || x.a.id)} · token ${d} 天后到期` });
       }
       for (const bt of (x.a.creditDetail || [])) {
         const d = fmtDays(bt.expireAt);
-        if (d !== null && d < 0 && (bt.remain || 0) > 0) concerns.push({ cls: 'bd', tag: '过期', text: `${accNames[x.a.id] || x.a.id} · 「${esc(bt.package || '批次')}」已过期余 ${fmtCredit(bt.remain)}` });
+        if (d !== null && d < 0 && (bt.remain || 0) > 0) concerns.push({ cls: 'bd', tag: '过期', text: `${esc(accNames[x.a.id] || x.a.id)} · 「${esc(bt.package || '批次')}」已过期余 ${fmtCredit(bt.remain)}` });
       }
     }
     const concernRows = concerns.length
@@ -646,7 +665,7 @@ async function loadOverview() {
           <div class="h" style="margin:12px 0 6px">按模型 · 今日 <span>${byModel.length} 个模型</span></div>
           ${modelRows || '<div class="muted" style="padding:6px 2px">今天还没有调用</div>'}
           <div class="h" style="margin:12px 0 6px">事件流 <span>最近 5 条</span></div>
-          <div class="ticker">${evRows || '<div class="muted" style="padding:6px 2px">暂无事件</div>'}</div>
+          <div class="muted" style="padding:6px 2px">${evRows || '暂无事件'}</div>
         </div>
       </div>
       <div class="k4b">
@@ -713,7 +732,7 @@ async function loadOverview() {
       };
       const rt = $('#ovRunTasks'); if (rt) rt.onclick = () => runTask('all');
     }
-  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { paint(el, `<div class="empty">加载失败：${esc(e.message)}</div>`); }
 }
 
 /* ---------- 顶栏积分预警（所有页签常驻，60s 轮询；无命中不渲染） ---------- */
@@ -731,12 +750,12 @@ async function loadUpdateAlert(items) {
     const u = await api('/update-check');
     if (!u.updateAvailable || !u.latest) return;
     const snoozeKey = 'wbUpdateSnooze';
-    const snoozedUntil = Number(localStorage.getItem(snoozeKey) || 0);
+    const snoozedUntil = Number(store.get(snoozeKey) || 0);
     if (Date.now() < snoozedUntil) return;
     items.push(`<span class="alertbar orange" title="更新方式：ZCode 插件设置 → 浏览插件（先「刷新市场」再找更新按钮）">⬆️ 有新版本 v${esc(u.latest)}（当前 v${esc(u.local)}） <a href="#" id="updSnooze" style="color:inherit">知道了</a></span>`);
     setTimeout(() => {
       const s = document.getElementById('updSnooze');
-      if (s) s.onclick = (ev) => { ev.preventDefault(); localStorage.setItem(snoozeKey, String(Date.now() + 12 * 3600e3)); loadAlerts(); };
+      if (s) s.onclick = (ev) => { ev.preventDefault(); store.set(snoozeKey, String(Date.now() + 12 * 3600e3)); loadAlerts(); };
     }, 0);
   } catch { /* 检查不了就静默 */ }
 }
@@ -745,6 +764,8 @@ function accountRemainOf(a) {
   if (Array.isArray(a.creditDetail) && a.creditDetail.length) {
     return a.creditDetail.reduce((s, b) => s + (Number(b.remain) || 0), 0);
   }
+  // null/'' 表示「余额未知」：Number(null)=0、Number('')=0 会把未知错显示成「余额 0」
+  if (a.creditRemain == null || a.creditRemain === '') return null;
   return Number.isFinite(Number(a.creditRemain)) ? Number(a.creditRemain) : null;
 }
 
@@ -823,11 +844,13 @@ async function loadAccounts() {
   const el = $('#view-accounts');
   try {
     const [policy, bridge0] = await Promise.all([api('/policy'), api('/bridge')]);
-    // 有账号但一个批次明细都没有（还没刷过）→ 自动刷一轮，让到期排序直接可用
+    // 有账号但一个批次明细都没有（还没刷过）→ 自动刷一轮，让到期排序直接可用。
+    // 只自动尝试一次（会话级标记）：上游持续失败时别让 30s 轮询每轮都强推全量刷新
     const hasAccount = (bridge0.sites || []).some((s) => (s.accounts || []).length);
     const anyDetail = (bridge0.sites || []).some((s) => (s.accounts || []).some((a) => Array.isArray(a.creditDetail) && a.creditDetail.length));
     let bridge = bridge0;
-    if (hasAccount && !anyDetail) {
+    if (hasAccount && !anyDetail && !loadAccounts._autoCreditRefreshTried) {
+      loadAccounts._autoCreditRefreshTried = true;
       try { await api('/credit/refresh', { method: 'POST' }); bridge = await api('/bridge'); } catch { /* 刷新失败先用缓存渲染 */ }
     }
     const sites = bridge.sites || [];
@@ -865,7 +888,7 @@ async function loadAccounts() {
           <button class="btn" id="btnImport">⬇ 导入本机账号</button>
           <button class="btn" id="btnRefresh">↻ 刷新全部积分</button>
           <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted);cursor:pointer" title="已用完的批次不参与调度，默认隐藏；明细来自上游，刷新后仍会回来，所以只能隐藏不能删除">
-            <input type="checkbox" id="chkShowSpent" ${localStorage.getItem('wbShowSpentBatches') === '1' ? 'checked' : ''}> 显示已耗尽批次
+            <input type="checkbox" id="chkShowSpent" ${store.get('wbShowSpentBatches') === '1' ? 'checked' : ''}> 显示已耗尽批次
           </label>
           <span class="spacer"></span>
           <span class="muted" style="font-size:12px">消耗顺序（当前策略）：</span>
@@ -903,7 +926,7 @@ async function loadAccounts() {
 
     // 「显示已耗尽批次」偏好（localStorage 持久化，跨刷新/跨轮询保留）
     $('#chkShowSpent').onchange = (e) => {
-      localStorage.setItem('wbShowSpentBatches', e.target.checked ? '1' : '0');
+      store.set('wbShowSpentBatches', e.target.checked ? '1' : '0');
       loadAccounts();
     };
 
@@ -984,7 +1007,7 @@ function acctCard(site, row, raw) {
   // 批次渲染：有余额的批次始终显示；耗尽（余 0）批次默认完全隐藏——它们不参与调度，
   // 且明细每次刷新积分都从上游重建，本地删除无法持久，所以只提供显示开关（页头勾选框）。
   // 注意：耗尽批次的展示区不能放在卡片的可点击空白里触发固定策略，一律加 data-act 排除。
-  const showSpent = localStorage.getItem('wbShowSpentBatches') === '1';
+  const showSpent = store.get('wbShowSpentBatches') === '1';
   const live = [], spent = [];
   for (const b of a.creditDetail || []) {
     ((b.remain || 0) > 0 ? live : spent).push(b);
@@ -1022,7 +1045,7 @@ function acctCard(site, row, raw) {
     <div class="bal">${bal === null ? '<span class="muted" style="font-size:14px">余额未知</span>' : bal}<small>积分${dlTag}${boTag}${budTag}${a.creditCheckedAt ? ' · 刷新于 ' + new Date(a.creditCheckedAt).toLocaleTimeString() : ''}</small></div>
     <div class="batches">${batches || (a.creditDetail && a.creditDetail.length ? '' : '<span class="muted" style="font-size:12px">暂无批次明细 —— 点「刷新全部积分」获取</span>')}</div>
     ${spentNote}
-    ${a.manualExpireAt ? `<div style="font-size:12px" class="muted">手动到期兜底：<span class="warn">${esc(a.manualExpireAt)}</span></div>` : ''}
+    ${a.manualExpireAt ? `<div style="font-size:12px" class="muted">手动到期兜底：<span class="warn" data-manual>${esc(a.manualExpireAt)}</span></div>` : ''}
     ${a.lastError ? `<div style="font-size:12px" class="bad">最近错误：${esc(a.lastError)}</div>` : ''}
     <div class="acts">
       <button class="btn mini" data-act="pin" data-site="${esc(site.site)}" data-id="${esc(a.id)}">📌 固定使用</button>
@@ -1143,18 +1166,23 @@ function openLoginModal(sites) {
   function stopLogin() { clearInterval(pollT); closeModal(); }
 
   $('#lgGo').onclick = async () => {
+    // 防连点：await 期间再点会覆盖 pollT，旧的 3s 轮询定时器泄漏且互相写状态
+    $('#lgGo').disabled = true;
+    clearInterval(pollT);
     const site = $('#lgSite').value, label = $('#lgLabel').value.trim();
     const area = $('#lgArea');
     area.innerHTML = `<div class="muted"><span class="spin"></span>正在向上游申请授权…</div>`;
     try {
       const r = await api('/login/start', { method: 'POST', body: { site, label } });
       const qr = makeQR(r.authUrl);
+      // 只放行 http(s) 授权链接：esc() 防不了 javascript: 伪协议
+      const safeUrl = /^https?:/i.test(String(r.authUrl || ''));
       area.innerHTML = `
         <div id="qrBox">${qr}</div>
         <div class="qrhint">
           <b style="color:var(--text)">微信扫码登录：</b><br>
           ① 打开微信「扫一扫」，扫描上方二维码 → 在手机上打开授权页并登录确认；<br>
-          ② 或点 <a href="${esc(r.authUrl)}" target="_blank" style="color:var(--accent)">在电脑浏览器打开授权页</a>，按页面提示用微信扫码登录。<br>
+          ${safeUrl ? `② 或点 <a href="${esc(r.authUrl)}" target="_blank" rel="noopener" style="color:var(--accent)">在电脑浏览器打开授权页</a>，按页面提示用微信扫码登录。<br>` : ''}
           登录完成后本窗口会自动检测到（最长等 10 分钟）。
         </div>
         <div id="lgStatus" class="muted"><span class="spin"></span>等待你在手机/浏览器上确认…</div>`;
@@ -1176,6 +1204,8 @@ function openLoginModal(sites) {
       }, 3000);
     } catch (e) {
       area.innerHTML = `<div class="bad">发起登录失败：${esc(e.message)}</div>`;
+    } finally {
+      $('#lgGo').disabled = false;
     }
   };
 }
@@ -1355,7 +1385,7 @@ async function loadModels() {
         loadModels();
       } catch (e) { toast('保存失败：' + e.message, 'bad'); }
     };
-  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { paint(el, `<div class="empty">加载失败：${esc(e.message)}</div>`); }
 }
 function capBadge(x, kind) {
   const v = kind === 'image' ? x.supportsImages : kind === 'tool' ? x.supportsToolCall : x.supportsReasoning;
@@ -1471,7 +1501,7 @@ async function loadGuide() {
         if (s) copy(s.text, '已复制 ' + s.title + ' 配置');
       };
     }
-  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { paint(el, `<div class="empty">加载失败：${esc(e.message)}</div>`); }
 }
 
 /* ---------- Tab 3：自动任务 ---------- */
@@ -1663,12 +1693,12 @@ async function loadTasks() {
       const accOptions = [];
       for (const s of bridge.sites || []) for (const a of s.accounts || []) {
         if (a.enabled === false) continue;
-        accOptions.push({ site: s.site, id: a.id, label: `${a.label || a.id}（${esc(s.label)}）` });
+        accOptions.push({ site: s.site, id: a.id, label: `${esc(a.label || a.id)}（${esc(s.label)}）` });
       }
       tcSel.innerHTML = accOptions.map((o) => `<option value="${esc(o.site)}|${esc(o.id)}">${o.label}</option>`).join('') || '<option value="">（没有账号）</option>';
-      const lastTc = localStorage.getItem('wbTcAccount');
+      const lastTc = store.get('wbTcAccount');
       if (lastTc && accOptions.some((o) => o.site + '|' + o.id === lastTc)) tcSel.value = lastTc;
-      tcSel.onchange = () => { localStorage.setItem('wbTcAccount', tcSel.value); loadTaskCenter({ spinner: true }); loadOfficialHeat(); };
+      tcSel.onchange = () => { store.set('wbTcAccount', tcSel.value); loadTaskCenter({ spinner: true }); loadOfficialHeat(); };
       $('#tcReload').onclick = () => loadTaskCenter({ force: true, spinner: true });
       if (accOptions.length) renderTcList(); // 回填最近一次数据（showView 的按需拉取稍后自动覆盖）
       else $('#tcList').innerHTML = '<div class="empty" style="padding:14px">没有可用账号</div>';
@@ -1722,7 +1752,7 @@ async function loadTasks() {
 
     // 任务中心列表不属于轮询/SSE 刷新路径：只有页面真的重建时才用最近一次数据即时回填（不重新拉上游）
     if (changed && lastTcData) renderTcList();
-  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { paint(el, `<div class="empty">加载失败：${esc(e.message)}</div>`); }
 }
 /* ---------- T50：renderTcOverview 的连登块从这里取快照（loadTasks 拉过后填充） ---------- */
 let lastTasksData = null;
@@ -1778,7 +1808,7 @@ async function loadTaskCenter({ force = false, spinner = false } = {}) {
   const [site, accountId] = v.split('|');
   const listEl = $('#tcList'), st = $('#tcStatus');
   if (!site || !accountId) { if (listEl) listEl.innerHTML = ''; return; }
-  localStorage.setItem('wbTcAccount', v);
+  store.set('wbTcAccount', v);
   if (spinner && st) st.innerHTML = '<span class="spin"></span>读取中…';
   try {
     const r = await api('/task-center?site=' + encodeURIComponent(site) + '&accountId=' + encodeURIComponent(accountId) + (force ? '&refresh=1' : ''));
@@ -1805,7 +1835,8 @@ function renderTcList() {
   }
   if (!tasks.length) { listEl.innerHTML = '<div class="empty" style="padding:14px">上游没有返回任务（可能活动未开放）</div>'; return; }
   listEl.innerHTML = tasks.map((x) => {
-    const pct = x.target > 0 ? Math.min(100, Math.round(x.current / x.target * 100)) : 0;
+    // x.current 缺失时兜底 0，否则 width:NaN% 静默不显示进度条
+    const pct = x.target > 0 ? Math.min(100, Math.round((x.current ?? 0) / x.target * 100)) : 0;
     const state = x.claimed ? '<span class="badge ok">已领奖</span>'
       : x.claimable ? '<span class="badge warn">可领奖</span>'
       : x.locked ? '<span class="badge">未解锁</span>'
@@ -1818,7 +1849,7 @@ function renderTcList() {
         ${x.autoplayable ? `<span class="badge" title="可由桥接代打（模型 ${esc(x.autoplayModel || 'default')}）">🤖 可代打</span>` : (x.autoplayBlockedReason ? `<span class="badge" title="${esc(x.autoplayBlockedReason)}">🤖 ${esc(x.autoplayBlockedReason)}</span>` : '')}
         <span class="spacer"></span>
         <span class="muted" style="font-size:12px">${x.target ? `${x.current}/${x.target}` : ''}</span>
-        ${x.autoplayable && !x.claimable ? `<button class="btn mini" data-tcplay="${esc(x.code)}" data-need="${x.remain}">代打</button>` : ''}
+        ${x.autoplayable && !x.claimable ? `<button class="btn mini" data-tcplay="${esc(x.code)}" data-need="${esc(x.remain)}">代打</button>` : ''}
         ${x.claimable ? `<button class="btn mini primary" data-tcclaim="${esc(x.code)}">领奖</button>` : ''}
       </div>
       ${x.target ? `<div style="height:6px;border-radius:3px;background:var(--chip);overflow:hidden"><i style="display:block;height:100%;width:${pct}%;background:${pct >= 100 ? 'var(--ok)' : 'var(--accent)'}"></i></div>` : ''}
@@ -1852,8 +1883,13 @@ async function runTask(kind) {
   toast('正在执行：' + ({ checkin: '签到+连登巡检', streak: '连登巡检', growth: '成长任务扫描', travel: '猫猫旅行巡逻' }[kind] || kind) + ' …');
   try {
     const r = await api('/tasks/run', { method: 'POST', body: { kind } });
+    // 互斥重入：同类任务进行中时 results 是 {busy:true,msg} 而不是按站点的数组表
+    if (r.results?.busy) { toast(r.results.msg || '任务正在进行中，请稍后再试', 'warn'); return; }
     const parts = [];
-    for (const [k, list] of Object.entries(r.results || {})) parts.push(`${k}: 成功${list.filter((x) => x.ok && !x.skipped).length} 跳过${list.filter((x) => x.skipped).length} 失败${list.filter((x) => x.ok === false).length}`);
+    for (const [k, list] of Object.entries(r.results || {})) {
+      if (!Array.isArray(list)) continue;
+      parts.push(`${k}: 成功${list.filter((x) => x.ok && !x.skipped).length} 跳过${list.filter((x) => x.skipped).length} 失败${list.filter((x) => x.ok === false).length}`);
+    }
     toast('执行完成 —— ' + parts.join('；'), 'ok');
     loadTasks();
     loadTaskCenter({ force: true }); // 手动执行会改变上游任务进度，强制刷一次当前账号的列表
@@ -1996,7 +2032,7 @@ async function loadUsage() {
         b.disabled = false; b.textContent = old;
       };
     }
-  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { paint(el, `<div class="empty">加载失败：${esc(e.message)}</div>`); }
 }
 
 /* ---------- Tab：事件时间线（T6） ---------- */
@@ -2011,7 +2047,7 @@ const EVENT_KINDS = [
   { id: 'health', name: '巡检' },
 ];
 const EVENT_BADGE = { system: 'acc', task: 'ok', policy: 'warn', account: 'bad', credit: 'warn', login: 'ok', health: 'acc' };
-let eventKindFilter = localStorage.getItem('wbEventKind') || '';
+let eventKindFilter = store.get('wbEventKind') || '';
 
 async function loadEvents() {
   const el = $('#view-events');
@@ -2041,9 +2077,9 @@ async function loadEvents() {
       </div>
       <div class="card" style="padding:0">${rows ? `<table><thead><tr><th style="width:150px">时间</th><th style="width:74px">类型</th><th>事件</th></tr></thead><tbody>${rows}</tbody></table>` : '<div class="muted" style="padding:22px;text-align:center">暂无事件</div>'}</div>`);
     for (const b of el.querySelectorAll('[data-evkind]')) {
-      b.onclick = () => { eventKindFilter = b.dataset.evkind; localStorage.setItem('wbEventKind', eventKindFilter); loadEvents(); };
+      b.onclick = () => { eventKindFilter = b.dataset.evkind; store.set('wbEventKind', eventKindFilter); loadEvents(); };
     }
-  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { paint(el, `<div class="empty">加载失败：${esc(e.message)}</div>`); }
 }
 
 /* ---------- T67 使用说明 ----------
@@ -2141,7 +2177,7 @@ function loadHelp() {
 }
 window.loadHelp = loadHelp;
 
-const fmtPct = (n) => (n >= 1000 ? (n / 1000).toFixed(1) + 's' : n + 'ms');
+// （fmtPct 死代码已删：全文件无调用，且名称与行为——输出 ms/s——不符）
 /* 账号健康状态 —— 必须与 server/src/pool.mjs 的 isUsable() 同一套语义：
  * enabled=false 已禁用；lastError 含 401 登录态失效；exhaustedAt 6h TTL 内算额度耗尽；
  * cooldownUntil（epoch ms）未到算冷却中。字段全是驼峰（0.3.25 修正：此前的
@@ -2189,7 +2225,7 @@ function healthState(a) {
       if (a.lastUsedAt) ttl.push({ t: '最近使用', at: a.lastUsedAt, cls: 'acc' });
       ttl.sort((x, y) => new Date(y.at) - new Date(x.at));
       const timeline = ttl.slice(0, 3).map((e) =>
-        `<div style="font-size:12px" class="muted"><span class="${e.cls}" style="margin-right:4px">●</span>${new Date(e.at).toLocaleString()} · ${esc(e.t.length > 60 ? e.t.slice(0, 60) + '…' : e.t)}</div>`).join('');
+        `<div style="font-size:12px" class="muted"><span class="${e.cls}" style="margin-right:4px">●</span>${e.at ? new Date(e.at).toLocaleString() : '—'} · ${esc(e.t.length > 60 ? e.t.slice(0, 60) + '…' : e.t)}</div>`).join('');
       return `<tr>
         <td><b>${esc(a.label || a.id)}</b> <span class="badge">${esc(a.site)}</span></td>
         <td><span class="badge ${st.cls}">${st.text}</span></td>
@@ -2416,12 +2452,20 @@ function healthState(a) {
       };
     }
     // ---- T19 行为绑定 ----
+    // 30s 轮询回填与用户编辑互踩的守卫：用户改过（dirty）或焦点正在输入框里时跳过回填；
+    // 保存成功后清 dirty，之后才以服务端为准
+    const markDirty = (el) => el.addEventListener('input', () => { el.dataset.dirty = '1'; });
+    const fillIfIdle = (el, val) => {
+      if (el.dataset.dirty === '1' || document.activeElement === el) return;
+      el.value = val;
+    };
     const rt = await api('/routes').catch(() => null);
     if (rt) {
-      $('#rtAliases').value = Object.entries(rt.aliases || {}).map(([k, v]) => `${k}=${v}`).join('\n');
-      $('#rtRoutes').value = Object.entries(rt.routes || {}).map(([k, v]) => `${k}=${v}`).join('\n');
-      $('#rtAllow').value = (rt.allowModels || []).join(', ');
-      $('#rtExclude').value = (rt.excludeModels || []).join(', ');
+      for (const id of ['rtAliases', 'rtRoutes', 'rtAllow', 'rtExclude']) markDirty($('#' + id));
+      fillIfIdle($('#rtAliases'), Object.entries(rt.aliases || {}).map(([k, v]) => `${k}=${v}`).join('\n'));
+      fillIfIdle($('#rtRoutes'), Object.entries(rt.routes || {}).map(([k, v]) => `${k}=${v}`).join('\n'));
+      fillIfIdle($('#rtAllow'), (rt.allowModels || []).join(', '));
+      fillIfIdle($('#rtExclude'), (rt.excludeModels || []).join(', '));
     }
     const parseKv = (text, what) => {
       const out = {};
@@ -2444,6 +2488,7 @@ function healthState(a) {
         };
         await api('/routes', { method: 'POST', body });
         $('#rtMsg').textContent = '已保存（' + Object.keys(body.aliases).length + ' 别名 · ' + Object.keys(body.routes).length + ' 路由 · 白' + body.allowModels.length + '/黑' + body.excludeModels.length + '）';
+        for (const id of ['rtAliases', 'rtRoutes', 'rtAllow', 'rtExclude']) delete $('#' + id).dataset.dirty;
         toast('路由规则已保存，立即生效', 'ok');
       } catch (e) { $('#rtMsg').textContent = ''; toast('保存失败：' + e.message, 'bad'); }
     };
@@ -2493,7 +2538,7 @@ function healthState(a) {
       try {
         const parsed = JSON.parse(await file.text());
         const r = await api('/backup/restore', { method: 'POST', body: { files: parsed.files || parsed } });
-        $('#bkMsg').innerHTML = `<span class="${r.ok ? 'ok' : 'bad'}" style="font-size:12.5px">已恢复：${(r.accepted || []).join('、') || '无'}${(r.skipped || []).length ? '；跳过：' + r.skipped.join('、') : ''}</span>` +
+        $('#bkMsg').innerHTML = `<span class="${r.ok ? 'ok' : 'bad'}" style="font-size:12.5px">已恢复：${esc((r.accepted || []).join('、')) || '无'}${(r.skipped || []).length ? '；跳过：' + esc(r.skipped.join('、')) : ''}</span>` +
           (r.note ? `<div class="muted" style="font-size:12px;margin-top:4px">${esc(r.note)}</div>` : '') +
           `<button class="btn mini primary" id="bkRestart" style="margin-top:6px">立即交棒重启使 config 生效（不断线）</button>`;
         const br = $('#bkRestart');
@@ -2563,20 +2608,22 @@ function healthState(a) {
           <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input type="checkbox" data-ch-on="${i}" ${c.enabled !== false ? 'checked' : ''}> 启用</label>
           <button class="btn mini danger" data-ch-del="${i}">删除</button>
         </div>`).join('') : '<div class="muted" style="padding:10px 0;font-size:12.5px">还没有通道 —— 不配置也不影响桌面气泡，两者是并行的。</div>';
-      // 行内控件改动后同步回内存列表，保存时直接提交
-      for (const sel of el.querySelectorAll('[data-ch-type]')) sel.onchange = () => { list[+sel.dataset.chType].type = sel.value; };
-      for (const inp of el.querySelectorAll('[data-ch-url]')) inp.oninput = () => { list[+inp.dataset.chUrl].url = inp.value; };
-      for (const cb of el.querySelectorAll('[data-ch-on]')) cb.onchange = () => { list[+cb.dataset.chOn].enabled = cb.checked; };
-      for (const b of el.querySelectorAll('[data-ch-del]')) b.onclick = () => { list.splice(+b.dataset.chDel, 1); renderChannels(list); };
+      // 行内控件改动后同步回内存列表，保存时直接提交；chDirty 防轮询重建覆盖未保存的编辑
+      for (const sel of el.querySelectorAll('[data-ch-type]')) sel.onchange = () => { chDirty = true; list[+sel.dataset.chType].type = sel.value; };
+      for (const inp of el.querySelectorAll('[data-ch-url]')) inp.oninput = () => { chDirty = true; list[+inp.dataset.chUrl].url = inp.value; };
+      for (const cb of el.querySelectorAll('[data-ch-on]')) cb.onchange = () => { chDirty = true; list[+cb.dataset.chOn].enabled = cb.checked; };
+      for (const b of el.querySelectorAll('[data-ch-del]')) b.onclick = () => { chDirty = true; list.splice(+b.dataset.chDel, 1); renderChannels(list); };
     };
+    let chDirty = false;
     let chList = ((nt && nt.channels) || []).map((c) => ({ ...c }));
     renderChannels(chList);
-    $('#ntAdd').onclick = () => { chList.push({ type: 'webhook', url: '', enabled: true }); renderChannels(chList); };
+    $('#ntAdd').onclick = () => { chDirty = true; chList.push({ type: 'webhook', url: '', enabled: true }); renderChannels(chList); };
     $('#ntSave').onclick = async () => {
       const bad = chList.find((c) => !String(c.url || '').trim());
       if (bad) { toast('有通道还没填地址 —— 填不上就点「删除」', 'bad'); return; }
       try {
         await api('/notify', { method: 'POST', body: { enabled: $('#ntEnabled').checked, channels: chList } });
+        chDirty = false;
         toast('通知通道已保存（地址已按密钥打码显示）', 'ok');
         loadHealth();
       } catch (e) { toast('保存失败：' + e.message, 'bad'); }
@@ -2672,7 +2719,7 @@ function healthState(a) {
       } catch (e) { toast('诊断失败：' + e.message, 'bad'); }
       b.disabled = false; b.textContent = '▶ 运行诊断';
     };
-  } catch (e) { el.innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
+  } catch (e) { paint(el, `<div class="empty">加载失败：${esc(e.message)}</div>`); }
 }
 
 /* ---------- Tab 5：日志 ---------- */

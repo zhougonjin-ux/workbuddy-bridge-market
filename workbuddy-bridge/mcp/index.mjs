@@ -23,7 +23,7 @@ function baseOf(cfg) {
   return `http://${cfg.host}:${cfg.port}`;
 }
 
-async function callLocal(cfg, path, { method = 'GET', body = null } = {}) {
+async function callLocal(cfg, path, { method = 'GET', body = null, timeoutMs = 60_000 } = {}) {
   const headers = { Accept: 'application/json' };
   const key = primaryKey(cfg);
   if (key) headers.Authorization = 'Bearer ' + key;
@@ -34,9 +34,14 @@ async function callLocal(cfg, path, { method = 'GET', body = null } = {}) {
       method,
       headers,
       body: body ? JSON.stringify(body) : undefined,
-      signal: AbortSignal.timeout(60_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
   } catch (e) {
+    // 超时和连接被拒是两回事：超时说明代理活着但活儿没干完（服务端会继续跑完），
+    // 文案混在「请先启动代理」里会把排障方向带偏
+    if (e?.name === 'TimeoutError') {
+      throw new Error(`代理响应超时（${Math.round(timeoutMs / 1000)}s）：请求已受理、服务端会继续执行，稍后可用 wb_tasks_status 查看结果。`);
+    }
     const hint = [
       `本地 WorkBuddy 代理没有响应（${e.cause?.code || e.name || e.message}）。`,
       `请先启动代理：/wbp-start 命令，或运行  node "${process.env.WB_BRIDGE_SERVER_DIR || '<插件目录>'}/server/server.mjs"`,
@@ -215,7 +220,11 @@ const TOOLS = [
       properties: { kind: { type: 'string', enum: ['checkin', 'growth', 'travel', 'streak', 'all'], description: '任务类型，默认 all' } },
     },
     run: async (cfg, args) => {
-      const r = await callLocal(cfg, '/admin/tasks/run', { method: 'POST', body: { kind: args?.kind || 'all' } });
+      // all 会跑 checkin+streak+growth+travel：多账号 × 每任务最多 5 次代打（真实上游 LLM
+      // 往返），轻松超过 60s 工具默认超时——这里给 4 分钟，超时后提示查状态而不是误导排障。
+      // busy 对象在 results 字段里（server 把 runTasks 的返回整个塞进 results）
+      const r = await callLocal(cfg, '/admin/tasks/run', { method: 'POST', body: { kind: args?.kind || 'all' }, timeoutMs: 240_000 });
+      if (r.results?.busy) return `任务执行：${r.results.msg}`;
       return `任务执行结果：\n${JSON.stringify(r.results, null, 2).slice(0, 2000)}`;
     },
   },
@@ -231,8 +240,10 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
     run: async (cfg) => {
       const r = await callLocal(cfg, '/admin/tasks/run', { method: 'POST', body: { kind: 'travel' } });
+      if (r.results?.busy) return `猫猫巡逻：${r.results.msg}`;
       const lines = [];
       for (const [key, list] of Object.entries(r.results || {})) {
+        if (!Array.isArray(list)) continue; // busy 形态或异常形状不炸迭代
         for (const x of list) lines.push(`  · [${key}] ${x.label || x.id}: ${x.msg || x.error || (x.skipped ? '今日已跑过' : '完成')}`);
       }
       return `猫猫巡逻结果：\n${lines.join('\n') || '（没有账号）'}`;
@@ -295,7 +306,8 @@ const TOOLS = [
         return r.ok ? `已领取：${r.msg}` : `领不了：${r.msg}`;
       }
       const body = { site, accountId, code };
-      if (args.times != null) body.times = Number(args.times) || undefined;
+      // times 原样透传（字符串 "0"/负数等语义由服务端校验并给出明确报错）
+      if (args.times != null) body.times = args.times;
       const r = await callLocal(cfg, '/console/api/task-center/play', { method: 'POST', body });
       return `${r.ok ? '✅' : '✗'} ${r.msg}${r.error ? `（${r.error}）` : ''}`;
     },
@@ -305,12 +317,24 @@ const TOOLS = [
 /* ---------------- MCP stdio 协议 ---------------- */
 
 function reply(id, result) {
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
+  try {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, result }) + '\n');
+  } catch {
+    /* 宿主关掉了管道（EPIPE 同步抛）：吞掉别让未捕获异常刷栈 */
+  }
 }
 
 function replyError(id, code, message) {
-  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }) + '\n');
+  try {
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }) + '\n');
+  } catch {
+    /* 同上 */
+  }
 }
+
+// Windows 的管道写是同步的（上面 catch 能接住）；macOS/Linux 是异步 error 事件，
+// 接不住会变成 uncaughtException——插件优先 Windows，这里补一行跨平台兜底
+process.stdout.on?.('error', () => {});
 
 async function handle(msg) {
   const { id, method, params } = msg;

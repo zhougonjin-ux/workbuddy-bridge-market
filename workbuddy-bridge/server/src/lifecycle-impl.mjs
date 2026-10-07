@@ -63,11 +63,11 @@ export function gracefulExit({ waitIdle = false, reason = 'stop', onClose = null
       setTimeout(() => process.exit(0), 5000).unref?.();
     }
   };
-  if (waitIdle && state.activeRequestsRef() > 0) {
+  if (waitIdle && (state.activeRequestsRef?.() || 0) > 0) {
     state.draining = true;
-    log(`${reason}：${state.activeRequestsRef()} 个请求进行中，等全部完成后退出`);
+    log(`${reason}：${state.activeRequestsRef?.() || 0} 个请求进行中，等全部完成后退出`);
     state.pendingExits.push(finish);
-    return { waiting: true, active: state.activeRequestsRef() };
+    return { waiting: true, active: state.activeRequestsRef?.() || 0 };
   }
   finish();
   return { waiting: false };
@@ -95,6 +95,10 @@ export function spawnReplacement() {
   });
   child.on('error', () => {});
   child.unref();
+  // 子进程已继承句柄，父进程自己的这份 fd 用完即关（交棒频繁时不积漏）
+  if (typeof stdio === 'number') {
+    try { fs.closeSync(stdio); } catch { /* 已关 */ }
+  }
   return child.pid;
 }
 

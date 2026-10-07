@@ -32,6 +32,7 @@ export class AuthError extends Error {
 // 这样配置目录切换后（测试隔离）不会命中另一个目录的缓存。
 const stores = new Map();
 const refreshInFlight = new Map(); // `${site}\0${accountId}` → Promise
+const recentRefreshAt = new Map(); // `${site}\0${accountId}` → 上次成功刷新的时间戳（防无 exp 的刷新风暴）
 const storeKey = (site, file) => `${site}\u0000${file}`;
 /** 池模式下「当前生效账号」在 stores 里的伪路径标记。 */
 const POOL_MARK = '\u0000pool';
@@ -224,6 +225,15 @@ export async function refreshToken(cfg, site, accountId = null) {
     try {
       json = JSON.parse(text);
     } catch {
+      // 非 JSON（网关 401/403 的 HTML 页等）+ 鉴权失败 = 凭证已死的另一种表现：
+      // 同样按失效清理，否则死凭证每次请求都重刷、刷屏 WARN 且永不清除
+      if (res.status === 401 || res.status === 403) {
+        clearAuth(site, id);
+        throw new AuthError(
+          `[${site}] 登录态已失效（刷新响应 HTTP ${res.status} 非 JSON）：请重新登录 —— node login.mjs --site ${site}`,
+          'not_logged_in',
+        );
+      }
       throw new AuthError(`[${site}] 刷新响应无法解析（HTTP ${res.status}）：${text.slice(0, 200)}`, 'refresh_failed');
     }
     if (res.status >= 400 || json.code !== 0 || !json.data?.accessToken) {
@@ -249,6 +259,11 @@ export async function refreshToken(cfg, site, accountId = null) {
       domain: json.data.domain || a.domain,
     };
     hydrateFromToken(site, next);
+    // 刷新后仍拿不到有效期（响应没 expiresIn 且新 token 连 exp 声明都没有），
+    // ensureToken 会退化为「每个请求都触发刷新」——recentRefreshAt 节流兜底之外，
+    // 这里至少把问题喊出来，别让它无声劣化。只看响应字段会误报：exp 由 hydrate 补齐
+    // 到 next.expiresAt 的情况其实是健康的
+    if (!expiresAt && !next.expiresAt) warn(`[${site}] 刷新成功但未获得有效期（响应无 expiresIn、token 无 exp 声明）：将按节流频率反复刷新，请关注上游协议变更`);
     // 有池就走池（按账号精确写回），否则沿用旧的单账号文件
     if (hasPoolFile(site) && id) {
       updateTokens(site, id, next);
@@ -323,21 +338,42 @@ export async function ensureToken(cfg, site = cfg.defaultSite, { force = false, 
     return picked ? picked.id : null;
   })();
 
-  if (!id) throw new AuthError(`[${site}] 尚未登录：请运行 node login.mjs --site ${site}`, 'not_logged_in');
+  if (!id) {
+    // 池里有账号但全部被排除/耗尽时，「尚未登录」的提示会误导用户去重跑登录
+    const total = listAccounts(site).length;
+    if (total > 0) {
+      throw new AuthError(
+        `[${site}] 暂无可用账号（共 ${total} 个，全部耗尽/冷却中或被本轮重试排除）：可在控制台「重置状态」或等待冷却恢复`,
+        'not_logged_in',
+      );
+    }
+    throw new AuthError(`[${site}] 尚未登录：请运行 node login.mjs --site ${site}`, 'not_logged_in');
+  }
   const a = getAccount(site, id);
   if (!a?.accessToken) throw new AuthError(`[${site}] 尚未登录：请运行 node login.mjs --site ${site}`, 'not_logged_in');
 
   // 把选中账号设为「当前生效账号」——后续 chatHeaders 通过 getAuth 读到的必须是它
   setCurrentAccount(site, a);
 
+  const key = `${site}\u0000${id}`;
   const needRefresh = force || !a.expiresAt || Date.now() > a.expiresAt - 5 * 60 * 1000;
+  // 防刷新风暴：上游刷新响应既无 expiresIn、新 token 又无 exp 声明时，expiresAt 一直是
+  // undefined，每个请求都会命中 needRefresh。10 秒内刚成功刷过就直接用现有 token，
+  // 把「每请求一刷」压到最多 6 次/分钟；正常账号（有 exp）完全不受影响。
+  if (!force && needRefresh && a.accessToken && Date.now() - (recentRefreshAt.get(key) || 0) < 10_000) {
+    return { token: a.accessToken, accountId: id };
+  }
   if (!needRefresh) return { token: a.accessToken, accountId: id };
 
   // 单飞按「站点 + 账号」粒度，不同账号互不阻塞
-  const key = `${site}\u0000${id}`;
   if (!refreshInFlight.has(key)) {
     const p = refreshToken(cfg, site, id)
-      .then(() => getAccount(site, id)?.accessToken)
+      .then(() => {
+        recentRefreshAt.set(key, Date.now());
+        // 刷新期间账号可能被删除/池被改写，此时用刷新前的 token 兜底，
+        // 绝不把 undefined 拼成 Bearer undefined 打上游
+        return getAccount(site, id)?.accessToken ?? a.accessToken;
+      })
       .finally(() => refreshInFlight.delete(key));
     refreshInFlight.set(key, p);
   }

@@ -1,6 +1,6 @@
 // Anthropic 兼容路由：/v1/messages、/v1/messages/count_tokens
 // Trae 的「Claude 型自定义模型」走 Anthropic Messages 协议，这里做双向转换。
-import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId } from './upstream.mjs';
+import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId, reportFrameError } from './upstream.mjs';
 import { resolveTarget } from './router.mjs';
 import { openWithSiteFallback } from './openai.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
@@ -152,13 +152,16 @@ export async function handleMessages(ctx) {
     try {
       agg = await aggregateFrames(up.frames);
     } catch (e) {
+      // 200+信封错误（带业务码）进号池状态机（0.3.37）
+      if (e.code != null) reportFrameError(site, up.accountId, model, { code: e.code, message: e.message });
       return sendError(res, e.status || 502, e.message, 'api_error');
     } finally {
       up.close();
     }
-    // 兜底：max_tokens 过小导致空回答时放大预算重试一次
+    // 兜底：max_tokens 过小导致空回答时放大预算重试一次。
+    // 加 frames/finish 守卫：零帧空流（上游异常）重试也是空流，白打一次计费请求
     const askedMax = Number(body.max_tokens ?? 0);
-    if (!agg.content && agg.toolCallList.length === 0 && askedMax > 0 && askedMax < 1024) {
+    if (!agg.content && agg.toolCallList.length === 0 && (agg.finishReason === 'length' || agg.frames > 0) && askedMax > 0 && askedMax < 1024) {
       warn(`[${site}] 空回答（finish=${agg.finishReason}，max_tokens=${askedMax}），放大到 1024 重试一次`);
       const up2 = await openChat(cfg, site, { ...openaiBody, max_tokens: Math.max(1024, askedMax * 4) }, { signal });
       if (up2.ok) {
@@ -178,9 +181,11 @@ export async function handleMessages(ctx) {
     for (const tc of agg.toolCallList) {
       content.push({ type: 'tool_use', id: tc.id || newId('toolu'), name: tc.function.name, input: parseArgs(tc.function.arguments) });
     }
-    // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage
+    // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage；
+    // token 兜底用本地估算，recordUsage 的 upstreamCredit 只收上游实报（估算 0 不进观测样本）
     const credit = await estimateCredit(cfg, site, model, agg.usage?.credit,
-      agg.usage?.prompt_tokens ?? 0, agg.usage?.completion_tokens ?? 0);
+      agg.usage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
+      agg.usage?.completion_tokens ?? estimateTokens(agg.content));
     requestLog({ site, model, account: up.accountId, mode: 'anthropic-json', status: 200, ms: Date.now() - started, credit });
     recordUsage({
       site,
@@ -193,6 +198,7 @@ export async function handleMessages(ctx) {
       ms: Date.now() - started,
       tools: agg.toolCallList.length,
       account: up.accountId,
+      upstreamCredit: Number.isFinite(agg.usage?.credit) ? agg.usage.credit : null,
     });
     return sendJson(res, 200, {
       id: newId('msg'),
@@ -200,7 +206,8 @@ export async function handleMessages(ctx) {
       role: 'assistant',
       model: publicModel,
       content: content.length ? content : [{ type: 'text', text: '' }],
-      stop_reason: stopReasonMap[agg.finishReason] || 'end_turn',
+      // 上游异常地以 stop/null 结束但带着工具调用时，按 tool_use 终态回给客户端
+      stop_reason: stopReasonMap[agg.finishReason] || (agg.toolCallList.length ? 'tool_use' : 'end_turn'),
       stop_sequence: null,
       usage: usageOf(agg.usage, estimateTokens(JSON.stringify(body.messages || [])), estimateTokens(agg.content)),
     });
@@ -214,7 +221,8 @@ export async function handleMessages(ctx) {
   let blockIndex = -1; // 当前打开的内容块
   let textBlockOpened = false;
   let nextBlock = 0;
-  const toolBlocks = new Map(); // 上游 tool_call index → anthropic block index
+  const toolBlocks = new Map(); // 上游 tool_call 聚合键（index 或 id）→ anthropic block index
+  let lastToolKey = null; // 最近打开的工具块聚合键（无 index/无 id 的裸参数帧续写它）
   let finishReason = null;
   let usage = null;
   let textLen = 0;
@@ -244,13 +252,15 @@ export async function handleMessages(ctx) {
       },
     });
 
-    for await (const payload of up.frames) {
-      const parsed = classifyFrame(payload);
-      if (parsed.kind === 'error') {
-        await emit('error', { type: 'error', error: { type: 'api_error', message: parsed.message } });
-        closed = true;
-        break;
-      }
+      for await (const payload of up.frames) {
+        const parsed = classifyFrame(payload);
+        if (parsed.kind === 'error') {
+          // 200 + 错误信封也要进号池状态机：否则同一账号既不轮换也不冷却（0.3.37）
+          reportFrameError(site, up.accountId, model, parsed);
+          await emit('error', { type: 'error', error: { type: 'api_error', message: parsed.message } });
+          closed = true;
+          break;
+        }
       if (parsed.kind !== 'chunk') continue;
       const chunk = parsed.obj;
       if (chunk.usage) usage = chunk.usage;
@@ -272,12 +282,20 @@ export async function handleMessages(ctx) {
 
       if (Array.isArray(delta.tool_calls)) {
         for (const tc of delta.tool_calls) {
-          const key = Number.isInteger(tc.index) ? tc.index : 0;
+          // 上游省略 index 时不能一律归 0（并行调用的参数会拼进同一条目）：
+          // 有 id 按 id 聚合；无 id 的裸参数帧续写最近打开的工具块。
+          // 开新工具块意味着当前文本块（若有）已关闭——必须复位 textBlockOpened，
+          // 否则其后再来正文增量会以 text_delta 写进工具块（块类型错乱）
+          const key = Number.isInteger(tc.index) ? `i${tc.index}`
+            : tc.id ? `id:${tc.id}`
+            : (lastToolKey ?? 'i0');
           let bi = toolBlocks.get(key);
           if (bi === undefined) {
             await closeBlock();
+            textBlockOpened = false;
             bi = nextBlock++;
             toolBlocks.set(key, bi);
+            lastToolKey = key;
             blockIndex = bi;
             await emit('content_block_start', {
               type: 'content_block_start',
@@ -315,9 +333,11 @@ export async function handleMessages(ctx) {
     heartbeat.stop();
     up.close();
     if (!res.writableEnded) res.end();
-    // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage
+    // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage；
+    // token 兜底用本地估算，recordUsage 的 upstreamCredit 只收上游实报（估算 0 不进观测样本）
     const credit = await estimateCredit(cfg, site, model, usage?.credit,
-      usage?.prompt_tokens ?? 0, usage?.completion_tokens ?? 0);
+      usage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
+      usage?.completion_tokens ?? Math.max(1, Math.ceil(textLen / 3)));
     requestLog({ site, model, account: up.accountId, mode: 'anthropic-stream', status: closed ? 502 : 200, ms: Date.now() - started, blocks: nextBlock, credit });
     recordUsage({
       site,
@@ -330,12 +350,21 @@ export async function handleMessages(ctx) {
       ms: Date.now() - started,
       tools: toolBlocks.size,
       account: up.accountId,
+      upstreamCredit: Number.isFinite(usage?.credit) ? usage.credit : null,
     });
   }
 }
 
 export function handleCountTokens(ctx) {
   const { body, res } = ctx;
-  const text = JSON.stringify(body.system || '') + JSON.stringify(body.messages || '') + JSON.stringify(body.tools || '');
-  sendJson(res, 200, { input_tokens: estimateTokens(text) });
+  // base64 图片数据按「3 字符 ≈ 1 token」估会膨胀几个数量级（1MB 图 ≈ 33 万 tok）。
+  // 剔掉 data 字段按纯文本估，每张图补固定 1600 tok（约 1092px 方图，Anthropic 口径的量级）。
+  const msgs = Array.isArray(body.messages) ? body.messages : [];
+  const imageCount = msgs.reduce(
+    (s, m) => s + (Array.isArray(m?.content) ? m.content.filter((b) => b?.type === 'image').length : 0),
+    0,
+  );
+  const stripped = JSON.parse(JSON.stringify(msgs).replace(/"data"\s*:\s*"[A-Za-z0-9+/=]+"/g, '"data":""'));
+  const text = JSON.stringify(body.system || '') + JSON.stringify(stripped) + JSON.stringify(body.tools || '');
+  sendJson(res, 200, { input_tokens: estimateTokens(text) + imageCount * 1600 });
 }

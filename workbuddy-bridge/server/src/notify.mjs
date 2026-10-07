@@ -31,6 +31,12 @@ export function shouldNotify(key, now = Date.now(), store = lastFired) {
   return true;
 }
 
+/** 发送失败（如 psBusy 丢气泡）时回滚节流时间戳：失败不该消耗 5 分钟的节流窗口。 */
+export function rollbackNotify(key, store = lastFired) {
+  if (!key) return;
+  store.delete(key);
+}
+
 function firePS(title, text) {
   if (process.platform !== 'win32') return false;
   if (psBusy) return false;
@@ -78,6 +84,7 @@ export function notify(cfg, title, text, { key = null, force = false, _fire = fi
     if (!force && key && !shouldNotify(key)) return false;
     const ok = _fire(title, text);
     if (ok) log(`桌面通知：${title} — ${String(text).slice(0, 80)}`);
+    else if (!force && key) rollbackNotify(key); // psBusy 丢掉的气泡不消耗节流窗口
     return ok;
   } catch {
     return false;
@@ -184,7 +191,14 @@ export function buildChannelRequest(ch, title, text) {
  * 日常通知（notifyChannels）依旧不 await 它，行为不变。
  */
 export function deliver(ch, title, text) {
-  const req = buildChannelRequest(ch, title, text);
+  let req;
+  try {
+    req = buildChannelRequest(ch, title, text);
+  } catch (e) {
+    // 构造失败的通道（如 telegram 缺 chat_id）返回自己的错误结果即可：
+    // 不能整体抛出去——「测试通知」会把其他通道的真实结果一并丢掉
+    return Promise.resolve({ type: ch.type, ok: false, error: String(e.message || e) });
+  }
   if (!req) return Promise.resolve({ type: ch.type, ok: false, error: '通道类型无法构造请求' });
   const ac = new AbortController();
   const to = setTimeout(() => ac.abort(), 10_000);

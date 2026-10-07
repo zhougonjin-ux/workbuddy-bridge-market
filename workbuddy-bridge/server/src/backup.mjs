@@ -12,6 +12,7 @@ import path from 'node:path';
 import { paths, siteKeys } from './config.mjs';
 import { poolPathFor } from './pool.mjs';
 import { log, warn } from './log.mjs';
+import { writeJsonFileAtomic } from './util.mjs';
 
 const statePath = () => path.join(paths.root, 'backup-state.json');
 
@@ -92,7 +93,9 @@ export function backupNow(cfg, { dir = null, now = new Date(), keep = null } = {
   const stamp = `${now.getFullYear()}-${p(now.getMonth() + 1)}-${p(now.getDate())}-${p(now.getHours())}${p(now.getMinutes())}`;
   const file = path.join(d, `backup-${stamp}.json`);
   const payload = { version: 1, exportedAt: now.toISOString(), files: collectBackupFiles(cfg) };
-  fs.writeFileSync(file, JSON.stringify(payload, null, 2) + '\n', 'utf8');
+  // 原子写：备份本体最怕「写一半被杀」——半截 JSON 文件名合法、滚动统计也正常，
+  // 真到恢复那天才发现是坏的
+  writeJsonFileAtomic(file, payload);
   const removed = pruneBackups(d, keep ?? cfg.backup?.keep ?? 4);
   return { file, files: Object.keys(payload.files).length, kept: keep ?? cfg.backup?.keep ?? 4, removed, bytes: fs.statSync(file).size };
 }

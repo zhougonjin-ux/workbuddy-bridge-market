@@ -1,6 +1,6 @@
 // OpenAI 兼容路由：/v1/models、/v1/chat/completions（流式 + 非流式，支持工具调用）
 // 多站点：请求里的 model 可写裸 ID（自动选站点），也可写 `站点/模型` 显式指定。
-import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId } from './upstream.mjs';
+import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId, reportFrameError } from './upstream.mjs';
 import { ensureToken } from './auth.mjs';
 import { isQuotaError } from './pool.mjs';
 import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText, effectiveSuffixText } from './router.mjs';
@@ -92,8 +92,11 @@ export async function openWithSiteFallback(cfg, target, upstreamBody, signal, op
       up = r.up;
       site = r.site;
       model = r.model;
-    } else if (cfg.pool?.switchSiteOnExhausted && target.fallback && !signal?.aborted) {
-      // 连接级失败且整站账号已耗尽 → 也换站点试一次
+    } else if (cfg.pool?.switchSiteOnExhausted && target.fallback && !signal?.aborted
+      && (e?.code === 'not_logged_in' || e?.status === 402)) {
+      // 池内账号全部耗尽/未登录（AuthError not_logged_in）或明确计费失败 → 换站点试一次。
+      // 只认这两类「额度层」异常：其他代码级异常原样抛出，别误标成「本站点账号额度不足」
+      // 去触发一次注定失败的换站并掩盖真实错误。
       const r = await openWithFallback(cfg, target, upstreamBody, signal, '本站点账号额度不足');
       up = r.up;
       site = r.site;
@@ -196,11 +199,15 @@ export async function handleChatCompletions(ctx) {
     const heartbeat = startHeartbeat(res);
     let valid = 0;
     let finished = false;
+    let sawError = false;
     let upstreamUsage = null;
     try {
       for await (const payload of up.frames) {
         const parsed = classifyFrame(payload);
         if (parsed.kind === 'error') {
+          // 200 + 错误信封也要进号池状态机：否则同一账号既不轮换也不冷却（0.3.37）
+          reportFrameError(site, up.accountId, model, parsed);
+          sawError = true;
           await writeSSE(res, JSON.stringify({ error: { message: parsed.message, type: 'upstream_error' } }));
           break;
         }
@@ -212,7 +219,8 @@ export async function handleChatCompletions(ctx) {
         if (parsed.obj.choices?.[0]?.delta?.content) contentChars += parsed.obj.choices[0].delta.content.length;
         await writeSSE(res, JSON.stringify(normalizeChunk(parsed.obj, publicModel)));
       }
-      if (valid === 0) {
+      // 信封已是真实错误就别再补一条「空流」把它盖掉（客户端常只看最后一条 error）
+      if (valid === 0 && !sawError) {
         await writeSSE(res, JSON.stringify({ error: { message: '上游返回空流', type: 'upstream_error' } }));
       }
       finished = true;
@@ -223,15 +231,20 @@ export async function handleChatCompletions(ctx) {
       if (!res.writableEnded) res.end();
       const streamMs = Date.now() - started;
       const outTok = upstreamUsage?.completion_tokens ?? estimateTokens('x'.repeat(contentChars));
-      // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage
+      // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage。
+      // token 兜底用本地估算而不是 0：上游没发 usage 帧时 (0+0)*mult 估出 0，
+      // 与「免费」无法区分；recordUsage 的 upstreamCredit 只收上游实报，估算不进观测样本。
       const credit = await estimateCredit(cfg, site, model, upstreamUsage?.credit,
-        upstreamUsage?.prompt_tokens ?? 0, upstreamUsage?.completion_tokens ?? 0);
+        upstreamUsage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
+        upstreamUsage?.completion_tokens ?? outTok);
+      // 信封错误按失败记账（与 anthropic/responses 口径一致），失败不该被统计成 200
+      const logStatus = sawError ? 502 : finished ? 200 : 499;
       requestLog({
         site,
         account: up.accountId,
         model,
         mode: 'stream',
-        status: finished ? 200 : 499,
+        status: logStatus,
         ttfb_ms: ttfb ?? '-',
         ms: streamMs,
         tok_s: outTok && streamMs > 0 ? (outTok / (streamMs / 1000)).toFixed(1) : undefined,
@@ -242,13 +255,14 @@ export async function handleChatCompletions(ctx) {
         site,
         model,
         mode: 'stream',
-        status: finished ? 200 : 499,
+        status: logStatus,
         promptTokens: upstreamUsage?.prompt_tokens ?? estimateTokens(JSON.stringify(body.messages || [])),
         completionTokens: outTok,
-        credit,
+        credit: sawError ? 0 : credit,
         ms: streamMs,
         tools,
         account: up.accountId,
+        upstreamCredit: sawError ? null : (Number.isFinite(upstreamUsage?.credit) ? upstreamUsage.credit : null),
       });
     }
     return;
@@ -259,6 +273,8 @@ export async function handleChatCompletions(ctx) {
   try {
     agg = await aggregateFrames(up.frames);
   } catch (e) {
+    // 聚合中抛出的「200+信封错误」（带业务码）同样要进号池状态机（0.3.37）
+    if (e.code != null) reportFrameError(site, up.accountId, model, { code: e.code, message: e.message });
     requestLog({ site, model, account: up.accountId, mode: 'json', status: e.status || 502, ms: Date.now() - started, note: 'aggregate_failed' });
     return sendError(res, e.status || 502, e.message);
   } finally {
@@ -303,6 +319,12 @@ export async function handleChatCompletions(ctx) {
     }));
   }
 
+  // 上游 usage 偶发缺 prompt/completion 字段：undefined 相加得 NaN，会一路污染 credit 落账
+  if (agg.usage) {
+    if (!Number.isFinite(agg.usage.prompt_tokens)) agg.usage.prompt_tokens = estimateTokens(JSON.stringify(body.messages || []));
+    if (!Number.isFinite(agg.usage.completion_tokens)) agg.usage.completion_tokens = estimateTokens(agg.content);
+    if (!Number.isFinite(agg.usage.total_tokens)) agg.usage.total_tokens = agg.usage.prompt_tokens + agg.usage.completion_tokens;
+  }
   const usage =
     agg.usage ||
     {
@@ -339,6 +361,7 @@ export async function handleChatCompletions(ctx) {
     ms: Date.now() - started,
     tools: agg.toolCallList.length,
     account: up.accountId,
+    upstreamCredit: Number.isFinite(usage.credit) ? usage.credit : null,
   });
 
   sendJson(res, 200, {
@@ -346,7 +369,13 @@ export async function handleChatCompletions(ctx) {
     object: 'chat.completion',
     created: agg.created || Math.floor(Date.now() / 1000),
     model: publicModel,
-    choices: [{ index: 0, message, finish_reason: agg.finishReason || 'stop' }],
+    choices: [{
+      index: 0,
+      message,
+      // 上游异常地以 stop/null 结束但带着工具调用时，按 tool_calls 终态回给客户端，
+      // 否则 Claude Code 等按 finish_reason 驱动的客户端不会执行工具
+      finish_reason: agg.finishReason || (agg.toolCallList.length ? 'tool_calls' : 'stop'),
+    }],
     usage,
   });
 }

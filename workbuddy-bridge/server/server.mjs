@@ -166,26 +166,34 @@ function isLoopbackHostname(hostname) {
   return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h);
 }
 
-/** 请求的 Host 是否指向本机（挡 DNS rebinding）。 */
-function hostIsLocal(req) {
-  const host = req.headers.host || '';
-  if (!host) return true; // HTTP/1.0 等无 Host 的场景，交由 Origin 判定
-  try {
-    const { hostname } = new URL(`http://${host}`);
-    return isLoopbackHostname(hostname);
-  } catch {
-    return false;
-  }
+/**
+ * Origin/Host 是否指向「本服务的回环地址 + 本服务端口」。
+ *
+ * 只比 hostname 不比端口是个洞：浏览器里 localhost:任意端口 的本地页面（开发服务器、
+ * 恶意 npm 包的本地 UI）也能通过「回环 hostname」校验，配合 401 续期响应里反射的
+ * ACAO 拿到 CONSOLE_TOKEN，进而读走全部账号 token 与 apiKey。端口必须就是本服务
+ * （控制台页面本身就跑在这个端口上，同源请求天然满足）。
+ */
+function isLocalServicePort(urlObj) {
+  if (!isLoopbackHostname(urlObj.hostname)) return false;
+  const port = urlObj.port || (urlObj.protocol === 'https:' ? '443' : '80');
+  return port === String(cfg.port);
 }
 
 /** 控制台来源是否可信。 */
 function consoleOriginAllowed(req) {
-  if (!hostIsLocal(req)) return false;
+  const host = req.headers.host || '';
+  if (host) {
+    try {
+      if (!isLocalServicePort(new URL(`http://${host}`))) return false;
+    } catch {
+      return false;
+    }
+  }
   const origin = req.headers.origin;
   if (!origin) return true; // 同源导航 / 本机工具：不带 Origin
   try {
-    const { hostname } = new URL(origin);
-    return isLoopbackHostname(hostname);
+    return isLocalServicePort(new URL(origin));
   } catch {
     return false;
   }
@@ -269,8 +277,14 @@ function isModelPath(pathname) {
 }
 
 const server = http.createServer(async (req, res) => {
-  const started = Date.now();
-  const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
+  // Host 头含 URL 非法字符（空格、| 等）时 new URL 会抛 TypeError——
+  // 包住并直接 400，否则请求处理器整体崩掉、socket 挂起（请求黑洞）。
+  let url;
+  try {
+    url = new URL(req.url, `http://${String(req.headers.host || '127.0.0.1').trim()}`);
+  } catch {
+    return sendError(res, 400, '非法 Host 头');
+  }
   const pathname = url.pathname.replace(/\/+$/, '') || '/';
 
   // ---- 活跃请求计数（不可断线保护）----
@@ -444,6 +458,11 @@ const server = http.createServer(async (req, res) => {
         // 就把 server.log 刷成 19/33 行全是噪声，真正的业务日志被淹没
         // （2026-10-04 手操实测）。前端拿到新 token 后续上，用户无感。
         // /console/api/unlock 本身不走这里（它在鉴权前单独处理），不会自激。
+        //
+        // newToken 只发给「来源可信」的请求（consoleOriginAllowed 现在还校验端口）：
+        // 对任意来源无条件下发有效 token 是鉴权旁路——本机任意端口的网页借 ACAO
+        // 反射就能拿到 token 完整接管控制台（0.3.37 修）。来源不可信就给裸 401。
+        if (!consoleOriginAllowed(req)) return sendError(res, 403, '控制台仅允许本机访问', 'console_forbidden');
         return sendJsonWith(res, 401, {
           error: { message: '控制台会话失效，正在自动续期', type: 'invalid_console_token', code: 401 },
           newToken: CONSOLE_TOKEN,
@@ -457,7 +476,7 @@ const server = http.createServer(async (req, res) => {
     // 原因：不少客户端（如 CCSM / Codex 配置向导）会裸探基础地址与模型目录来做「同步模型」，
     // 不带 Authorization。这里只返回模型名与服务信息，不含任何密钥 / token，
     // 且服务只监听本机，因此免鉴权是安全的。
-    if (req.method === 'GET' && pathname.endsWith('/models')) {
+    if (req.method === 'GET' && (pathname === '/v1/models' || pathname.endsWith('/v1/models'))) {
       res.setHeader('X-Service', 'workbuddy-proxy');
       return await handleModels({ cfg, req, res });
     }
@@ -520,7 +539,9 @@ const server = http.createServer(async (req, res) => {
 
     // ---- workbuddy-bridge 管理面（MCP 工具 / 斜杠命令共用；需要本地 API Key）----
     if (pathname === '/admin/bridge' && req.method === 'GET') {
-      return sendJson(res, 200, bridgeStatus(cfg));
+      // 与 /bridge 同口径脱敏：accessToken/refreshToken 不必流经 HTTP 响应，
+      // 余额/到期/策略信息才是调用方要的（MCP wb_status 也不该把 token 带进模型上下文）
+      return sendJson(res, 200, bridgeStatus(cfg, { redact: true }));
     }
     if (pathname === '/admin/policy' && req.method === 'POST') {
       const body = await readJsonBody(req);
@@ -677,11 +698,6 @@ const server = http.createServer(async (req, res) => {
     // 当成普通上游故障（上游错误一律塞成 upstream_error，会丢掉这个区分）。
     if (!res.headersSent && !res.writableEnded && !res.destroyed) sendError(res, status, e.message || 'internal error', e.type || 'upstream_error');
     else if (!res.writableEnded && !res.destroyed) res.end();
-  } finally {
-    if (pathname !== '/health') {
-      // 记录非健康检查请求的耗时（流式请求由各自 handler 记录明细）
-      void started;
-    }
   }
 });
 
@@ -783,9 +799,17 @@ server.listen(cfg.port, cfg.host, () => {
   importLocalAccounts(cfg, { silent: true }).catch((e) => warn('本机账号自动导入失败：', e.message));
 });
 
+let sigintCount = 0;
 process.on('SIGINT', () => {
   // 与 /admin/restart 同一条优雅退出路径：活跃请求没跑完就等（不主动断模型流量），
   // 全部跑完（或 close 超时兜底）才退出。
+  // 第二次 SIGINT 强制退出：挂着一个不结束的流式请求时优雅路径会无限等待，
+  // 用户不该被迫去任务管理器（那样连优雅刷盘都丢了）。
+  sigintCount += 1;
+  if (sigintCount > 1) {
+    error('再次收到 SIGINT，强制退出');
+    process.exit(0);
+  }
   gracefulExit({
     waitIdle: true,
     reason: '收到退出信号',

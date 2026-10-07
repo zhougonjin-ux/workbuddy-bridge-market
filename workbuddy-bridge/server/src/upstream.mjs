@@ -70,10 +70,13 @@ export function stripClientFingerprint(messages, fallbackPrompt) {
   return 改动数;
 }
 
-/** 上游请求体改写：强制流式 + 首条必须为 system + 角色/工具选择归一 + 剔除配置中要求剔除的字段。 */
+/** 上游请求体改写：强制流式 + 首条必须为 system + 角色/工具选择归一 + 剔除配置中要求剔除的字段。
+ *  messages 做一层元素拷贝：本函数会原地改写 role/content，不拷贝的话调用方复用入参做
+ *  空回答重试时拿到的是被改写过的消息（隐蔽的共享耦合）。 */
 export function prepareBody(cfg, src) {
   const body = { ...src };
   body.stream = true;
+  if (Array.isArray(body.messages)) body.messages = body.messages.map((m) => (m && typeof m === 'object' ? { ...m } : m));
 
   // 上游 role 白名单里没有 developer，等价改写为 system
   if (Array.isArray(body.messages)) {
@@ -450,8 +453,11 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
     // 压缩后重试仍会失败，最终照样把上游的原始错误如实抛给客户端。
     const 可能是超限 = isProviderParamRejection(text);
     if (!isTooLongError(res.status, text) && !可能是超限) {
-      // 不是「太长」，把读掉的 body 还原成一个可返回的结果
-      res = { status: res.status, _text: text };
+      // 不是「太长」，把读掉的 body 还原成一个可返回的结果。
+      // ⚠️ headers 必须保留：下面 res.status>=400 分支要读 Retry-After——
+      // 合成对象丢了 headers 会对所有非「太长」错误（401/402/429/5xx）抛 TypeError，
+      // 整条账号轮换/限流冷却/换站链路被短路（0.3.37 修）
+      res = { status: res.status, _text: text, headers: res.headers };
       break;
     }
 
@@ -594,6 +600,27 @@ export function classifyFrame(payload) {
   return { kind: 'chunk', obj };
 }
 
+/**
+ * 把 200 + 错误信封上报进号池状态机（三个协议入口共用）。
+ *
+ * 为什么需要：markSuccess 在上游 <400 时就清空了失败计数，而上游会把 14003 限流 /
+ * 14018 额度耗尽包在 200 的 JSON 信封里发回来——信封错误不进状态机的话，同一账号
+ * 既不轮换也不冷却，后续每个请求都完整付一次往返后在流中失败，只能等余额轮询兜底。
+ * message 里嵌 JSON 形态业务码：markFailure 的限流/额度分类（businessCode）靠
+ * "code":14003 这类片段裁决该记限流冷却还是耗尽。
+ */
+export function reportFrameError(site, accountId, model, parsed) {
+  if (!accountId) return;
+  try {
+    const codePart = parsed?.code != null ? `{"code":${Number(parsed.code)}}` : '';
+    markFailure(site, accountId, {
+      status: 0,
+      message: `${codePart}${parsed?.message || '上游错误信封'}`,
+      model,
+    });
+  } catch { /* 状态机是旁观者，绝不能绊倒响应路径 */ }
+}
+
 /** 聚合上游流为单个完整回复（供非流式客户端使用）。 */
 export async function aggregateFrames(frames) {
   const out = {
@@ -629,7 +656,22 @@ export async function aggregateFrames(frames) {
     if (typeof delta.reasoning_content === 'string') out.reasoning += delta.reasoning_content;
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
-        const idx = Number.isInteger(tc.index) ? tc.index : 0;
+        let idx = Number.isInteger(tc.index) ? tc.index : null;
+        if (idx === null) {
+          // 上游省略 index 时不能一律归 0：并行调用的参数串会拼进同一条目产生非法 JSON。
+          // 先按 id 找已有条目续写；找不到且带新 id 就开新槽位（保持出现顺序）。
+          // 无 id 的裸参数帧续写最近一个槽位——上游存在「首帧带 id、后续裸参数帧」的
+          // 形态（与 anthropic 流式的 lastToolKey 同一观察），拆开会把一次调用碎成两次。
+          if (tc.id) {
+            for (const [k, v] of out.toolCalls) {
+              if (v.id === tc.id) { idx = k; break; }
+            }
+            if (idx === null) idx = out.toolCalls.size;
+          } else {
+            const keys = [...out.toolCalls.keys()];
+            idx = keys.length ? keys[keys.length - 1] : 0;
+          }
+        }
         const cur = out.toolCalls.get(idx) || { id: '', type: 'function', function: { name: '', arguments: '' } };
         if (tc.id) cur.id = tc.id;
         if (tc.type) cur.type = tc.type;
@@ -721,10 +763,15 @@ export async function fetchModelsRaw(cfg, site) {
   } catch (e) {
     throw new UpstreamError(`[${site}] 模型接口请求失败（${describeFetchFailure(e, timeoutMs)}）`, { status: 504, transport: true, site });
   }
+  if (res.status !== 200) {
+    // 非 200（404 HTML、网关错误页等）是「端点不可用」，不是「协议漂移」——
+    // 显式抛带状态的错误，让协议自检把它归入「探针失败跳过」而不是误报漂移
+    throw new UpstreamError(`[${site}] 模型接口 HTTP ${res.status}：${text.slice(0, 200)}`, { status: res.status, site });
+  }
   try {
     return JSON.parse(text);
   } catch {
-    throw new UpstreamError(`[${site}] 模型接口返回无法解析（HTTP ${res.status}）`, { status: 502, site });
+    throw new UpstreamError(`[${site}] 模型接口返回无法解析`, { status: 502, site });
   }
 }
 
@@ -755,8 +802,13 @@ export async function fetchV3ConfigRaw(cfg, site) {
     const json = JSON.parse(text);
     json.__wantModel = cfg.defaultModel || '';
     return json;
-  } catch {
-    throw new UpstreamError(`[${site}] v3/config 返回无法解析（HTTP ${res.status}）`, { status: 502, site });
+  } catch (e) {
+    if (e instanceof UpstreamError) throw e;
+    if (res.status !== 200) {
+      // 非 200 是「端点不可用」而非「协议漂移」，让协议自检归入探针失败跳过
+      throw new UpstreamError(`[${site}] v3/config HTTP ${res.status}：${text.slice(0, 200)}`, { status: res.status, site });
+    }
+    throw new UpstreamError(`[${site}] v3/config 返回无法解析`, { status: 502, site });
   }
 }
 
@@ -794,7 +846,11 @@ export async function fetchModels(cfg, site) {
       timeoutMs,
       headers: { ...chatHeaders(siteCfg, auth), Accept: 'application/json' },
     });
-    if (r.res.status === 200) v3 = JSON.parse(await r.text());
+    if (r.res.status === 200) {
+      v3 = JSON.parse(await r.text());
+    } else {
+      r.dispose?.(); // 非 200 不读 body：显式释放，别让 30s 超时定时器悬挂
+    }
   } catch { /* 降级为企业目录 */ }
   let res, text;
   try {

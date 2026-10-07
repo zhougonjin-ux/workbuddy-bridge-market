@@ -29,7 +29,13 @@ async function api(cfg, site, method, url, { body, token } = {}) {
   if (body) headers['Content-Type'] = 'application/json';
   if (jar.size) headers.Cookie = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
   if (token) headers.Authorization = 'Bearer ' + token;
-  const res = await fetch(url, { method, headers, body: body ? JSON.stringify(body) : undefined });
+  const res = await fetch(url, {
+    method,
+    headers,
+    body: body ? JSON.stringify(body) : undefined,
+    // 本分片其余上游调用都有 15~20s 超时，这里不能裸奔：上游挂起会占死控制台请求
+    signal: AbortSignal.timeout(15_000),
+  });
   storeCookies(site, res);
   const text = await res.text();
   let json = null;
@@ -59,7 +65,9 @@ export async function pollLogin(cfg, site, state, { label = null } = {}) {
   const res = await api(cfg, site, 'GET', siteCfg.apiBase + '/v2/plugin/auth/token?state=' + encodeURIComponent(state));
   const data = res.json?.data;
   if (!(res.status < 400 && res.json?.code === 0 && data?.accessToken)) {
-    return { done: false, msg: res.json?.msg || res.text || `HTTP ${res.status}` };
+    // msg 截断：上游 502 的整页 HTML 原样流进 MCP 工具输出会是一大坨噪音
+    const raw = res.json?.msg || res.text || `HTTP ${res.status}`;
+    return { done: false, msg: String(raw).slice(0, 200) };
   }
 
   const auth = {

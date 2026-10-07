@@ -15,6 +15,9 @@
 //   round-robin   最久未用的先用（上游开源代理的默认行为）
 //   pinned        固定使用 pool.pinnedAccountId 指定的账号，不可用时回落 expiry-first
 
+/** 额度耗尽后多久重新尝试（额度可能已重置）。默认 6 小时。pool.mjs 的 isUsable 同源。 */
+export const EXHAUST_TTL_MS = 6 * 60 * 60 * 1000;
+
 /** 上游到期时间候选字段（按优先级）。 */
 const UPSTREAM_END_FIELDS = ['CycleEndTime', 'PackageEndTime', 'ExpiredTime', 'EndTime'];
 
@@ -118,7 +121,7 @@ export function orderAccounts(accounts, { policy = 'expiry-first', pinnedAccount
   const list = Array.isArray(accounts) ? [...accounts] : [];
   if (!list.length) return list;
 
-  const exhaustedRank = (a, t) => (a.exhaustedAt && t - a.exhaustedAt < 6 * 60 * 60 * 1000 ? 1 : 0);
+  const exhaustedRank = (a, t) => (a.exhaustedAt && t - a.exhaustedAt < EXHAUST_TTL_MS ? 1 : 0);
 
   const byStability = (a, b) => {
     const ea = exhaustedRank(a, now);

@@ -1,6 +1,7 @@
 // HTTP 小工具：请求体读取、响应写出（含背压）、SSE 帧写出。
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 export const MAX_BODY = 16 * 1024 * 1024;
 
@@ -12,10 +13,18 @@ export const MAX_BODY = 16 * 1024 * 1024;
  * 相当于一个崩溃就把用户全部登录凭证清掉了。rename 在同一目录内是原子的。
  */
 export function writeJsonFileAtomic(file, data, { mode } = {}) {
-  const tmp = file + '.tmp';
+  // tmp 名带 pid+随机后缀：常驻服务与 login.mjs/控制台是不同进程，共享固定 tmp 名时
+  // 并发写同一文件会互相截断，交错内容被 rename 成正式文件——账号池会整站损坏。
+  // 唯一名 + 同目录 rename 原子替换，把「跨进程并发写」也变成安全的。
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
   const opts = mode ? { encoding: 'utf8', mode } : 'utf8';
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', opts);
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', opts);
+    fs.renameSync(tmp, file);
+  } catch (e) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* 尽力清理残留 tmp */ }
+    throw e;
+  }
 }
 
 /**
@@ -97,7 +106,17 @@ export function writeAsync(res, chunk) {
   return new Promise((resolve) => {
     const ok = res.write(chunk);
     if (ok) resolve(true);
-    else res.once('drain', () => resolve(true));
+    else {
+      // 背压期间客户端断开时 drain 永远不会来，必须同时监听 close，
+      // 否则 await writeAsync 的流式协程永久挂起，连同上游响应缓冲一起泄漏。
+      const onClose = () => resolve(false);
+      const onDrain = () => {
+        res.removeListener('close', onClose); // drain 先到时把 close 监听摘掉，别给慢客户端攒监听器
+        resolve(true);
+      };
+      res.once('close', onClose);
+      res.once('drain', onDrain);
+    }
   });
 }
 

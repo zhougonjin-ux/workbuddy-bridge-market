@@ -26,7 +26,9 @@ const labelIdx = args.indexOf('--label');
 const label = labelIdx >= 0 ? args[labelIdx + 1] : null;
 const autoOpen = !args.includes('--no-open');
 const listOnly = args.includes('--list');
-const timeoutSec = Number(args.find((a) => /^\d+$/.test(a)) || 600);
+// 只认 --timeout N 形式：裸数字会跟 --label 123 这类取值静默耦合
+const timeoutIdx = args.indexOf('--timeout');
+const timeoutSec = timeoutIdx >= 0 ? (Number(args[timeoutIdx + 1]) || 600) : 600;
 const POLL_MS = 3000;
 
 /** --list：不登录，只把各站点号池现状打出来。 */
@@ -56,7 +58,9 @@ const site = cfg.sites[siteKey];
 function openBrowser(url) {
   try {
     if (process.platform === 'win32') {
-      spawn('cmd', ['/c', 'start', '""', url], { detached: true, stdio: 'ignore' }).unref();
+      // rundll32 直调不经过 cmd 的解析：`start ""` 形态下 URL 里的 & 会把命令截成两半，
+      // 浏览器拿到的是丢了 query 参数的链接，设备授权必然失败
+      spawn('rundll32', ['url.dll,FileProtocolHandler', url], { detached: true, stdio: 'ignore' }).unref();
     } else if (process.platform === 'darwin') {
       spawn('open', [url], { detached: true, stdio: 'ignore' }).unref();
     } else {
@@ -95,40 +99,51 @@ async function main() {
   const deadline = Date.now() + timeoutSec * 1000;
   let dots = 0;
   let lastMsg = '';
-  while (Date.now() < deadline) {
-    await sleep(POLL_MS);
-    const r = await pollLogin(cfg, siteKey, state, { label });
-    if (r.done) {
+  try {
+    while (Date.now() < deadline) {
+      await sleep(POLL_MS);
+      let r;
       try {
-        fs.unlinkSync(paths.loginState);
-      } catch {
-        /* 忽略 */
+        r = await pollLogin(cfg, siteKey, state, { label });
+      } catch (e) {
+        // 600 秒窗口内上游一次网络抖动不该报废整个登录流程：记一下继续轮
+        warn(`轮询失败（忽略重试）：${e.message}`);
+        continue;
       }
-      const saved = r.auth;
-      const claims = jwtClaims(saved.accessToken) || {};
-      const 池 = accountSnapshot(siteKey);
-      console.log('');
-      log(`登录成功 ✅  （站点 ${siteKey}）`);
-      log(`  账号：${saved.label || saved.nickname || saved.id}`);
-      log(`  uid：${saved.uid || claims.sub || '未知'}`);
-      log(`  昵称：${saved.nickname || '未知'}`);
-      log(`  企业/域：${saved.enterpriseId || '未知'} / ${saved.domain || '未知'}`);
-      log(`  token 过期时间：${saved.expiresAt ? new Date(saved.expiresAt).toLocaleString() : '未知'}`);
-      log(`  已写入号池：${poolPathFor(siteKey)}`);
-      log(`  该站点现有 ${池.length} 个账号：${池.map((a) => a.label).join('、')}`);
-      return;
+      if (r.done) {
+        const saved = r.auth;
+        const claims = jwtClaims(saved.accessToken) || {};
+        const 池 = accountSnapshot(siteKey);
+        console.log('');
+        log(`登录成功 ✅  （站点 ${siteKey}）`);
+        log(`  账号：${saved.label || saved.nickname || saved.id}`);
+        log(`  uid：${saved.uid || claims.sub || '未知'}`);
+        log(`  昵称：${saved.nickname || '未知'}`);
+        log(`  企业/域：${saved.enterpriseId || '未知'} / ${saved.domain || '未知'}`);
+        log(`  token 过期时间：${saved.expiresAt ? new Date(saved.expiresAt).toLocaleString() : '未知'}`);
+        log(`  已写入号池：${poolPathFor(siteKey)}`);
+        log(`  该站点现有 ${池.length} 个账号：${池.map((a) => a.label).join('、')}`);
+        return;
+      }
+      const msg = r.msg || '';
+      if (msg !== lastMsg) {
+        lastMsg = msg;
+        process.stdout.write(`\n等待授权…（上游：${String(msg).slice(0, 80)}）\n`);
+        dots = 0;
+      } else {
+        process.stdout.write('.');
+        if (++dots % 40 === 0) process.stdout.write('\n');
+      }
     }
-    const msg = r.msg || '';
-    if (msg !== lastMsg) {
-      lastMsg = msg;
-      process.stdout.write(`\n等待授权…（上游：${String(msg).slice(0, 80)}）\n`);
-      dots = 0;
-    } else {
-      process.stdout.write('.');
-      if (++dots % 40 === 0) process.stdout.write('\n');
+    throw new Error(`等待超时（${timeoutSec}s）：请重新运行 node login.mjs --site ${siteKey}`);
+  } finally {
+    // 成功/超时/异常都清理登录状态文件（里面带着 state 的授权链接，留着没有意义）
+    try {
+      fs.unlinkSync(paths.loginState);
+    } catch {
+      /* 本来就不存在 */
     }
   }
-  throw new Error(`等待超时（${timeoutSec}s）：请重新运行 node login.mjs --site ${siteKey}`);
 }
 
 main().catch((e) => {

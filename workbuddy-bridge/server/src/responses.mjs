@@ -8,7 +8,7 @@
 // 设计原则：只新增，不改动 /v1/chat/completions 的任何既有行为。
 import { resolveTarget } from './router.mjs';
 import { openWithSiteFallback } from './openai.mjs';
-import { openChat, openChatRotating, classifyFrame, upstreamErrorMessage } from './upstream.mjs';
+import { openChat, openChatRotating, classifyFrame, upstreamErrorMessage, reportFrameError } from './upstream.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
 import { startSSE, writeSSEEvent, sendJson, sendError, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
@@ -65,8 +65,10 @@ export function toChatRequest(body) {
           function: { name: item.name || '', arguments: item.arguments || '{}' },
         };
         const last = messages[messages.length - 1];
-        if (last && last.role === 'assistant' && Array.isArray(last.tool_calls) && last.content === null) {
-          last.tool_calls.push(call); // 并入上一条 assistant
+        // 合并进上一条 assistant（保留其文本）：模型的常见输出就是「分析文字 + 并行工具调用」，
+        // 若拆成相邻两条 assistant，上游会报 tool calls and tool results do not match
+        if (last && last.role === 'assistant' && Array.isArray(last.tool_calls)) {
+          last.tool_calls.push(call);
         } else {
           messages.push({ role: 'assistant', content: null, tool_calls: [call] });
         }
@@ -103,7 +105,7 @@ export function toChatRequest(body) {
     messages.unshift({ role: 'system', content: 'You are a helpful AI assistant.' });
   }
 
-  const chat = { messages, stream: body.stream !== false };
+  const chat = { messages, stream: body.stream === true }; // Responses API 规范：stream 缺省为 false
 
   // 模型由调用方注入
   if (body.model) chat.model = body.model;
@@ -167,7 +169,7 @@ function normalizeContent(content) {
 }
 
 /** 组装一个完整的 Responses 对象（供非流式与流式收尾共用）。 */
-function buildResponse({ id, model, status, output, usage, createdAt, reasoning }) {
+function buildResponse({ id, model, status, output, usage, createdAt, reasoning, error }) {
   return {
     id,
     object: 'response',
@@ -182,7 +184,8 @@ function buildResponse({ id, model, status, output, usage, createdAt, reasoning 
     tool_choice: 'auto',
     tools: [],
     usage: usage || null,
-    error: null,
+    // failed 响应必须带 error 详情，否则客户端无从得知失败原因
+    error: error || null,
     incomplete_details: null,
     instructions: null,
     metadata: {},
@@ -254,7 +257,10 @@ function toUsage(u) {
 export async function handleResponses(ctx) {
   const { cfg, res, body, signal } = ctx;
   const started = Date.now();
-  const wantsStream = body.stream !== false;
+  // Responses API 规范：stream 缺省为 false（与 openai/anthropic 两个入口同口径）。
+  // toChatRequest 里的 chat.stream 会被 prepareBody 无条件覆盖成 true，真正决定
+  // 客户端形态的是这里——之前修复点落错了位置，缺省客户端一直收到 SSE。
+  const wantsStream = body.stream === true;
 
   // 回显给客户端用的思考强度配置。原样透传请求里的值（客户端自己发的最准），
   // 没有就回 null —— 客户端据此显示「思考强度」。
@@ -287,7 +293,8 @@ export async function handleResponses(ctx) {
     try {
       agg = await aggregateFrames(up.frames);
     } catch (e) {
-      up.close();
+      // 200+信封错误（带业务码）进号池状态机（0.3.37）
+      if (e.code != null) reportFrameError(site, up.accountId, model, { code: e.code, message: e.message });
       return sendError(res, e.status || 502, e.message);
     } finally {
       up.close();
@@ -305,6 +312,7 @@ export async function handleResponses(ctx) {
       ms: Date.now() - started,
       tools: agg.toolCallList.length,
       account: up.accountId,
+      upstreamCredit: Number.isFinite(agg.usage?.credit) ? agg.usage.credit : null,
     });
 
     return sendJson(
@@ -343,7 +351,25 @@ export async function handleResponses(ctx) {
   let reasoningItemId = null;
   let reasoningOpened = false;
   let reasoningDone = false;
-  const toolItems = new Map(); // index → { id, call_id, name, args }
+  let streamFailed = false; // 上游发回错误信封：response.failed 已发，收尾不能再发 response.completed
+  const toolItems = new Map(); // 上游 index → { id, call_id, name, args, output_index }
+
+  /** 收尾当前打开的 reasoning 项（占用当前 outputIndex 并让它让位）。 */
+  const closeReasoning = async () => {
+    if (!(reasoningOpened && !reasoningDone)) return;
+    await emit('response.reasoning_summary_text.done', {
+      item_id: reasoningItemId,
+      output_index: outputIndex,
+      summary_index: 0,
+      text: reasoningText,
+    });
+    await emit('response.output_item.done', {
+      output_index: outputIndex,
+      item: { type: 'reasoning', id: reasoningItemId, summary: [{ type: 'summary_text', text: reasoningText }] },
+    });
+    reasoningDone = true;
+    outputIndex++;
+  };
 
   try {
     await emit('response.created', {
@@ -356,6 +382,9 @@ export async function handleResponses(ctx) {
     for await (const payload of up.frames) {
       const parsed = classifyFrame(payload);
       if (parsed.kind === 'error') {
+        // 错误信封进号池状态机（0.3.37）；failed 已是终态，收尾不能再发 response.completed
+        streamFailed = true;
+        reportFrameError(site, up.accountId, model, parsed);
         await emit('response.failed', {
           response: buildResponse({
             id: responseId,
@@ -364,6 +393,10 @@ export async function handleResponses(ctx) {
             output: [],
             usage: null,
             reasoning: reasoningEcho,
+            error: {
+              code: parsed.code != null ? String(parsed.code) : 'upstream_error',
+              message: parsed.message,
+            },
           }),
         });
         break;
@@ -399,20 +432,7 @@ export async function handleResponses(ctx) {
       if (typeof delta.content === 'string' && delta.content) {
         if (!textOpened) {
           // 正文开始前，先把 reasoning 项收尾并让出 output_index
-          if (reasoningOpened && !reasoningDone) {
-            await emit('response.reasoning_summary_text.done', {
-              item_id: reasoningItemId,
-              output_index: outputIndex,
-              summary_index: 0,
-              text: reasoningText,
-            });
-            await emit('response.output_item.done', {
-              output_index: outputIndex,
-              item: { type: 'reasoning', id: reasoningItemId, summary: [{ type: 'summary_text', text: reasoningText }] },
-            });
-            reasoningDone = true;
-            outputIndex++;
-          }
+          await closeReasoning();
           textItemId = rid('msg');
           await emit('response.output_item.added', {
             output_index: outputIndex,
@@ -455,14 +475,28 @@ export async function handleResponses(ctx) {
           textDone = true;
         }
 
+        // 推理项还开着的话先收尾：否则 reasoning 与第一个 function_call 的
+        // added 事件会撞同一个 output_index（「先推理后直接调工具」是最常见回合）
+        await closeReasoning();
+
         for (const tc of delta.tool_calls) {
-          const idx = Number.isInteger(tc.index) ? tc.index : 0;
+          // 上游省略 index 时不能一律归 0（并行调用会并进同一条目产生非法 JSON）：
+          // 有 id 按 id 聚合；无 id 的裸参数帧续写最近一个工具项（与 aggregateFrames /
+          // anthropic 流式的同一观察对齐：首帧带 id、后续裸参数帧是同一调用）
+          const keys = [...toolItems.keys()];
+          const idx = Number.isInteger(tc.index) ? tc.index
+            : tc.id ? (keys.find((k) => toolItems.get(k).call_id === tc.id || toolItems.get(k).upstreamId === tc.id) ?? `id:${tc.id}`)
+            : (keys.length ? keys[keys.length - 1] : 0);
           let cur = toolItems.get(idx);
           if (!cur) {
             cur = { id: rid('fc'), call_id: tc.id || rid('call'), name: tc.function?.name || '', args: '' };
+            if (tc.id) cur.upstreamId = tc.id;
+            // 每个工具项独占一个 output_index 槽位：added/delta/done 全程用同一个值，
+            // 不再出现 done 索引比 added 大 1 的错位
+            cur.output_index = outputIndex++;
             toolItems.set(idx, cur);
             await emit('response.output_item.added', {
-              output_index: outputIndex + idx,
+              output_index: cur.output_index,
               item: {
                 type: 'function_call',
                 id: cur.id,
@@ -478,12 +512,18 @@ export async function handleResponses(ctx) {
             cur.args += tc.function.arguments;
             await emit('response.function_call_arguments.delta', {
               item_id: cur.id,
-              output_index: outputIndex + idx,
+              output_index: cur.output_index,
               delta: tc.function.arguments,
             });
           }
         }
       }
+    }
+
+    // 上游发了错误信封时 response.failed 已经发过：终态之后不能再发 item 级
+    // done/completed 事件（客户端状态机行为未定义），失败流直接跳过全部收尾
+    if (streamFailed) {
+      return;
     }
 
     // 正文收尾
@@ -512,25 +552,14 @@ export async function handleResponses(ctx) {
     // 工具项收尾
     const finalOutput = [];
 
-    // 兜底：若从未出现正文，reasoning 项可能仍处于打开状态，先收尾
-    if (reasoningOpened && !reasoningDone) {
-      await emit('response.reasoning_summary_text.done', {
-        item_id: reasoningItemId,
-        output_index: outputIndex,
-        summary_index: 0,
-        text: reasoningText,
-      });
-      await emit('response.output_item.done', {
-        output_index: outputIndex,
-        item: { type: 'reasoning', id: reasoningItemId, summary: [{ type: 'summary_text', text: reasoningText }] },
-      });
-      reasoningDone = true;
+    // 兜底：若从未出现正文/工具，reasoning 项可能仍处于打开状态，先收尾
+    await closeReasoning();
+    if (reasoningDone) {
       finalOutput.push({
         type: 'reasoning',
         id: reasoningItemId,
         summary: [{ type: 'summary_text', text: reasoningText }],
       });
-      outputIndex++;
     }
 
     if (textOpened) {
@@ -542,14 +571,14 @@ export async function handleResponses(ctx) {
         content: [{ type: 'output_text', text: contentText, annotations: [] }],
       });
     }
-    for (const [, cur] of [...toolItems.entries()].sort((a, b) => a[0] - b[0])) {
+    for (const [, cur] of [...toolItems.entries()].sort((a, b) => a[1].output_index - b[1].output_index)) {
       await emit('response.function_call_arguments.done', {
         item_id: cur.id,
-        output_index: outputIndex,
+        output_index: cur.output_index,
         arguments: cur.args,
       });
       await emit('response.output_item.done', {
-        output_index: outputIndex,
+        output_index: cur.output_index,
         item: {
           type: 'function_call',
           id: cur.id,
@@ -567,22 +596,25 @@ export async function handleResponses(ctx) {
         arguments: cur.args,
         status: 'completed',
       });
-      outputIndex++;
     }
 
-    const usage = toUsage(upstreamUsage);
-    finished = true;
+    // 上游发了错误信封时 response.failed 已经发过：同一流里再发 response.completed
+    // 是双终态（客户端状态机行为未定义），且失败不该被记成 200
+    if (!streamFailed) {
+      const usage = toUsage(upstreamUsage);
+      finished = true;
 
-    await emit('response.completed', {
-      response: buildResponse({
-        id: responseId,
-        model: requestModel,
-        status: 'completed',
-        output: finalOutput,
-        usage,
-        reasoning: reasoningEcho,
-      }),
-    });
+      await emit('response.completed', {
+        response: buildResponse({
+          id: responseId,
+          model: requestModel,
+          status: 'completed',
+          output: finalOutput,
+          usage,
+          reasoning: reasoningEcho,
+        }),
+      });
+    }
   } catch (e) {
     warn(`[${site}] Responses 流式转换异常：${e?.message || e}`);
   } finally {
@@ -591,7 +623,8 @@ export async function handleResponses(ctx) {
     if (!res.writableEnded) res.end();
     // credit 先算好同时喂给 requestLog（T9 异常检测要请求级消耗）与 recordUsage
     const credit = await estimateCredit(cfg, site, model, upstreamUsage?.credit,
-      upstreamUsage?.prompt_tokens ?? 0, upstreamUsage?.completion_tokens ?? 0);
+      upstreamUsage?.prompt_tokens ?? estimateTokens(JSON.stringify(chatReq.messages || [])),
+      upstreamUsage?.completion_tokens ?? estimateTokens('x'.repeat(contentChars)));
     requestLog({
       site,
       account: up.accountId,
@@ -612,6 +645,7 @@ export async function handleResponses(ctx) {
       ms: Date.now() - started,
       tools: toolItems.size,
       account: up.accountId,
+      upstreamCredit: Number.isFinite(upstreamUsage?.credit) ? upstreamUsage.credit : null,
     });
   }
 }

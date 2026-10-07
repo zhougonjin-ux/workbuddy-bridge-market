@@ -110,13 +110,32 @@ export function buildModelRule(m) {
  * 返回 'written' | 'unchanged'；结构不合法的现存文件不动（那是应用恢复逻辑的事）。
  */
 export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
-  let doc;
+  // 读文件时区分「不存在」与「存在但读不了/解析不了」：后者绝不能整份重建——
+  // ZCode 自己也在写这个文件（共享锁/半截写入），整份重建会把用户的其他供应商
+  // 条目连同 apiKey 一起抹掉。跳过本轮，等下一轮 30 分钟后再试。
+  let raw;
   try {
-    doc = JSON.parse(fs.readFileSync(target, 'utf8'));
+    raw = fs.readFileSync(target, 'utf8');
+  } catch (e) {
+    if (e.code !== 'ENOENT') {
+      console.warn(`[workbuddy-bridge] provider_config.json 读取失败，本轮跳过同步：${e.message}`);
+      return 'skipped';
+    }
+    raw = null; // 文件确实不存在：首次注册，以空 doc 起步
+  }
+  let doc;
+  if (raw === null) {
+    doc = { schemaVersion: 1, config: {} };
+  } else {
+    try {
+      doc = JSON.parse(raw);
+    } catch {
+      // 解析失败（用户手改坏了）：结构不合法的现存文件不动（那是应用恢复逻辑的事）
+      console.warn('[workbuddy-bridge] provider_config.json 解析失败，本轮跳过同步（文件保持原样）');
+      return 'skipped';
+    }
     if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return 'skipped';
     if (!doc.config || typeof doc.config !== 'object' || Array.isArray(doc.config)) doc.config = {};
-  } catch {
-    doc = { schemaVersion: 1, config: {} };
   }
   const cfgRoot = doc.config;
   doc.schemaVersion = 1;
@@ -130,6 +149,12 @@ export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
   const keptRules = providerRules.filter((r) => r?.providerId !== PROVIDER_ID);
 
   const modelIds = models.map((m) => m.id);
+  if (modelIds.length === 0 && Array.isArray(previous?.config?.personalModelIds) && previous.config.personalModelIds.length > 0) {
+    // 这轮一个模型都拉不到，但已注册过旧清单：整体保留旧状态直接返回——
+    // 否则会「模型列在 personalModelIds 里、modelConfigRules 却被清空」，
+    // 编译规则缺失导致模型回退内置默认行为，直到下次成功同步才自愈
+    return 'unchanged';
+  }
   const personalModelIds = modelIds.length > 0
     ? modelIds
     : (Array.isArray(previous?.config?.personalModelIds) ? previous.config.personalModelIds : []);

@@ -78,7 +78,8 @@ async function fetchLatest() {
 export async function checkForUpdate() {
   const local = localVersion();
   if (cache && Date.now() - cache.at < CHECK_INTERVAL_MS) {
-    return { checkedAt: new Date(cache.at).toISOString(), local, latest: cache.latest, updateAvailable: cache.updateAvailable, note: cache.note || null };
+    // checkedAt 用缓存里存的真实时间（cache.at 可能是失败缓存回拨过的，展示会误导）
+    return { checkedAt: cache.checkedAt || new Date(cache.at).toISOString(), local, latest: cache.latest, updateAvailable: cache.updateAvailable, note: cache.note || null };
   }
   let result;
   try {
@@ -94,8 +95,10 @@ export async function checkForUpdate() {
     cache = { at: Date.now(), ...result };
     if (result.updateAvailable) log(`发现新版本：v${latest}（当前 v${local}）—— 在 ZCode 插件市场「刷新市场 → 浏览插件」里更新`);
   } catch (e) {
-    // 网络/仓库不可达：不缓存失败结果（下次请求再试），静默降级
+    // 网络/仓库不可达（GitHub 类域名被墙很常见）：失败结果缓存 10 分钟——
+    // 不缓存的话三源串行 × 8s 超时会让每次「检查更新」的管理请求阻塞约 24s
     result = { checkedAt: new Date().toISOString(), local, latest: null, updateAvailable: false, note: String(e.message || e).slice(0, 120) };
+    cache = { at: Date.now() - (CHECK_INTERVAL_MS - 10 * 60_000), ...result };
   }
   return result;
 }

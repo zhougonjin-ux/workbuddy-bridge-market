@@ -134,3 +134,15 @@ test('v3config 签名：无 v3config 样本时判漂移（探针失败会带 err
   const v3 = r.results.find((x) => x.key === 'v3config.cli.models');
   assert.equal(v3.ok, false);
 });
+
+test('v3config 探针失败时签名跳过、不计漂移（0.3.37：端点不可用 ≠ 协议漂移）', () => {
+  const r = evaluateSignatures({ v3configFailed: 'HTTP 404：Not Found' });
+  const v3 = r.results.find((x) => x.key === 'v3config.cli.models');
+  assert.equal(v3.skipped, true, '应标记 skipped');
+  assert.equal(v3.ok, true, '跳过的签名按通过计');
+  assert.equal(r.drifted, 5, '其他域没样本仍判漂移（v3config 之外的 5 条）');
+  // 全部探针域都失败 → 没有任何签名被判漂移（整站探针不可用 ≠ 协议漂移）
+  const all = evaluateSignatures({ modelsFailed: '网络超时', creditFailed: 'HTTP 403', v3configFailed: 'HTTP 403' });
+  assert.equal(all.drifted, 0);
+  assert.equal(all.skipped, all.total);
+});
