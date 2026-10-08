@@ -4,14 +4,20 @@
       {
         "hooks": [
           {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/ensure-server.mjs\"",
-            "timeout": 15
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/ensure-server.mjs"
+            ],
+            "timeoutMs": 15000
           },
           {
-            "type": "command",
-            "command": "node \"${CLAUDE_PLUGIN_ROOT}/hooks/sync-provider.mjs\"",
-            "timeout": 15
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/sync-provider.mjs"
+            ],
+            "timeoutMs": 15000
           }
         ]
       }

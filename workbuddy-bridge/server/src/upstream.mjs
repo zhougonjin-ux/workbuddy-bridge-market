@@ -3,6 +3,8 @@
 //   - SSE 读取（带首字节/空闲超时，客户端断开即中止）
 //   - 模型清单（含积分倍率）、额度查询
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { getAuth, ensureToken } from './auth.mjs';
 import { markSuccess, markFailure, isQuotaError, isRateLimitError, usableCount, listModelCooldownAccounts } from './pool.mjs';
 import {
@@ -21,6 +23,7 @@ import {
 } from './compress.mjs';
 import { chatHeaders, billingHeaders } from './headers.mjs';
 import { normalizeCreditDetail } from './expiry.mjs';
+import { paths } from './config.mjs';
 import { warn } from './log.mjs';
 import { waitForUpstreamSlot, reportUpstream429 } from './coordination.mjs';
 
@@ -38,33 +41,78 @@ import { waitForUpstreamSlot, reportUpstream429 } from './coordination.mjs';
  * 已知影响面：Claude Code、以及 Claude desktop 的 /code 面板（开头就是这句话）。
  * Claude desktop 的 /cowork 面板提示词不同，所以同一账号下 /cowork 正常、/code 报 400。
  *
- * 只剥离命中的那一句，system 提示词的其余内容原样保留，不改动用户的实质指令。
+ * 第二条指纹（2026-10-08 加，cn-cli 二分定位）：Claude Code 风格 gitStatus 段里的
+ *   "Main branch (you will usually use this for PRs)"。ZCode 等客户端复刻了这句原话，
+ *   于是所有「带 git 仓库上下文」的请求全军覆没。实测最小命中单位是**括号短语本身**
+ *   （分支名无关；剥成 "Main branch: main" 即通过），所以只去掉括号，保留分支名语义。
+ *
+ * 黑名单不止扫 system（2026-10-08 第三轮探针，cn-cli 实锤）：
+ *   ❌ system content      ❌ assistant content（历史回复里引用过指纹原文同样 400！）
+ *   ✅ user content        ✅ assistant tool_calls[].function.arguments
+ *   ✅ tool 角色消息
+ * 也就是说编码会话里「助手曾输出/编辑过含指纹的代码」后，后续所有请求都会带毒——
+ * 这就是 system 层剥离后仍偶发 400 的根因。tool_calls 参数安全说明匹配的是
+ * content 文本面，不深入 JSON 字符串内部。
+ *
+ * 只剥离命中的那一句，消息的其余内容原样保留，不改动用户的实质指令。
  * 多一条可疑模式就多一份误伤风险，所以**这里只放实测确认过的**，
  * 以后遇到新的指纹再按同样方式验证后追加。
+ *
+ * content 既可能是字符串（OpenAI /v1/chat/completions 常见形态），也可能是
+ * [{type:'text',text}] 分段数组；两种都要剥，否则指纹藏在数组段里照样吃 400。
  */
 const CLIENT_FINGERPRINTS = [
-  /You are Claude Code,\s*Anthropic's official CLI for Claude\.?/i,
+  [/You are Claude Code,\s*Anthropic's official CLI for Claude\.?/gi, ''],
+  [/Main branch\s*\(\s*you will usually use this for PRs\s*\)/gi, 'Main branch'],
 ];
 
+/** 剥一段文本里的指纹：无命中返回 null，命中返回剥后文本（顺带收敛多余空行）。 */
+function stripPatterns(text) {
+  let next = text;
+  for (const [re, to] of CLIENT_FINGERPRINTS) next = next.replace(re, to);
+  if (next === text) return null;
+  return next.replace(/\n{3,}/g, '\n\n').trim();
+}
+
 /**
- * 从 system 消息里剥离客户端指纹。返回被改动的消息条数。
- * 若剥离后内容为空，用 fallbackPrompt 兜底（否则首条 system 会变成空串）。
+ * 从 system 与 assistant 消息里剥离客户端指纹。返回被改动的消息条数。
+ * 若剥离后字符串 content 为空，用 fallbackPrompt 兜底（否则消息会变成空串/空 text 块）。
  */
 export function stripClientFingerprint(messages, fallbackPrompt) {
   if (!Array.isArray(messages)) return 0;
   let 改动数 = 0;
   for (const m of messages) {
     if (!m || typeof m !== 'object') continue;
-    if (String(m.role || '').toLowerCase() !== 'system') continue;
-    if (typeof m.content !== 'string' || !m.content) continue;
-    let next = m.content;
-    for (const re of CLIENT_FINGERPRINTS) {
-      if (!re.test(next)) continue;
-      next = next.replace(re, '').replace(/\n{3,}/g, '\n\n').trim();
+    const role = String(m.role || '').toLowerCase();
+    if (role !== 'system' && role !== 'assistant') continue;
+    // assistant 常见 content:null（纯工具调用消息），跳过
+    if (m.content == null) continue;
+    // 剥离后整段为空时的兜底：system 用默认提示词；assistant 用中性占位符
+    // （assistant 说 "You are a helpful AI assistant." 语义很怪；实测空串/占位符上游均 200）
+    const 兜底 = role === 'system' ? fallbackPrompt : '(earlier content removed)';
+
+    if (typeof m.content === 'string' && m.content) {
+      const next = stripPatterns(m.content);
+      if (next !== null) {
+        m.content = next || 兜底;
+        改动数++;
+      }
+      continue;
     }
-    if (next !== m.content) {
-      m.content = next || fallbackPrompt;
-      改动数++;
+
+    // 分段数组：逐段剥，命中才算改动（空段同样用兜底顶上，避免送出空 text 块）
+    if (Array.isArray(m.content)) {
+      let 命中 = false;
+      for (const part of m.content) {
+        if (!part || typeof part !== 'object') continue;
+        if (typeof part.text !== 'string' || !part.text) continue;
+        const next = stripPatterns(part.text);
+        if (next !== null) {
+          part.text = next || 兜底;
+          命中 = true;
+        }
+      }
+      if (命中) 改动数++;
     }
   }
   return 改动数;
@@ -225,6 +273,30 @@ export class UpstreamError extends Error {
     this.code = code;
     this.transport = transport;
     this.site = site;
+  }
+}
+
+/** 指纹黑名单报错（11128）时把被拒请求体落盘到数据目录 rejected/，
+ *  供下一轮二分定位新指纹。只留最近 5 份，失败只 warn 不影响错误路径。 */
+export function dumpRejectedBody(status, text, payload) {
+  try {
+    if (!/Illegal API invocation|unapproved channel/i.test(String(text || ''))) return;
+    const dir = path.join(paths.root, 'rejected');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = path.join(dir, `rejected-${stamp}.json`);
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ at: new Date().toISOString(), status, upstream: String(text || '').slice(0, 500), payload }, null, 2),
+    );
+    // 只留最近 5 份
+    const olds = fs.readdirSync(dir).filter((f) => f.startsWith('rejected-') && f.endsWith('.json')).sort();
+    for (const f of olds.slice(0, Math.max(0, olds.length - 5))) {
+      try { fs.unlinkSync(path.join(dir, f)); } catch { /* 留着也无妨 */ }
+    }
+    warn(`被拒请求体已留存：${file}（供二分定位新指纹）`);
+  } catch (e) {
+    warn(`被拒请求体留存失败：${e.message}`);
   }
 }
 
@@ -521,6 +593,9 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
   if (res.status >= 400) {
     const text = res._text !== undefined ? res._text : await res.text().catch(() => '');
     cleanup();
+    // 指纹黑名单（11128）命中时留存被拒请求体：剥离名单不可能一次穷尽，
+    // 上游再加新指纹时，有原体才能像这次一样快速二分定位。
+    dumpRejectedBody(res.status, text, 当前payload);
     // Retry-After（0.3.33）：上游限流响应若带等待秒数，据此计算模型冷却的恢复时间；
     // 支持秒数与 HTTP 日期两种形态，解析不了为 null（调用方回落缺省 60s）。
     return {
@@ -1123,6 +1198,10 @@ export function upstreamErrorMessage(status, text, site = '') {  let msg = text 
   };
   const head = map[status] || `上游 HTTP ${status}`;
   warn(`${prefix}上游返回 ${status}：${String(msg).slice(0, 200)}`);
+  // 指纹黑名单报错时在消息里点名，提示已自动剥离、若再现会留存请求体供二分
+  if (/Illegal API invocation|unapproved channel/i.test(String(msg))) {
+    return `${prefix}上游 HTTP ${status}：客户端指纹被上游黑名单拦截（11128）。代理已自动剥离已知指纹；若反复出现，说明上游启用了新指纹，被拒请求体已留存到数据目录 rejected/ 下供定位`;
+  }
   return `${prefix}${head}：${String(msg).slice(0, 500)}`;
 }
 

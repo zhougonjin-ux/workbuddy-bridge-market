@@ -5,7 +5,7 @@ import path from 'node:path';
 import { paths } from './config.mjs';
 import { warn } from './log.mjs';
 import { writeJsonFileAtomic } from './util.mjs';
-import { getCatalog, parseMultiplier, setObservedCostProvider } from './router.mjs';
+import { setObservedCostProvider } from './router.mjs';
 
 // 观测成本注入（0.3.33）：router 的 free-first 选型与后缀展示需要读观测数据，
 // 但 router→budget→usage→router 成环——模块顶层注册会撞 router 侧 `let` 的 TDZ
@@ -13,28 +13,38 @@ import { getCatalog, parseMultiplier, setObservedCostProvider } from './router.m
 
 /**
  * credit 统计：上游流式帧的 usage 里通常没有 credit 字段（只有非流式聚合偶尔带），
- * 直接 `?? 0` 会让「积分消耗」曲线恒为 0。这里在上游没报时用
- * 模型倍率（parseMultiplier）× tokens 估算一个近似值。
+ * 上游没报时曾经用「目录倍率 × tokens」估算——但 x0.06 是**相对倍率**不是单价，
+ * 按 0.06 credit/token 算会把大 prompt 请求虚高约 750 倍（2026-10-08 实录：两笔
+ * ~38K tokens 的请求各被记 2280 分，当日「消耗」4574 分里 99.7% 是虚的）。
  *
- * 口径：倍率 x0.06 表示每 token 扣 0.06 credit，所以 credit ≈ (prompt+completion) × mult。
- * 估算值只进用量统计，不代表上游真实扣费；目录拉不到（Infinity）时不估，如实记 0。
+ * 0.3.40 起估算改用**当日同模型观测单价**：Σ上游实报 credit ÷ Σtokens。
+ * 有实报样本（lastCredit 与对应 tokens 同帧到达）才建立单价；没有样本记 0——
+ * 少记比虚记好：虚值会污染用量曲线、free-first 选型与预算模式。
  *
  * ⚠️ 0 是有效实报（0.3.34 修）：上游对夜间免费/限时免费模型实扣就是 0——
  * 旧守卫 `> 0` 把真 0 当「没报」再用倍率估算，观测成本、后缀翻转与用量统计
- * 全部被估算值污染（实测：hy4-preview 夜间上游实报 0，桥接记成估算 0.02）。
- * 只有「没报」（undefined/null/NaN）才回落估算。
+ * 全部被估算值污染。只有「没报」（undefined/null/NaN）才走估算。
  */
+/** 同模型当日的观测单价（credit/token）。样本不足（无实报或 0 tokens）返回 null。 */
+export function observedUnitPrice(site, model) {
+  ensureLoaded();
+  const m = data.days[todayKey()]?.models?.[`${site}/${model}`];
+  if (!m) return null;
+  const tokens = (m.promptTokens || 0) + (m.completionTokens || 0);
+  if (tokens <= 0 || !Number.isFinite(m.credit) || m.credit <= 0) return null;
+  return m.credit / tokens;
+}
+
 export async function estimateCredit(cfg, site, model, upstreamCredit, promptTokens, completionTokens) {
   if (Number.isFinite(upstreamCredit)) return upstreamCredit;
-  try {
-    const cat = await getCatalog(cfg, site);
-    const info = cat.models.get(model);
-    const mult = parseMultiplier(info?.credits);
-    if (!Number.isFinite(mult)) return 0;
-    return (promptTokens + completionTokens) * mult;
-  } catch {
-    return 0;
+  // 估算口径（0.3.40）：当日观测单价 × tokens。上游实报样本总是先于估算请求到达
+  // （第一个请求必带 usage 帧，实测半天 200+ 笔里仅个别大 prompt 请求缺帧），
+  // 所以当日样本通常存在；真没有就记 0，不猜。
+  const unit = observedUnitPrice(site, model);
+  if (unit !== null) {
+    return (promptTokens + completionTokens) * unit;
   }
+  return 0;
 }
 
 // 与 config.json 同目录（跟随 setConfigDir / WB_CONFIG_DIR 变化，不冻结路径）

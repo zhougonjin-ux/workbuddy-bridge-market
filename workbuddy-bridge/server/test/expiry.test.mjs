@@ -96,14 +96,22 @@ test('expiry-first：同到期时间时先耗余额少的', () => {
   assert.deepEqual(ordered.map((a) => a.id), ['small', 'big']);
 });
 
-test('任何策略：耗尽/失败多的账号都排后面', () => {
+test('任何策略：耗尽的账号排后面；failCount 不再压排序（0.3.40 修死锁）', () => {
   const dead = acc('dead', { exhaustedAt: NOW - 1000, creditDetail: [{ remain: 1, expireAt: NOW + DAY }] });
   const flaky = acc('flaky', { failCount: 3, creditDetail: [{ remain: 1, expireAt: NOW + DAY }] });
   const ok = acc('ok', { creditDetail: [{ remain: 1, expireAt: NOW + 30 * DAY }] });
   for (const policy of ['expiry-first', 'balance-first', 'round-robin']) {
     const ordered = orderAccounts([dead, flaky, ok], { policy, now: NOW });
     assert.equal(ordered[ordered.length - 1].id, 'dead', policy);
-    assert.equal(ordered[ordered.length - 2].id, 'flaky', policy);
+  }
+  // failCount 高但已过冷却的账号必须正常参与策略排序，否则：B 吃几次失败沉底，
+  // A 一直被选中（成功清零 A 的计数），B 永远轮不到 → failCount 永远清不了零。
+  // 失败的惩罚只认 cooldownUntil（时间性）与 exhaustedAt（额度性）。
+  const victim = acc('victim', { failCount: 9, creditDetail: [{ remain: 1, expireAt: NOW + DAY }] });
+  const healthy = acc('healthy', { creditDetail: [{ remain: 1, expireAt: NOW + 30 * DAY }] });
+  for (const policy of ['expiry-first', 'balance-first', 'round-robin']) {
+    const ordered = orderAccounts([victim, healthy], { policy, now: NOW });
+    assert.equal(ordered[0].id, 'victim', policy);
   }
 });
 

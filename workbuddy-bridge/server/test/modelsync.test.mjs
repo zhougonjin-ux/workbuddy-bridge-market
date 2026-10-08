@@ -196,6 +196,34 @@ test('estimateCredit：上游实报 0 必须原样返回（夜间免费实扣就
   assert.equal(await estimateCredit({}, 's', 'm', null, 10, 1) >= 0, true);
 });
 
+/* ============ estimateCredit：观测单价口径（0.3.40 修虚高 750 倍） ============ */
+// 旧实现把目录倍率 x0.06 当「每 token 0.06 credit」估算，大 prompt 请求虚高 ~750 倍
+// （2026-10-08 实录：两笔 38K tokens 各记 2280 分，当日 4574 分里 99.7% 是虚的）。
+// 新口径：同模型当日 Σ实报credit ÷ Σtokens；无样本记 0。
+
+test('estimateCredit：无观测样本时记 0，不再用倍率瞎猜', async () => {
+  // 'no-sample-model' 当日没有任何 recordUsage 记录 → 无单价 → 必须记 0
+  assert.equal(await estimateCredit({}, 'cn-cli', 'no-sample-model', undefined, 1_000_000, 1), 0);
+});
+
+test('estimateCredit：有实报样本后按观测单价估算', async () => {
+  // 建立 10 笔实报样本：每笔 100 tokens 实报 0.01 → 单价 1e-4 credit/token
+  for (let i = 0; i < 10; i++) {
+    recordUsage({ site: 'cn-cli', model: 'unit-price-model', status: 200, promptTokens: 100, completionTokens: 0, credit: 0.01, account: 'acc_a', upstreamCredit: 0.01 });
+  }
+  // 一笔 50,000 tokens 的请求上游没报 usage → 50000 × 1e-4 = 5.0
+  const est = await estimateCredit({}, 'cn-cli', 'unit-price-model', undefined, 50_000, 0);
+  assert.ok(Math.abs(est - 5.0) < 1e-9, `观测单价估算 5.0（实际 ${est}）`);
+  // 旧口径会是 50000 × 0.06 = 3000 —— 虚高 600 倍
+});
+
+test('estimateCredit：全 0 实报样本（夜间免费）单价仍为 0，不猜正值', async () => {
+  for (let i = 0; i < 5; i++) {
+    recordUsage({ site: 'cn-cli', model: 'free-model', status: 200, promptTokens: 100, completionTokens: 0, credit: 0, account: 'acc_a', upstreamCredit: 0 });
+  }
+  assert.equal(await estimateCredit({}, 'cn-cli', 'free-model', undefined, 10_000, 0), 0);
+});
+
 /* ==================== Retry-After 解析 ==================== */
 
 test('parseRetryAfter：秒数 / HTTP 日期 / 非法值', () => {

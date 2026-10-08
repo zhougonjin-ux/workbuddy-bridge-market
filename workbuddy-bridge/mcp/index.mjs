@@ -6,6 +6,7 @@
 //
 // 协议：MCP stdio（换行分隔的 JSON-RPC 2.0）。日志一律走 stderr，stdout 只发协议帧。
 import { loadConfig, primaryKey } from '../server/src/config.mjs';
+import { ensureProxyRunning } from '../server/src/autostart.mjs';
 import { readFileSync } from 'node:fs';
 
 // 版本号以 server/package.json 为唯一事实源（serverInfo 版本号会报告给客户端）。
@@ -23,7 +24,13 @@ function baseOf(cfg) {
   return `http://${cfg.host}:${cfg.port}`;
 }
 
-async function callLocal(cfg, path, { method = 'GET', body = null, timeoutMs = 60_000 } = {}) {
+/** 从 fetch 的异常里挖出网络错误码：cause 可能是带 code 的 Error，也可能是 AggregateError。 */
+function errorCode(e) {
+  const c = e?.cause;
+  return c?.code || c?.errors?.[0]?.code || '';
+}
+
+async function callLocal(cfg, path, { method = 'GET', body = null, timeoutMs = 60_000, retried = false } = {}) {
   const headers = { Accept: 'application/json' };
   const key = primaryKey(cfg);
   if (key) headers.Authorization = 'Bearer ' + key;
@@ -42,8 +49,20 @@ async function callLocal(cfg, path, { method = 'GET', body = null, timeoutMs = 6
     if (e?.name === 'TimeoutError') {
       throw new Error(`代理响应超时（${Math.round(timeoutMs / 1000)}s）：请求已受理、服务端会继续执行，稍后可用 wb_tasks_status 查看结果。`);
     }
+    // 连接被拒（代理没起）→ 自愈：拉起代理并等就绪后重试一次。
+    // 钩子链路万一失效（hook 未注册/被禁用/新机器异常），工具调用本身就是兜底启动路径。
+    // cause 的形态不定：字面 IP 直连是带 code 的 Error；主机名解析到多地址时是 AggregateError
+    // （code 为空，各分支错误在 errors[] 里），所以两处都取。
+    const code = errorCode(e);
+    if (!retried && (code === 'ECONNREFUSED' || code === 'EHOSTUNREACH' || code === 'EACCES')) {
+      const r = await ensureProxyRunning({ waitMs: 5000, source: 'mcp-selfheal' });
+      // alive = 探测时已被别的链路拉起；spawned = 本次拉起并等到就绪。两种都值得重试。
+      if (r.ok && (r.action === 'spawned' || r.action === 'alive')) {
+        return callLocal(cfg, path, { method, body, timeoutMs, retried: true });
+      }
+    }
     const hint = [
-      `本地 WorkBuddy 代理没有响应（${e.cause?.code || e.name || e.message}）。`,
+      `本地 WorkBuddy 代理没有响应（${code || e.name || e.message}）。`,
       `请先启动代理：/wbp-start 命令，或运行  node "${process.env.WB_BRIDGE_SERVER_DIR || '<插件目录>'}/server/server.mjs"`,
     ].join('\n');
     throw new Error(hint);
@@ -385,6 +404,11 @@ async function handle(msg) {
 
 let buf = '';
 process.stdin.setEncoding('utf8');
+
+// MCP 进程起来就拉一次代理（幂等）：SessionStart hook 失效时（未注册/被禁用/新机器异常），
+// 首个 MCP 工具调用前的这一步是第二条兜底链路；拉起不阻塞协议握手（waitMs=0）。
+ensureProxyRunning({ source: 'mcp-boot' });
+
 process.stdin.on('data', (chunk) => {
   buf += chunk;
   let idx;

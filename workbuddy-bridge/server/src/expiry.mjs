@@ -114,8 +114,11 @@ export function accountEarliestExpiry(a, now = Date.now()) {
  * 输入 accounts 是「已过滤掉禁用/无 token/被排除」后的候选副本数组。
  * 返回排好序的新数组（不改入参）；池为空返回 []。
  *
- * 所有策略都先保证：未耗尽的排在耗尽前面、失败少的排前面（沿用原代理的保守约束），
- * 然后才按策略分序。
+ * 所有策略都先保证：未耗尽的排在耗尽前面（沿用原代理的保守约束）。
+ * ⚠️ failCount 不参与排序（0.3.40 修）：冷却（cooldownUntil）已经是失败后的时间性
+ * 惩罚，failCount 再压排序会形成死锁——账号 B 因故障连吃几次失败后沉底，A 一直被用
+ * （markSuccess 清零 A 的计数），B 永远轮不到 → failCount 永远清不了零。实测
+ * 11128 风暴后 expiry-first 就这样被永久钉死在单账号上。失败惩罚只认冷却与耗尽。
  */
 export function orderAccounts(accounts, { policy = 'expiry-first', pinnedAccountId = null, now = Date.now() } = {}) {
   const list = Array.isArray(accounts) ? [...accounts] : [];
@@ -123,12 +126,7 @@ export function orderAccounts(accounts, { policy = 'expiry-first', pinnedAccount
 
   const exhaustedRank = (a, t) => (a.exhaustedAt && t - a.exhaustedAt < EXHAUST_TTL_MS ? 1 : 0);
 
-  const byStability = (a, b) => {
-    const ea = exhaustedRank(a, now);
-    const eb = exhaustedRank(b, now);
-    if (ea !== eb) return ea - eb;
-    return (a.failCount || 0) - (b.failCount || 0);
-  };
+  const byStability = (a, b) => exhaustedRank(a, now) - exhaustedRank(b, now);
 
   if (policy === 'round-robin') {
     // 最久未用的先用（lastUsedAt 为空视为最久）
