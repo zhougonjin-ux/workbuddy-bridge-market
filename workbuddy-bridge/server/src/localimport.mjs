@@ -45,6 +45,45 @@ function candidateFiles() {
     .map((n) => path.join(dir, n));
 }
 
+/**
+ * 检测 WorkBuddy 桌面客户端的登录态文件（0.3.41）。
+ *
+ * 桌面客户端把登录态存在 ~/AppData/Local/CodeBuddyExtension/Data/Public/auth/
+ * workbuddy-desktop.info：uid 是明文，accessToken/refreshToken 是 $wbEncrypted
+ * AES-GCM 密文，密钥只在桌面主进程内存里（自家 CLI 读同一个文件也报 missing-key，
+ * 见同目录 security/at-rest-failures-v1.json 的失败记录）——静态读取解不了密，
+ * 所以检测到也只能给「已登录但需扫码换绑」的明确指引，不能直接入池。
+ * 返回 { uid, file, mtimeMs, encrypted } 或 null（无客户端/未登录）。
+ */
+export function detectDesktopLogin() {
+  const home = process.env.USERPROFILE || os.homedir();
+  const dirs = {
+    win32: ['AppData', 'Local', 'CodeBuddyExtension'],
+    darwin: ['Library', 'Application Support', 'CodeBuddyExtension'],
+  };
+  const rel = dirs[process.platform] || ['.local', 'share', 'CodeBuddyExtension'];
+  const base = path.join(home, ...rel, 'Data', 'Public', 'auth');
+  let files = [];
+  try { files = fs.readdirSync(base).filter((n) => n.endsWith('.info')); } catch { return null; }
+  let best = null;
+  for (const n of files) {
+    const f = path.join(base, n);
+    try {
+      const st = fs.statSync(f);
+      if (!best || st.mtimeMs > best.mtimeMs) best = { file: f, mtimeMs: st.mtimeMs };
+    } catch { /* 跳过读不到的 */ }
+  }
+  if (!best) return null;
+  try {
+    const j = JSON.parse(fs.readFileSync(best.file, 'utf8'));
+    const uid = j?.account?.uid || null;
+    if (!uid) return null;
+    return { uid, file: best.file, mtimeMs: best.mtimeMs, encrypted: Boolean(j?.auth?.accessToken) };
+  } catch {
+    return null;
+  }
+}
+
 /** 深度收集 JSON 里所有「三段式 JWT」字符串。 */
 function collectJwtStrings(value, out) {
   if (typeof value === 'string') {
@@ -185,10 +224,29 @@ export async function importLocalAccounts(cfg, { silent = false } = {}) {
     if (credit) updateCreditDetail(site, (loadPool(site).accounts.find((a) => a.uid && String(a.uid) === uid) || {}).id, credit);
   }
 
+  // WorkBuddy 桌面客户端登录态检测（0.3.41）：token 加密解不了，但 uid 明文可读。
+  // 检测到就在结果里如实告知「检测到登录但 token 加密」，别让弹窗笼统地说「没有发现」——
+  // 用户明明登录着客户端，看到那句话只会以为是桥接坏了。
+  const desktop = detectDesktopLogin();
+  if (desktop) {
+    const short = String(desktop.uid).slice(0, 8) + '…';
+    const inPool = siteKeys(cfg).some((site) => loadPool(site).accounts.find((a) => a.uid && String(a.uid) === desktop.uid));
+    found.push({
+      uid: short,
+      nickname: 'WorkBuddy 桌面客户端',
+      site: 'cn-cli',
+      exp: null,
+      status: inPool ? 'skipped' : 'skipped',
+      reason: inPool
+        ? '桌面客户端已登录（该账号已在账号池中，无需导入）'
+        : '检测到桌面客户端已登录，但 token 是加密存储（密钥只在客户端内存），无法静态导入——请在控制台「＋ 添加账号」扫码登录同一账号',
+    });
+  }
+
   if (!silent) {
-    if (!files.length) log('本机导入：未找到 ~/.codebuddy 客户端配置（没装客户端不影响其他登录方式）');
+    if (!files.length && !desktop) log('本机导入：未找到 ~/.codebuddy 客户端配置（没装客户端不影响其他登录方式）');
     else if (!found.length) log(`本机导入：扫描了 ${files.length} 个配置文件，没有发现可导入的登录态`);
     else log(`本机导入：新增 ${imported} / 更新 ${updated} / 跳过 ${skipped}`);
   }
-  return { scannedFiles: files.length, imported, updated, skipped, found };
+  return { scannedFiles: files.length, imported, updated, skipped, found, desktop };
 }
