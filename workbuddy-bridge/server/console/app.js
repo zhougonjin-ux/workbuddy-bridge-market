@@ -1236,7 +1236,7 @@ function showImportModal(r) {
     ${(r.found || []).map((f) => `<div class="card" style="padding:9px 13px;margin-bottom:8px">
       <div class="row"><b style="font-size:13px">${esc(f.nickname || f.uid)}</b>${badge(f.status)}<span class="spacer"></span><span class="badge">${esc(f.site)}</span></div>
       <div class="muted" style="font-size:12px;margin-top:3px">${esc(f.reason || '')}${f.exp ? ' · token 有效期至 ' + new Date(f.exp).toLocaleDateString() : ''}</div>
-    </div>`).join('') || '<div class="empty" style="padding:14px">没有发现可导入的登录态 —— 需要本机装有已登录的 WorkBuddy / CodeBuddy 客户端</div>'}
+    </div>`).join('') || '<div class="empty" style="padding:14px">没有发现可导入的登录态 —— 需要本机装有已登录的 WorkBuddy / CodeBuddy 客户端<br><span style="font-size:12px">客户端凭证是加密存储，代理只能读 CodeBuddy CLI 的 settings*.json 明文 token；想找回在控制台删除的账号，用「备份与恢复」选最近一份备份恢复即可</span></div>'}
     <div class="qrhint">本机导入的账号没有 refreshToken：token 到期后（客户端会自动续期）再点一次「导入本机账号」即可拿到新 token；服务每次启动也会自动重扫一次。若同账号已用扫码登录（支持自动续期），则不会被覆盖。</div>
     <div class="row"><span class="spacer"></span><button class="btn" id="imClose">关闭</button></div>
   </div></div>`;
