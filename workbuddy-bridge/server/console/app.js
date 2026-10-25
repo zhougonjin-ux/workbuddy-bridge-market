@@ -2223,6 +2223,11 @@ function loadAggregate() {
       </div>
     </div>
     <div class="card" style="margin-bottom:14px">
+      <div style="font-weight:600;font-size:13.5px;margin-bottom:6px">常用厂商 <span class="sub">预置目录（移植自 dsh-xdpool）——点厂商带出接口地址，只需贴 key，不用自己找链接</span></div>
+      <div id="aggPresets" style="display:flex;flex-wrap:wrap;gap:6px;max-height:150px;overflow:auto;border:1px solid var(--line);border-radius:8px;padding:8px;background:var(--panel2)"><span class="muted" style="font-size:12px">加载中…</span></div>
+      <div class="muted" id="aggPresetHint" style="font-size:12px;margin-top:6px">绿色 = 有免费额度。点厂商名填入下方表单；右侧「申请 key」打开厂商取 key 页面</div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
       <div id="aggList"></div>
       <div class="row" style="flex-wrap:wrap;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
         <input id="aggName" placeholder="渠道名（字母数字_-）" style="width:150px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
@@ -2265,6 +2270,20 @@ function loadAggregate() {
       aggLane = r.enabled !== false;
       $('#aggLane').checked = aggLane;
       renderAgg();
+      // 预置厂商速填（0.3.63，目录来自 dsh-xdpool）：免费额度组排前；已配置的带 ✓
+      const configured = new Set(aggProviders.map((x) => x.name));
+      const presets = [...(r.presets || [])].sort((a, b) => Number(b.free ? 1 : 0) - Number(a.free ? 1 : 0));
+      $('#aggPresets').innerHTML = presets.length ? presets.map((p) => `
+        <span class="badge ${p.free ? 'ok' : ''}" style="cursor:pointer;display:inline-flex;gap:5px;align-items:center;margin:1px" data-preset="${esc(p.id)}" title="${esc(p.name)}${p.note ? ' · ' + esc(p.note) : ''}&#10;${esc(p.baseUrl)}">${configured.has(p.id) ? '✓ ' : ''}${esc(p.name)}${p.keyUrl
+          ? ` · <a href="${esc(p.keyUrl)}" target="_blank" rel="noopener" style="color:inherit;text-decoration:underline" onclick="event.stopPropagation()">申请key</a>` : ''}</span>`).join('') : '<span class="muted" style="font-size:12px">预置目录加载失败</span>';
+      for (const b of el.querySelectorAll('[data-preset]')) b.onclick = () => {
+        const p = presets.find((x) => x.id === b.dataset.preset);
+        if (!p) return;
+        $('#aggName').value = p.id;
+        $('#aggUrl').value = p.baseUrl;
+        $('#aggKeys').focus();
+        $('#aggPresetHint').textContent = `已选 ${p.name}${p.note ? '（' + p.note + '）' : ''} —— 接口地址已带出，粘贴 key 后点「＋ 添加渠道」`;
+      };
       $('#aggModels').textContent = (r.models || []).length ? `已接入 ${(r.models || []).length} 个模型：${(r.models || []).slice(0, 8).join('、')}${(r.models || []).length > 8 ? ' …' : ''}` : '（还没有拉到模型 —— 添加渠道后点「⟳ 拉取模型」）';
     } catch (e) { $('#aggModels').textContent = '聚合渠道加载失败：' + e.message; }
   };

@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { aggregateProviders, nextAggregateKey } from '../src/aggregate.mjs';
+import { AGG_PRESETS } from '../src/aggpresets.mjs';
 import { resolveTarget } from '../src/router.mjs';
 import { validateConfig } from '../src/config.mjs';
 import { expertIdFromJumpUrl, expertNameFromTitle, isEventChainTask } from '../src/taskevents.mjs';
@@ -15,6 +16,17 @@ const AGG_CFG = {
     ],
   },
 };
+
+test('AGG_PRESETS 预置厂商目录：id 可作渠道名、baseUrl 合法、无重名（0.3.63）', () => {
+  assert.ok(AGG_PRESETS.length >= 50, '预置目录应至少 50 家');
+  const seen = new Set();
+  for (const p of AGG_PRESETS) {
+    assert.match(p.id, /^[A-Za-z0-9_-]{1,32}$/, '渠道名非法：' + p.id);
+    assert.match(p.baseUrl, /^https:\/\/.+/, 'baseUrl 非法：' + p.id);
+    assert.ok(!seen.has(p.id), '预置重名：' + p.id);
+    seen.add(p.id);
+  }
+});
 
 test('aggregateProviders：三要素齐且未停用才算有效', () => {
   const list = aggregateProviders(AGG_CFG);

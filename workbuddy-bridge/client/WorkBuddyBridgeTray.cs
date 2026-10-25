@@ -368,7 +368,10 @@ class MainForm : Form
     readonly System.Windows.Forms.TextBox aggUrlBox = new System.Windows.Forms.TextBox();
     readonly System.Windows.Forms.TextBox aggKeysBox = new System.Windows.Forms.TextBox();
     List<Dictionary<string, object>> aggProviders = new List<Dictionary<string, object>>();
+    List<Dictionary<string, object>> aggPresets = new List<Dictionary<string, object>>();
+    readonly System.Windows.Forms.ComboBox aggPresetCombo = new System.Windows.Forms.ComboBox();
     bool aggLane = true;
+    bool fillingAggCombo;
     string currentPolicy = "";
     string pinnedId = "";
 
@@ -1046,12 +1049,28 @@ class MainForm : Form
 
         var addCaption = new Label { Text = "添加渠道", Location = new Point(32, 484), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
         page.Controls.Add(addCaption);
+        var presetCaption = new Label { Text = "常用厂商（选一个，地址自动带出，只需贴 key）：", Location = new Point(32, 510), AutoSize = true, ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 9F) };
+        page.Controls.Add(presetCaption);
+        aggPresetCombo.Location = new Point(32, 532);
+        aggPresetCombo.Size = new Size(360, 24);
+        aggPresetCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        aggPresetCombo.Font = new Font("Microsoft YaHei UI", 9F);
+        aggPresetCombo.SelectedIndexChanged += delegate
+        {
+            if (fillingAggCombo || aggPresetCombo.SelectedIndex < 0) return;
+            var p = aggPresets[aggPresetCombo.SelectedIndex];
+            aggNameBox.Text = Str(p, "id");
+            aggUrlBox.Text = Str(p, "baseUrl");
+            string ku = Str(p, "keyUrl");
+            SetAggMsg("已选 " + Str(p, "name") + (ku != "" ? " · 申请 key：" + ku : "") + " —— 现在贴 key 点「＋ 添加渠道」", SubText);
+        };
+        page.Controls.Add(aggPresetCombo);
         aggNameBox.Location = new Point(32, 510); aggNameBox.Width = 140;
         aggUrlBox.Location = new Point(182, 510); aggUrlBox.Width = 320;
         aggKeysBox.Location = new Point(512, 510);
         aggNameBox.Font = aggUrlBox.Font = aggKeysBox.Font = new Font("Microsoft YaHei UI", 9F);
         page.Controls.Add(aggNameBox); page.Controls.Add(aggUrlBox); page.Controls.Add(aggKeysBox);
-        var addRow = new FlowLayoutPanel { Location = new Point(32, 542), Size = new Size(900, 40) };
+        var addRow = new FlowLayoutPanel { Location = new Point(32, 602), Size = new Size(900, 40) };
         AddBtn(addRow, "＋ 添加渠道", delegate
         {
             string name = aggNameBox.Text.Trim();
@@ -1075,7 +1094,7 @@ class MainForm : Form
         addRow.Controls.Add(aggMsg);
         page.Controls.Add(addRow);
 
-        var hint = new Label { Text = "提示：关掉聚合开关不影响 WorkBuddy 账号池；停用渠道会保留 key 只摘出池子。删除/启停/添加都会立即保存。", Location = new Point(32, 592), AutoSize = true, ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 8.5F) };
+        var hint = new Label { Text = "提示：关掉聚合开关不影响 WorkBuddy 账号池；停用渠道会保留 key 只摘出池子。删除/启停/添加都会立即保存。", Location = new Point(32, 652), AutoSize = true, ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 8.5F) };
         page.Controls.Add(hint);
 
         page.HorizontalScroll.Enabled = false;
@@ -1084,9 +1103,10 @@ class MainForm : Form
         {
             int w = Math.Max(360, page.ClientSize.Width - 64);
             aggList.Width = w;
+            aggList.Columns[2].Width = Math.Max(140, w - 110 - 76 - 240 - 26); // 地址列吃剩余宽度，禁横滚（0.3.63）
             opRow.Width = w; addRow.Width = w;
-            int urlW = Math.Max(200, w - 140 - 240 - 20);
-            aggUrlBox.Width = urlW;
+            aggUrlBox.Width = Math.Max(200, w - 140 - 240 - 20);
+            aggKeysBox.Width = 240;
         };
         return page;
     }
@@ -1136,12 +1156,25 @@ class MainForm : Form
             object mv; int modelCount = 0;
             if (root != null && root.TryGetValue("models", out mv) && mv is object[]) modelCount = ((object[])mv).Length;
             object ev; bool lane = !(root != null && root.TryGetValue("enabled", out ev) && ev is bool && !(bool)ev);
+            var presets = new List<Dictionary<string, object>>();
+            object pvv;
+            if (root != null && root.TryGetValue("presets", out pvv) && pvv is object[])
+                foreach (var o in (object[])pvv) { var d = o as Dictionary<string, object>; if (d != null) presets.Add(d); }
+            // 免费额度厂商排前（与 web 端一致）
+            presets.Sort(delegate (Dictionary<string, object> a, Dictionary<string, object> b) { return (Str(b, "free") == "True" ? 1 : 0) - (Str(a, "free") == "True" ? 1 : 0); });
             BeginInvoke((MethodInvoker)delegate
             {
                 aggProviders = list;
                 aggLane = lane;
                 aggLaneCheck.Checked = lane;
                 RenderAggList();
+                aggPresets = presets;
+                fillingAggCombo = true;
+                aggPresetCombo.Items.Clear();
+                foreach (var p in presets)
+                    aggPresetCombo.Items.Add((Str(p, "free") == "True" ? "★ " : "") + Str(p, "name") + "（" + Str(p, "id") + "）");
+                fillingAggCombo = false;
+                aggPresetCombo.SelectedIndex = -1;
                 SetAggMsg(modelCount + " 个模型已接入选择器（agg:渠道/模型）", Accent);
             });
         });

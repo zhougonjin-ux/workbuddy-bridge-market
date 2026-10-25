@@ -1110,10 +1110,11 @@ export async function handleConsoleApi(ctx) {
   // ---- 聚合渠道泳道（0.3.58）----
   if (p === '/aggregate' && method === 'GET') {
     const { aggregateProviders, aggregateModels } = await import('./aggregate.mjs');
+    const { AGG_PRESETS } = await import('./aggpresets.mjs');
     const providers = aggregateProviders(cfg).map((x) => ({ ...x, apiKeys: x.apiKeys.map((k) => k.slice(0, 6) + '…') }));
     let models = [];
     try { models = (await aggregateModels(cfg)).map((m) => m.id); } catch { /* 目录失败给空 */ }
-    return sendJson(res, 200, { providers, models, all: (cfg.aggregate?.providers || []).length, enabled: cfg.aggregate?.enabled !== false });
+    return sendJson(res, 200, { providers, models, all: (cfg.aggregate?.providers || []).length, enabled: cfg.aggregate?.enabled !== false, presets: AGG_PRESETS });
   }
   if (p === '/aggregate' && method === 'POST') {
     // 整包替换 providers（前端聚合渠道卡编辑后提交）。key 打码值（以 … 结尾且长度≤7）
