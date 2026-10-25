@@ -349,7 +349,8 @@ class MainForm : Form
     readonly Dictionary<string, Panel> pages = new Dictionary<string, Panel>();
     readonly Label navVersion = new Label();
     NotifyIcon tray;
-    bool busy;          // 轮询互斥（RefreshAll 专用）
+    bool busy;
+    DateTime acctMsgUntil = DateTime.MinValue; // 账号页提示占线至：60s 轮询在此前不得覆盖状态行          // 轮询互斥（RefreshAll 专用）
     bool actionBusy;    // 按钮动作互斥——与轮询分离：轮询进行中点击不再被静默吞掉（0.3.59）
     Label taskRunStatus;   // 任务页按钮的执行反馈（旧版点按钮零反馈，用户以为没点上）
     ListView modelList; Label modelCur; Label modelMsg; string modelsDefaultModel = "";
@@ -624,10 +625,59 @@ class MainForm : Form
         };
         var importBtn = PlainButton("导入本机账号");
         importBtn.Location = new Point(192, 128);
-        importBtn.Click += delegate { Run(delegate { Program.Api("POST", "/console/api/local/import", "{}"); }); };
+        importBtn.Click += delegate
+        {
+            RunAcctWithStatus("导入", delegate
+            {
+                string outText = Program.Api("POST", "/console/api/local/import", "{}");
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer();
+                var d = ser.DeserializeObject(outText) as Dictionary<string, object>;
+                return "导入完成 ✓ 新增 " + Int(d, "imported") + " · 更新 " + Int(d, "updated") + " · 跳过 " + Int(d, "skipped")
+                    + "（扫描 " + Int(d, "scannedFiles") + " 个客户端目录，无变化即全部跳过）";
+            });
+        };
         var refreshBtn = PlainButton("刷新");
         refreshBtn.Location = new Point(352, 128);
-        refreshBtn.Click += delegate { Run(delegate { Program.Api("POST", "/console/api/credit/refresh", "{}"); }); };
+        refreshBtn.Click += delegate
+        {
+            RunAcctWithStatus("刷新积分", delegate
+            {
+                string outText = Program.Api("POST", "/console/api/credit/refresh", "{}");
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer();
+                var d = ser.DeserializeObject(outText) as Dictionary<string, object>;
+                int total = 0, fail = 0;
+                var failSites = new List<string>();
+                object rv;
+                if (d != null && d.TryGetValue("results", out rv))
+                {
+                    var bySite = rv as Dictionary<string, object>;
+                    if (bySite != null)
+                    {
+                        foreach (var kv in bySite)
+                        {
+                            var items = kv.Value as object[];
+                            if (items == null) continue;
+                            foreach (var item in items)
+                            {
+                                var m = item as Dictionary<string, object>;
+                                if (m == null) continue;
+                                total++;
+                                object ov;
+                                bool ok = m.TryGetValue("ok", out ov) && ov is bool && (bool)ov;
+                                if (!ok)
+                                {
+                                    fail++;
+                                    if (failSites.Count < 3 && !failSites.Contains(kv.Key)) failSites.Add(kv.Key);
+                                }
+                            }
+                        }
+                    }
+                }
+                return fail == 0
+                    ? "积分刷新完成 ✓ " + total + " 个账号全部成功"
+                    : "积分刷新完成 ✓ " + (total - fail) + "/" + total + " 个成功，" + fail + " 个失败（" + string.Join("、", failSites.ToArray()) + (fail > 3 ? " 等" : "") + "，详情见网页控制台）";
+            });
+        };
         page.Controls.Add(addBtn);
         page.Controls.Add(importBtn);
         page.Controls.Add(refreshBtn);
@@ -1312,7 +1362,7 @@ class MainForm : Form
                 lastSiteLabels.Clear();
                 foreach (var a in rowsSnapshot) lastRows.Add(a);
                 foreach (var sl in siteLabelsSnapshot) lastSiteLabels.Add(sl);
-                acctStatus.Text = up ? ("状态：" + statusText) : statusText;
+                if (DateTime.Now >= acctMsgUntil) acctStatus.Text = up ? ("状态：" + statusText) : statusText;
                 serviceStatus.Text = "服务：" + (up ? "运行中（端口 " + Program.Port + "）" : "未运行");
                 if (Program.tray != null) Program.tray.Icon = Program.MakeIcon(up);
                 RebuildCards();
@@ -1636,6 +1686,42 @@ class MainForm : Form
             sw.Stop();
             SetTaskStatus(label + " 完成 ✓（耗时 " + ((int)sw.Elapsed.TotalSeconds) + " 秒，明细见「最近记录」）", Accent);
         });
+    }
+
+    /** 账号页动作反馈（0.3.60）：导入/刷新积分的成功失败都落在按钮下方的状态行；
+        15 秒内轮询不得回写，避免刚出的结果被 60s 轮询的「状态：…」糊掉。 */
+    void SetAcctStatus(string text, Color c)
+    {
+        acctMsgUntil = DateTime.Now.AddSeconds(15);
+        BeginInvoke((MethodInvoker)delegate { acctStatus.Text = text; acctStatus.ForeColor = c; });
+    }
+
+    void RunAcctWithStatus(string label, Func<string> act)
+    {
+        SetAcctStatus(label + " 执行中…", InkText);
+        Run(delegate
+        {
+            string summary;
+            try { summary = act(); }
+            catch (Exception ex)
+            {
+                SetAcctStatus(label + " 失败：" + ex.Message, Danger);
+                throw; // Run 接住后弹错误框
+            }
+            SetAcctStatus(summary, Accent);
+        });
+    }
+
+    static int Int(Dictionary<string, object> d, string key)
+    {
+        object v;
+        if (d != null && d.TryGetValue(key, out v) && v != null)
+        {
+            int n;
+            if (v is int) return (int)v;
+            if (int.TryParse(v.ToString(), out n)) return n;
+        }
+        return 0;
     }
 
     void RunTask(string kind)

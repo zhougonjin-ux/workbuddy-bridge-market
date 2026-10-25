@@ -2265,7 +2265,6 @@ function loadClientCard() {
 function loadHelp() {
   const el = $('#view-help');
   if (!el) return;
-  loadClientCard();
   const sec = (title, sub, inner, open) => `
     <details class="secd" ${open ? 'open' : ''}>
       <summary>${esc(title)} <span class="sub">${esc(sub)}</span></summary>
@@ -2351,6 +2350,8 @@ function loadHelp() {
       ])}
     `)}
     <div class="muted" style="font-size:12px;margin-top:14px">说明随版本更新；如发现与实际界面不符，以界面为准并跑一次「一键诊断」。文档维护：控制台「使用说明」页（T67）。</div>`;
+  // 必须在 innerHTML 之后：卡片节点是上面模板渲染出来的，先调后渲染＝永远停在「加载中…」（0.3.60 修）
+  loadClientCard();
 }
 window.loadHelp = loadHelp;
 
