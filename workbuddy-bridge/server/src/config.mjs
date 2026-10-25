@@ -471,6 +471,9 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
   if (!isPlainObject(cfg.aggregate) || !Array.isArray(cfg.aggregate.providers)) {
     fix('aggregate.providers 必须是数组，已回退为 []');
     cfg.aggregate = { providers: [] };
+  } else if (cfg.aggregate.enabled !== undefined && typeof cfg.aggregate.enabled !== 'boolean') {
+    fix('aggregate.enabled 必须是布尔值，已回退为 true');
+    cfg.aggregate.enabled = true;
   } else {
     const seenNames = new Set();
     const clean = [];

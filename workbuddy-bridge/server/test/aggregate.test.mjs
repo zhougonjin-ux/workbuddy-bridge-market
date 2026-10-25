@@ -21,6 +21,15 @@ test('aggregateProviders：三要素齐且未停用才算有效', () => {
   assert.deepEqual(list.map((x) => x.name), ['demo']);
 });
 
+test('aggregateProviders：聚合总开关关闭时整体为空（0.3.62 泳道开关）', () => {
+  const off = aggregateProviders({ aggregate: { enabled: false, providers: AGG_CFG.aggregate.providers } });
+  assert.deepEqual(off, []);
+  const on = aggregateProviders({ aggregate: { enabled: true, providers: AGG_CFG.aggregate.providers } });
+  assert.deepEqual(on.map((x) => x.name), ['demo']);
+  // 缺省（未配置 enabled）= 开
+  assert.deepEqual(aggregateProviders(AGG_CFG).map((x) => x.name), ['demo']);
+});
+
 test('nextAggregateKey：多 key 轮换、单 key 恒定', () => {
   const p = AGG_CFG.aggregate.providers[0];
   const seq = [nextAggregateKey(p), nextAggregateKey(p), nextAggregateKey(p)];

@@ -9,8 +9,10 @@
 // 是唯一路径；key 绝不进日志/错误文案（打码后只剩前 6 位）。
 import { log, warn } from './log.mjs';
 
-/** 启用中的 provider 列表（name/baseUrl/keys 三要素齐才有效）。 */
+/** 启用中的 provider 列表（name/baseUrl/keys 三要素齐才有效）。
+ * 聚合总开关（0.3.62，仿 dsh 泳道开关）关闭时整体返回空——目录/模型/转发全部随之静默。 */
 export function aggregateProviders(cfg) {
+  if (cfg.aggregate?.enabled === false) return [];
   return (cfg.aggregate?.providers || []).filter((p) => p && p.enabled !== false
     && typeof p.name === 'string' && p.name.trim()
     && typeof p.baseUrl === 'string' && /^https?:\/\//.test(p.baseUrl)

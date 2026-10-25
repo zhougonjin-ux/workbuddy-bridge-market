@@ -187,9 +187,11 @@ static class Program
             return sr.ReadToEnd();
     }
 
-    public static void OpenConsole()
+    public static void OpenConsole(string view = null)
     {
-        try { Process.Start("http://127.0.0.1:" + port + "/console"); } catch { }
+        // view 直达控制台子页（如聚合渠道 agg），hash 路由与 showView 对齐
+        string url = "http://127.0.0.1:" + port + "/console" + (string.IsNullOrEmpty(view) ? "" : "#/" + view);
+        try { Process.Start(url); } catch { }
     }
 
     static string FindNode()
@@ -356,6 +358,17 @@ class MainForm : Form
     bool actionBusy;    // 按钮动作互斥——与轮询分离：轮询进行中点击不再被静默吞掉（0.3.59）
     Label taskRunStatus;   // 任务页按钮的执行反馈（旧版点按钮零反馈，用户以为没点上）
     ListView modelList; Label modelCur; Label modelMsg; string modelsDefaultModel = "";
+
+    // 聚合渠道页（0.3.62，入口形态对齐 dsh-xdpool / web 控制台）
+    readonly ListView aggList = new ListView();
+    readonly Label aggMsg = new Label();
+    readonly Label aggCount = new Label();
+    readonly CheckBox aggLaneCheck = new CheckBox();
+    readonly System.Windows.Forms.TextBox aggNameBox = new System.Windows.Forms.TextBox();
+    readonly System.Windows.Forms.TextBox aggUrlBox = new System.Windows.Forms.TextBox();
+    readonly System.Windows.Forms.TextBox aggKeysBox = new System.Windows.Forms.TextBox();
+    List<Dictionary<string, object>> aggProviders = new List<Dictionary<string, object>>();
+    bool aggLane = true;
     string currentPolicy = "";
     string pinnedId = "";
 
@@ -467,8 +480,9 @@ class MainForm : Form
         AddNav("账号管理", "accounts", 68);
         AddNav("任务中心", "tasks", 110);
         AddNav("模型", "models", 152);
-        AddNav("用量", "usage", 194);
-        AddNav("设置", "settings", 236);
+        AddNav("聚合渠道", "agg", 194);
+        AddNav("用量", "usage", 236);
+        AddNav("设置", "settings", 278);
 
         navVersion.Dock = DockStyle.Bottom;
         navVersion.Height = 36;
@@ -545,6 +559,7 @@ class MainForm : Form
         pages["accounts"] = BuildAccountsPage();
         pages["tasks"] = BuildTasksPage();
         pages["models"] = BuildModelsPage();
+        pages["agg"] = BuildAggPage();
         pages["usage"] = BuildUsagePage();
         pages["settings"] = BuildSettingsPage();
         foreach (var p in pages.Values) bodyPanel.Controls.Add(p);
@@ -862,6 +877,7 @@ class MainForm : Form
         var topRow = new FlowLayoutPanel { Location = new Point(32, 112), Size = new Size(900, 36) };
         AddBtn(topRow, "⟳ 刷新列表", delegate { LoadModels(); });
         AddBtn(topRow, "设选中为默认", delegate { SetDefaultModelFromSelection(); });
+        AddBtn(topRow, "🔗 聚合渠道", delegate { ShowPage("agg"); });
         modelMsg = new Label { AutoSize = true, ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 9F), Text = "", Margin = new Padding(8, 7, 4, 4) };
         topRow.Controls.Add(modelMsg);
         page.Controls.Add(topRow);
@@ -971,6 +987,201 @@ class MainForm : Form
             modelsReloadQueued = true; // 忙碌期被吞：Run 收尾自动补跑
             if (modelMsg != null) modelMsg.Text = "加载中…（等待当前操作完成）";
         }
+    }
+
+    /** 聚合渠道页（0.3.62）：与 web 控制台同款能力——总开关、渠道增删启停、拉取模型。
+        keys 从服务端来的是打码值（sk-xxx…），保存时服务端会把打码值还原成原 key。 */
+    Panel BuildAggPage()
+    {
+        var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
+        page.Controls.Add(PageTitle("聚合渠道"));
+        page.Controls.Add(PageSub("自有 key 的 OpenAI 兼容 provider 接进同一个模型池；默认一家都不接，填上 key 它的模型才进选择器（ID 形如 agg:渠道/模型，多 key 自动轮换）。", 60));
+
+        aggLaneCheck.Text = "聚合开关";
+        aggLaneCheck.Location = new Point(32, 92);
+        aggLaneCheck.AutoSize = true;
+        aggLaneCheck.Checked = true;
+        aggLaneCheck.ThreeState = false;
+        aggLaneCheck.CheckedChanged += delegate { if (aggList.Items.Count == 0) return; aggLane = aggLaneCheck.Checked; SaveAgg(aggLane ? "聚合开关已打开" : "聚合开关已关闭（渠道保留，不再贡献模型）"); };
+        page.Controls.Add(aggLaneCheck);
+        aggCount.Location = new Point(140, 94);
+        aggCount.AutoSize = true;
+        aggCount.ForeColor = Accent;
+        aggCount.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        aggCount.Text = "—";
+        page.Controls.Add(aggCount);
+
+        aggList.Location = new Point(32, 122);
+        aggList.Size = new Size(880, 300);
+        aggList.View = View.Details;
+        aggList.FullRowSelect = true;
+        aggList.Font = new Font("Microsoft YaHei UI", 9F);
+        aggList.Columns.Add("渠道", 110);
+        aggList.Columns.Add("状态", 76);
+        aggList.Columns.Add("接口地址", 350);
+        aggList.Columns.Add("Keys", 240);
+        page.Controls.Add(aggList);
+
+        var opRow = new FlowLayoutPanel { Location = new Point(32, 432), Size = new Size(900, 40) };
+        AddBtn(opRow, "启用选中", delegate { SetAggSelectedEnabled(true); });
+        AddBtn(opRow, "停用选中", delegate { SetAggSelectedEnabled(false); });
+        AddBtn(opRow, "删除选中", delegate
+        {
+            if (aggList.SelectedItems.Count == 0) { SetAggMsg("先选中一行", SubText); return; }
+            string name = Str(aggProviders[aggList.SelectedIndices[0]], "name");
+            aggProviders.RemoveAt(aggList.SelectedIndices[0]);
+            RenderAggList();
+            SaveAgg("已删除 " + name);
+        });
+        AddBtn(opRow, "⟳ 拉取模型", delegate
+        {
+            SetAggMsg("拉取中…", SubText);
+            Run(delegate
+            {
+                Program.Api("POST", "/console/api/aggregate/refresh", "{}");
+                LoadAgg();
+            }, delegate { SetAggMsg("模型目录已刷新（新渠道的模型已进选择器）", Accent); });
+        });
+        page.Controls.Add(opRow);
+
+        var addCaption = new Label { Text = "添加渠道", Location = new Point(32, 484), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
+        page.Controls.Add(addCaption);
+        aggNameBox.Location = new Point(32, 510); aggNameBox.Width = 140;
+        aggUrlBox.Location = new Point(182, 510); aggUrlBox.Width = 320;
+        aggKeysBox.Location = new Point(512, 510);
+        aggNameBox.Font = aggUrlBox.Font = aggKeysBox.Font = new Font("Microsoft YaHei UI", 9F);
+        page.Controls.Add(aggNameBox); page.Controls.Add(aggUrlBox); page.Controls.Add(aggKeysBox);
+        var addRow = new FlowLayoutPanel { Location = new Point(32, 542), Size = new Size(900, 40) };
+        AddBtn(addRow, "＋ 添加渠道", delegate
+        {
+            string name = aggNameBox.Text.Trim();
+            string url = aggUrlBox.Text.Trim();
+            var keys = new List<string>();
+            foreach (var k in aggKeysBox.Text.Split(new[] { ',', '，', ';', '；', ' ', '\t' }, StringSplitOptions.RemoveEmptyEntries))
+            {
+                var t = k.Trim();
+                if (t != "") keys.Add(t);
+            }
+            if (name == "" || url == "" || keys.Count == 0) { SetAggMsg("渠道名 / 接口地址 / key 都要填", Danger); return; }
+            if (!url.StartsWith("http://") && !url.StartsWith("https://")) { SetAggMsg("接口地址必须是 http(s):// 开头", Danger); return; }
+            if (aggProviders.Exists(delegate (Dictionary<string, object> p) { return Str(p, "name") == name; })) { SetAggMsg("渠道 " + name + " 已存在", Danger); return; }
+            var d = new Dictionary<string, object>();
+            d["name"] = name; d["baseUrl"] = url; d["apiKeys"] = keys.ToArray(); d["enabled"] = true;
+            aggProviders.Add(d);
+            aggNameBox.Text = ""; aggUrlBox.Text = ""; aggKeysBox.Text = "";
+            RenderAggList();
+            SaveAgg("已添加 " + name);
+        });
+        addRow.Controls.Add(aggMsg);
+        page.Controls.Add(addRow);
+
+        var hint = new Label { Text = "提示：关掉聚合开关不影响 WorkBuddy 账号池；停用渠道会保留 key 只摘出池子。删除/启停/添加都会立即保存。", Location = new Point(32, 592), AutoSize = true, ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 8.5F) };
+        page.Controls.Add(hint);
+
+        page.HorizontalScroll.Enabled = false;
+        page.HorizontalScroll.Visible = false;
+        page.Resize += delegate
+        {
+            int w = Math.Max(360, page.ClientSize.Width - 64);
+            aggList.Width = w;
+            opRow.Width = w; addRow.Width = w;
+            int urlW = Math.Max(200, w - 140 - 240 - 20);
+            aggUrlBox.Width = urlW;
+        };
+        return page;
+    }
+
+    void SetAggMsg(string text, Color c)
+    {
+        aggMsg.Text = text;
+        aggMsg.ForeColor = c;
+        aggMsg.AutoSize = true;
+        aggMsg.Margin = new Padding(8, 7, 4, 4);
+    }
+
+    void RenderAggList()
+    {
+        aggList.BeginUpdate();
+        aggList.Items.Clear();
+        foreach (var p in aggProviders)
+        {
+            bool en = Str(p, "enabled") != "False";
+            var keys = new List<string>();
+            object kv;
+            if (p.TryGetValue("apiKeys", out kv) && kv is object[]) foreach (var k in (object[])kv) if (k != null && k.ToString() != "") keys.Add(k.ToString());
+            var it = new ListViewItem(Str(p, "name"));
+            it.SubItems.Add(en ? "已接入" : "未接入");
+            it.SubItems.Add(Str(p, "baseUrl"));
+            it.SubItems.Add(keys.Count == 0 ? "—" : string.Join(" , ", keys.ToArray()));
+            aggList.Items.Add(it);
+        }
+        aggList.EndUpdate();
+        int inPool = 0;
+        foreach (var p in aggProviders) if (Str(p, "enabled") != "False") inPool++;
+        aggCount.Text = aggProviders.Count + " 家已配置 · " + inPool + " 家在池";
+    }
+
+    void LoadAgg()
+    {
+        SetAggMsg("加载中…", SubText);
+        Run(delegate
+        {
+            string json = Program.Api("GET", "/console/api/aggregate", null);
+            var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            var root = ser.DeserializeObject(json) as Dictionary<string, object>;
+            var list = new List<Dictionary<string, object>>();
+            object pv;
+            if (root != null && root.TryGetValue("providers", out pv) && pv is object[])
+                foreach (var o in (object[])pv) { var d = o as Dictionary<string, object>; if (d != null) list.Add(d); }
+            object mv; int modelCount = 0;
+            if (root != null && root.TryGetValue("models", out mv) && mv is object[]) modelCount = ((object[])mv).Length;
+            object ev; bool lane = !(root != null && root.TryGetValue("enabled", out ev) && ev is bool && !(bool)ev);
+            BeginInvoke((MethodInvoker)delegate
+            {
+                aggProviders = list;
+                aggLane = lane;
+                aggLaneCheck.Checked = lane;
+                RenderAggList();
+                SetAggMsg(modelCount + " 个模型已接入选择器（agg:渠道/模型）", Accent);
+            });
+        });
+    }
+
+    void SaveAgg(string okText)
+    {
+        var arr = new List<object>();
+        foreach (var p in aggProviders)
+        {
+            var d = new Dictionary<string, object>();
+            d["name"] = Str(p, "name");
+            d["baseUrl"] = Str(p, "baseUrl");
+            var keys = new List<string>();
+            object kv;
+            if (p.TryGetValue("apiKeys", out kv) && kv is object[]) foreach (var k in (object[])kv) if (k != null && k.ToString() != "") keys.Add(k.ToString());
+            d["apiKeys"] = keys;
+            d["enabled"] = Str(p, "enabled") != "False";
+            arr.Add(d);
+        }
+        var body = new Dictionary<string, object>();
+        body["providers"] = arr;
+        body["enabled"] = aggLane;
+        string json = new System.Web.Script.Serialization.JavaScriptSerializer().Serialize(body);
+        Run(delegate { Program.Api("POST", "/console/api/aggregate", json); }, delegate { SetAggMsg(okText + " ✓", Accent); LoadModelsIfVisible(); });
+    }
+
+    void LoadModelsIfVisible()
+    {
+        // 聚合变化会影响模型页目录与选择器；模型页打开着就顺带刷新
+        if (pages.ContainsKey("models") && pages["models"].Visible) LoadModels();
+    }
+
+    void SetAggSelectedEnabled(bool en)
+    {
+        if (aggList.SelectedItems.Count == 0) { SetAggMsg("先在列表里选中一个渠道", SubText); return; }
+        var p = aggProviders[aggList.SelectedIndices[0]];
+        p["enabled"] = en;
+        RenderAggList();
+        SaveAgg((en ? "已接入 " : "已摘出 ") + Str(p, "name"));
     }
 
     Panel BuildUsagePage()
@@ -1239,6 +1450,7 @@ class MainForm : Form
     {
         foreach (var kv in pages) kv.Value.Visible = kv.Key == page;
         if (page == "models" && modelList != null && modelList.Items.Count == 0) LoadModels();
+        if (page == "agg" && aggList != null && aggList.Items.Count == 0) LoadAgg();
         foreach (var nb in navButtons) nb.Selected = nb.Text == NavNameOf(page);
         foreach (var nb in navButtons) nb.Invalidate();
     }
@@ -1248,6 +1460,7 @@ class MainForm : Form
         if (page == "accounts") return "账号管理";
         if (page == "tasks") return "任务中心";
         if (page == "models") return "模型";
+        if (page == "agg") return "聚合渠道";
         if (page == "usage") return "用量";
         return "设置";
     }

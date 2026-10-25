@@ -1113,7 +1113,7 @@ export async function handleConsoleApi(ctx) {
     const providers = aggregateProviders(cfg).map((x) => ({ ...x, apiKeys: x.apiKeys.map((k) => k.slice(0, 6) + '…') }));
     let models = [];
     try { models = (await aggregateModels(cfg)).map((m) => m.id); } catch { /* 目录失败给空 */ }
-    return sendJson(res, 200, { providers, models, all: (cfg.aggregate?.providers || []).length });
+    return sendJson(res, 200, { providers, models, all: (cfg.aggregate?.providers || []).length, enabled: cfg.aggregate?.enabled !== false });
   }
   if (p === '/aggregate' && method === 'POST') {
     // 整包替换 providers（前端聚合渠道卡编辑后提交）。key 打码值（以 … 结尾且长度≤7）
@@ -1133,11 +1133,13 @@ export async function handleConsoleApi(ctx) {
       if (next.some((x) => x.name === name)) return sendJson(res, 400, { error: `渠道名 ${name} 重复` });
       next.push({ name, baseUrl, apiKeys, enabled: q.enabled !== false });
     }
-    cfg.aggregate = { providers: next };
+    // 聚合总开关（0.3.62，仿 dsh 泳道开关）：false 时聚合渠道不贡献任何模型；缺省 = 开
+    const laneEnabled = body.enabled === false ? false : cfg.aggregate?.enabled !== false;
+    cfg.aggregate = { enabled: laneEnabled, providers: next };
     const { invalidateAggregateCatalog } = await import('./aggregate.mjs');
     invalidateAggregateCatalog();
     saveConfig(cfg);
-    return sendJson(res, 200, { ok: true, count: next.length });
+    return sendJson(res, 200, { ok: true, count: next.length, enabled: laneEnabled });
   }
   if (p === '/aggregate/refresh' && method === 'POST') {
     const { aggregateModels, invalidateAggregateCatalog } = await import('./aggregate.mjs');

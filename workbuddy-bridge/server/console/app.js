@@ -173,10 +173,11 @@ function paint(el, html) {
 /* ---------- 0.3.24 视图路由：无页签，大屏(home)为唯一主页面，其余全部是下钻子页面 ----------
  * 导航模型：大屏面板/卡片点「详情」进子页面 → 返回条「← 返回大屏」或浏览器后退回大屏；
  * location.hash 同步（#/accounts 等），刷新/转发链接都能直接落到对应子页面。 */
-const VIEWS = ['home', 'accounts', 'models', 'tasks', 'usage', 'events', 'settings', 'help'];
+const VIEWS = ['home', 'accounts', 'models', 'agg', 'tasks', 'usage', 'events', 'settings', 'help'];
 const VIEW_META = {
   accounts: ['账号与积分', '账号卡 · 到期批次 · 策略 · 扫码登录'],
   models: ['模型库', '清单 · 倍率 · 巡检 · 设为默认'],
+  agg: ['聚合渠道', '自有 key 的 OpenAI 兼容 provider · agg:渠道/模型'],
   tasks: ['任务中心', '签到 · 连登 · 成长任务 · 猫猫旅行 · 日历'],
   usage: ['用量分析', '消耗图表 · 按模型/账号 · CSV 导出'],
   events: ['事件时间线', '任务 / 账号 / 策略 / 登录 回放'],
@@ -212,6 +213,7 @@ function enterView(name, focus = null) {
   if (name === 'home') { loadOverview(); void loadTcSummary(); refreshTimer = setInterval(loadOverview, 30000); }
   if (name === 'accounts') { loadAccounts().then(() => focusAcct(focus)).catch(() => {}); refreshTimer = setInterval(loadAccounts, 30000); }
   if (name === 'models') { loadModels(); refreshTimer = setInterval(loadModels, 60000); }
+  if (name === 'agg') { loadAggregate(); } // 进页拉一次即可，无轮询
   if (name === 'tasks') { loadTasks(); loadTaskCenter(); void loadTcSummary(); refreshTimer = setInterval(loadTasks, 30000); }
   if (name === 'usage') { loadUsage(); refreshTimer = setInterval(loadUsage, 60000); }
   if (name === 'events') { loadEvents(); refreshTimer = setInterval(loadEvents, 30000); }
@@ -1349,73 +1351,13 @@ async function loadModels() {
         </div>
         <div style="overflow:auto">${hrows ? `<table><thead><tr><th>模型</th><th>站点</th><th>倍率</th><th>状态 / 延迟</th></tr></thead><tbody>${hrows}</tbody></table>` : '<div class="muted" style="padding:16px;text-align:center">还没有巡检结果 —— 点「▶ 全量巡检」实测所有模型（约 10~30 秒）</div>'}</div>
       </div>
-      <details class="secd" id="aggCard" style="margin-top:14px">
-        <summary>🔗 聚合渠道 <span class="sub">自有 key 的 OpenAI 兼容 provider · 模型 ID 形如 agg:渠道/模型 · 多 key 自动轮换</span></summary>
-        <div style="padding:6px 0 12px">
-          <div id="aggList" style="margin-bottom:10px"></div>
-          <div class="row" style="flex-wrap:wrap;gap:8px">
-            <input id="aggName" placeholder="渠道名（字母数字_-）" style="width:150px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-            <input id="aggUrl" placeholder="https://api.example.com/v1" style="flex:1;min-width:220px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-            <input id="aggKeys" placeholder="API key（多个用逗号分隔，轮换使用）" style="flex:1;min-width:220px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
-            <button class="btn mini" id="aggAdd">＋ 添加渠道</button>
-            <button class="btn mini" id="aggRefresh">⟳ 拉取模型</button>
-            <span class="muted" id="aggMsg" style="font-size:12px"></span>
-          </div>
-          <div id="aggModels" class="muted" style="font-size:12px;margin-top:8px"></div>
-        </div>
-      </details>`);
-    // ---- 聚合渠道泳道（0.3.58）----
-    let aggProviders = [];
-    const renderAgg = () => {
-      $('#aggList').innerHTML = aggProviders.length ? aggProviders.map((p, i) => `
-        <div class="row" style="gap:8px;padding:7px 0;border-bottom:1px solid var(--line)">
-          <b style="min-width:90px">${esc(p.name)}</b>
-          <span class="muted" style="flex:1;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.baseUrl)}">${esc(p.baseUrl)}</span>
-          <span class="badge" title="key 已打码显示，保存时以 … 结尾的打码值会自动保留原值">${(p.apiKeys || []).map(esc).join(' , ') || '—'}</span>
-          <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input type="checkbox" data-agg-en="${i}" ${p.enabled !== false ? 'checked' : ''}> 启用</label>
-          <button class="btn mini" data-agg-del="${i}">删除</button>
-        </div>`).join('') : '<div class="muted" style="font-size:12.5px;padding:6px 0">还没有聚合渠道 —— 填名称 / baseUrl / key 添加（例如任意 OpenAI 兼容中转的免费额度）</div>';
-      for (const b of el.querySelectorAll('[data-agg-del]')) b.onclick = () => { aggProviders.splice(Number(b.dataset.aggDel), 1); renderAgg(); };
-      for (const c of el.querySelectorAll('[data-agg-en]')) c.onchange = () => { aggProviders[Number(c.dataset.aggEn)].enabled = c.checked; };
-    };
-    const saveAgg = async () => {
-      try {
-        const r = await api('/aggregate', { method: 'POST', body: { providers: aggProviders } });
-        $('#aggMsg').textContent = `已保存 ${r.count} 个渠道`;
-        toast('聚合渠道已保存，模型 ID 形如 agg:渠道/模型', 'ok');
-        await loadAgg();
-      } catch (e) { $('#aggMsg').textContent = ''; toast('保存失败：' + e.message, 'bad'); }
-    };
-    const loadAgg = async () => {
-      try {
-        const r = await api('/aggregate');
-        aggProviders = r.providers || [];
-        renderAgg();
-        $('#aggModels').textContent = (r.models || []).length ? `已接入 ${(r.models || []).length} 个模型：${(r.models || []).slice(0, 8).join('、')}${(r.models || []).length > 8 ? ' …' : ''}` : '（还没有拉到模型 —— 添加渠道后点「⟳ 拉取模型」）';
-      } catch (e) { $('#aggModels').textContent = '聚合渠道加载失败：' + e.message; }
-    };
-    $('#aggAdd').onclick = () => {
-      const name = $('#aggName').value.trim();
-      const baseUrl = $('#aggUrl').value.trim();
-      const apiKeys = $('#aggKeys').value.split(/[,，;；\s]+/).map((s) => s.trim()).filter(Boolean);
-      if (!name || !baseUrl || !apiKeys.length) { toast('渠道名 / baseUrl / key 都要填', 'bad'); return; }
-      if (aggProviders.some((p) => p.name === name)) { toast(`渠道 ${name} 已存在`, 'bad'); return; }
-      aggProviders.push({ name, baseUrl, apiKeys, enabled: true });
-      $('#aggName').value = ''; $('#aggUrl').value = ''; $('#aggKeys').value = '';
-      renderAgg();
-      saveAgg();
-    };
-    $('#aggRefresh').onclick = async () => {
-      const b = $('#aggRefresh');
-      b.disabled = true; b.textContent = '拉取中…';
-      try {
-        const r = await api('/aggregate/refresh', { method: 'POST' });
-        toast(`已拉到 ${r.count} 个聚合模型`, 'ok');
-        await loadAgg();
-      } catch (e) { toast('拉取失败：' + e.message, 'bad'); }
-      b.disabled = false; b.textContent = '⟳ 拉取模型';
-    };
-    loadAgg();
+      <div class="row" style="margin-top:12px;align-items:center;gap:10px">
+        <span class="badge acc">🔗 聚合渠道</span>
+        <span class="muted" style="font-size:12.5px">自有 key 的 OpenAI 兼容 provider（模型 ID 形如 agg:渠道/模型）——配置已移到独立页</span>
+        <button class="btn mini" id="goAgg">打开聚合渠道页 →</button>
+      </div>`);
+    $('#goAgg').onclick = () => showView('agg');
+    // ---- 聚合渠道泳道（0.3.58 起，0.3.62 独立成页 loadAggregate；此处只留跳转） ----
     $('#btnModelsRefresh').onclick = async () => {
       const b = $('#btnModelsRefresh');
       b.disabled = true; b.textContent = '同步中…';
@@ -2260,6 +2202,95 @@ function loadClientCard() {
       };
     }
   }).catch(() => { el.innerHTML = '<div class="muted" style="padding:10px">桌面客户端状态获取失败</div>'; });
+}
+
+/* ---------- 聚合渠道独立页（0.3.62）----------
+ * 入口形态参考 dsh-xdpool 的 AggregatePage：一级导航直达（不再藏在模型页底部的
+ * 折叠条里）、hero 说明「默认一家都不接，填 key 才进池」、泳道总开关（关掉后
+ * 聚合渠道不再贡献任何模型，WorkBuddy 账号池不受影响）、计数徽标、渠道行收拢。 */
+function loadAggregate() {
+  const el = $('#view-agg');
+  if (!el) return;
+  el.innerHTML = `
+    <h2>聚合渠道 <span class="sub">自有 key 的 OpenAI 兼容 provider 接进同一个模型池</span></h2>
+    <div class="card" style="margin-bottom:14px">
+      <div class="row" style="align-items:center;gap:12px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;font-size:13.5px;flex-shrink:0" title="关闭后聚合渠道不再贡献任何模型，WorkBuddy 账号池不受影响">
+          <input type="checkbox" id="aggLane"> <b>聚合开关</b>
+        </label>
+        <span class="badge acc" id="aggCount">加载中…</span>
+        <span class="muted" style="font-size:12.5px;flex:1;min-width:260px">把各家免费额度 / 自有中转接进同一个池。这里默认一家都不接：填上 key，它的模型才会出现在选择器里（ID 形如 <code class="mono">agg:渠道/模型</code>，多 key 自动轮换）。关闭聚合开关不影响 WorkBuddy 账号池。</span>
+      </div>
+    </div>
+    <div class="card" style="margin-bottom:14px">
+      <div id="aggList"></div>
+      <div class="row" style="flex-wrap:wrap;gap:8px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line)">
+        <input id="aggName" placeholder="渠道名（字母数字_-）" style="width:150px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+        <input id="aggUrl" placeholder="https://api.example.com/v1（OpenAI 兼容）" style="flex:1;min-width:220px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+        <input id="aggKeys" placeholder="API key（多个用逗号分隔，轮换使用）" style="flex:1;min-width:220px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+        <button class="btn mini primary" id="aggAdd">＋ 添加渠道</button>
+        <button class="btn mini" id="aggRefresh">⟳ 拉取模型</button>
+        <span class="muted" id="aggMsg" style="font-size:12px"></span>
+      </div>
+      <div id="aggModels" class="muted" style="font-size:12px;margin-top:8px"></div>
+    </div>`;
+  let aggProviders = [];
+  let aggLane = true;
+  const renderAgg = () => {
+    $('#aggList').innerHTML = aggProviders.length ? aggProviders.map((p, i) => `
+      <div class="row" style="gap:8px;padding:8px 0;border-bottom:1px solid var(--line);align-items:center">
+        <b style="min-width:90px">${esc(p.name)}</b>
+        <span class="badge ${p.enabled !== false ? 'ok' : ''}">${p.enabled !== false ? '已接入' : '未接入'}</span>
+        <span class="muted" style="flex:1;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.baseUrl)}">${esc(p.baseUrl)}</span>
+        <span class="badge" title="key 已打码显示，保存时以 … 结尾的打码值会自动保留原值">${(p.apiKeys || []).map(esc).join(' , ') || '—'}</span>
+        <label style="display:flex;align-items:center;gap:4px;font-size:12.5px" title="保留 key 的前提下把这家摘出池子"><input type="checkbox" data-agg-en="${i}" ${p.enabled !== false ? 'checked' : ''}> 启用</label>
+        <button class="btn mini" data-agg-del="${i}" style="color:var(--bad)">删除</button>
+      </div>`).join('') : '<div class="muted" style="font-size:12.5px;padding:10px 0">还没有聚合渠道 —— 填名称 / baseUrl / key 添加（例如任意 OpenAI 兼容中转的免费额度）</div>';
+    for (const b of el.querySelectorAll('[data-agg-del]')) b.onclick = () => { aggProviders.splice(Number(b.dataset.aggDel), 1); renderAgg(); saveAgg(); };
+    for (const c of el.querySelectorAll('[data-agg-en]')) c.onchange = () => { aggProviders[Number(c.dataset.aggEn)].enabled = c.checked; renderAgg(); saveAgg(); };
+    $('#aggCount').textContent = `${aggProviders.length} 家已配置 · ${(aggProviders.filter((p) => p.enabled !== false)).length} 家在池`;
+  };
+  const saveAgg = async () => {
+    try {
+      const r = await api('/aggregate', { method: 'POST', body: { providers: aggProviders, enabled: aggLane } });
+      $('#aggMsg').textContent = `已保存 ${r.count} 个渠道`;
+      toast('聚合渠道已保存，模型 ID 形如 agg:渠道/模型', 'ok');
+      await loadAgg();
+    } catch (e) { $('#aggMsg').textContent = ''; toast('保存失败：' + e.message, 'bad'); }
+  };
+  const loadAgg = async () => {
+    try {
+      const r = await api('/aggregate');
+      aggProviders = r.providers || [];
+      aggLane = r.enabled !== false;
+      $('#aggLane').checked = aggLane;
+      renderAgg();
+      $('#aggModels').textContent = (r.models || []).length ? `已接入 ${(r.models || []).length} 个模型：${(r.models || []).slice(0, 8).join('、')}${(r.models || []).length > 8 ? ' …' : ''}` : '（还没有拉到模型 —— 添加渠道后点「⟳ 拉取模型」）';
+    } catch (e) { $('#aggModels').textContent = '聚合渠道加载失败：' + e.message; }
+  };
+  $('#aggLane').onchange = () => { aggLane = $('#aggLane').checked; saveAgg(); };
+  $('#aggAdd').onclick = () => {
+    const name = $('#aggName').value.trim();
+    const baseUrl = $('#aggUrl').value.trim();
+    const apiKeys = $('#aggKeys').value.split(/[,，;；\s]+/).map((s) => s.trim()).filter(Boolean);
+    if (!name || !baseUrl || !apiKeys.length) { toast('渠道名 / baseUrl / key 都要填', 'bad'); return; }
+    if (aggProviders.some((p) => p.name === name)) { toast(`渠道 ${name} 已存在`, 'bad'); return; }
+    aggProviders.push({ name, baseUrl, apiKeys, enabled: true });
+    $('#aggName').value = ''; $('#aggUrl').value = ''; $('#aggKeys').value = '';
+    renderAgg();
+    saveAgg();
+  };
+  $('#aggRefresh').onclick = async () => {
+    const b = $('#aggRefresh');
+    b.disabled = true; b.textContent = '拉取中…';
+    try {
+      const r = await api('/aggregate/refresh', { method: 'POST' });
+      toast(`已拉到 ${r.count} 个聚合模型`, 'ok');
+      await loadAgg();
+    } catch (e) { toast('拉取失败：' + e.message, 'bad'); }
+    b.disabled = false; b.textContent = '⟳ 拉取模型';
+  };
+  loadAgg();
 }
 
 function loadHelp() {
