@@ -3,6 +3,7 @@
 import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId, reportFrameError } from './upstream.mjs';
 import { resolveTarget } from './router.mjs';
 import { openWithSiteFallback, openWithModelChain } from './openai.mjs';
+import { aggregateOpen } from './aggregate.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
 import { startSSE, writeSSEEvent, sendJson, sendError, writeAsync, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
@@ -138,7 +139,9 @@ export async function handleMessages(ctx) {
     target,
     openaiBody,
     signal,
-    (s, b) => openChatRotating(cfg, s, b, { signal }).then((x) => x.up)
+    target.aggregate
+      ? (s, b) => aggregateOpen(cfg, target.aggregate.provider, b, signal)
+      : (s, b) => openChatRotating(cfg, s, b, { signal }).then((x) => x.up)
   );
   const up = r.up;
   site = r.site;
@@ -162,7 +165,7 @@ export async function handleMessages(ctx) {
     // 兜底：max_tokens 过小导致空回答时放大预算重试一次。
     // 加 frames/finish 守卫：零帧空流（上游异常）重试也是空流，白打一次计费请求
     const askedMax = Number(body.max_tokens ?? 0);
-    if (!agg.content && agg.toolCallList.length === 0 && (agg.finishReason === 'length' || agg.frames > 0) && askedMax > 0 && askedMax < 1024) {
+    if (!agg.content && agg.toolCallList.length === 0 && !target.aggregate && (agg.finishReason === 'length' || agg.frames > 0) && askedMax > 0 && askedMax < 1024) {
       warn(`[${site}] 空回答（finish=${agg.finishReason}，max_tokens=${askedMax}），放大到 1024 重试一次`);
       // 与 openai 入口对齐（0.3.53 P2）：①改走 openChatRotating 拿账号轮换（重试不该
       // 又选中刚失败的号）；②重试的传输失败不顶掉已拿到的（空但合法的）结果

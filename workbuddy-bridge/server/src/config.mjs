@@ -177,6 +177,9 @@ export function defaultConfig() {
     // 模型链（0.3.56，可选）：模型层失败（限流/额度/模型不存在）时按序换下一个模型，
     // 例如 { "glm-5.3-flash": ["glm-5.2", "hy3"] }
     modelChains: {},
+    // 聚合渠道泳道（0.3.58，可选）：用户自有 key 的 OpenAI 兼容 provider，
+    // 模型 ID 形如 agg:<name>/<model>
+    aggregate: { providers: [] },
     timeouts: {
       headerMs: 90000, // 上游首字节（响应头）超时
       idleMs: 300000, // 流中空闲超时
@@ -462,6 +465,28 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
   if (!isPlainObject(cfg.modelChains)) {
     fix('modelChains 必须是对象（模型 → 候选数组），已回退为 {}');
     cfg.modelChains = {};
+  }
+  // 聚合渠道（0.3.58）：providers 必须是数组；name 只允许 [A-Za-z0-9_-]（进模型 ID）、
+  // baseUrl 必须 http(s)、apiKeys 非空字符串数组；重名以后者为准（去重）
+  if (!isPlainObject(cfg.aggregate) || !Array.isArray(cfg.aggregate.providers)) {
+    fix('aggregate.providers 必须是数组，已回退为 []');
+    cfg.aggregate = { providers: [] };
+  } else {
+    const seenNames = new Set();
+    const clean = [];
+    for (const p of cfg.aggregate.providers) {
+      if (!isPlainObject(p)) { fix('aggregate.providers 里有非对象项，已移除'); continue; }
+      const name = String(p.name ?? '').trim();
+      if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) { fix(`聚合渠道名 "${p.name}" 非法（只允许字母数字_-，≤32 字符），已移除`); continue; }
+      if (seenNames.has(name)) { fix(`聚合渠道 ${name} 重名，保留后一条`); }
+      const baseUrl = String(p.baseUrl ?? '').trim().replace(/\/+$/, '');
+      if (!/^https?:\/\/.+/.test(baseUrl)) { fix(`聚合渠道 ${name} 的 baseUrl 非法，已移除`); continue; }
+      const apiKeys = (Array.isArray(p.apiKeys) ? p.apiKeys : []).map((k) => String(k ?? '').trim()).filter(Boolean);
+      if (!apiKeys.length) { fix(`聚合渠道 ${name} 没有可用 key，已移除`); continue; }
+      seenNames.add(name);
+      clean.push({ name, baseUrl, apiKeys, enabled: p.enabled !== false });
+    }
+    cfg.aggregate.providers = clean;
   }
   if (!isPlainObject(cfg.modelAliases)) {
     fix('modelAliases 必须是对象，已回退为 {}');

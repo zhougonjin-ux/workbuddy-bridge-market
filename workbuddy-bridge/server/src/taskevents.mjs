@@ -435,7 +435,7 @@ export async function setAppearanceTheme(cfg, site, accountId, resourceKey) {
 export async function marketExpertList(cfg, site, accountId, expertType = '') {
   const { auth } = await ensureToken(cfg, site, { accountId });
   const siteCfg = cfg.sites[site];
-  const body = { page: 1, page_size: 20, sort_by: 'reco_rank', sort_order: 'desc' };
+  const body = { page: 1, page_size: 50, sort_by: 'reco_rank', sort_order: 'desc' };
   if (expertType !== '') body.expert_type = expertType;
   const json = await postJSON(siteCfg.apiBase + MARKET_EXPERT_LIST_PATH, { ...chatHeaders(siteCfg, auth), 'User-Agent': DESKTOP_TASK_UA }, body, '专家市场列表');
   const data = json?.data ?? {};
@@ -598,6 +598,10 @@ export async function chainsFor(cfg, site, accountId, task) {
     case 'Expert_lighthouse':
       return lighthouseChains(cfg, site, accountId);
     default:
+      // 活动专家任务（0.3.58）：expert_use_*（jump_url 内嵌 id）/ WorkBuddy_Valorant（按名匹配）
+      if (/^expert_use_/.test(task.code) || task.code === 'WorkBuddy_Valorant') {
+        return campaignExpertChains(cfg, site, accountId, task);
+      }
       return [];
   }
 }
@@ -610,9 +614,59 @@ async function sendChain(cfg, site, accountId, chain) {
   await reportDesktopEvents(cfg, site, accountId, chain.events ?? []);
 }
 
-/** 该任务是否由事件链负责（判断「能不能自动完成」的补充口径）。 */
+/** 该任务是否由事件链负责（判断「能不能自动完成」的补充口径）。
+ *  0.3.58：活动专家任务两类也走链——expert_use_*（jump_url 内嵌专家 id）与
+ *  WorkBuddy_Valorant（市场列表按名匹配），标题形如 体验「某专家」。 */
 export function isEventChainTask(code) {
-  return EVENT_CHAIN_CODES.includes(code);
+  return EVENT_CHAIN_CODES.includes(code) || /^expert_use_/.test(code) || code === 'WorkBuddy_Valorant';
+}
+
+/** 从任务标题里取专家显示名（体验「XX专家」的内层引号）。 */
+export function expertNameFromTitle(title) {
+  const m = String(title || '').match(/[「『]([^」』]+)[」』]/);
+  return m ? m[1] : null;
+}
+
+/** 从任务的 jump_url 里取内嵌的专家 id（workbuddy://experts?expertId=ex_xxx）。 */
+export function expertIdFromJumpUrl(url) {
+  const m = String(url || '').match(/expertId(?:=|%3D)([A-Za-z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+/** 活动专家链（0.3.58）：召唤 + 真使用。专家定位优先 jump_url 内嵌 id（任务自带，
+ *  最可靠——实测四个 expert_use_* 都不在市场推荐列表的前 200 个里）；没有 id 再按
+ *  标题名匹配市场列表（WorkBuddy_Valorant 走这条路）。市场列表只用来补展示字段，
+ *  拉不到不拦链（id 本身已足够定位）。 */
+async function campaignExpertChains(cfg, site, accountId, task) {
+  const name = expertNameFromTitle(task.title);
+  let expert = null;
+  const byId = expertIdFromJumpUrl(task.jumpUrl);
+  if (byId) {
+    try {
+      const listed = await marketExpertList(cfg, site, accountId, '');
+      const hit = listed.find((x) => x.expertId === byId);
+      if (hit) expert = hit;
+    } catch { /* 列表拉不到不拦链 */ }
+    if (!expert) {
+      expert = { expertId: byId, expertType: 'agent', displayName: name || byId, profession: '', version: '', categories: [] };
+    }
+  } else if (name) {
+    const experts = await marketExpertList(cfg, site, accountId, '');
+    expert = experts.find((x) => x.displayName === name)
+      || experts.find((x) => x.displayName.includes(name) || name.includes(x.displayName))
+      || null;
+  }
+  if (!expert) throw new Error(`找不到「${name || task.code}」对应的专家`);
+  await reportDesktopEvents(cfg, site, accountId, expertSummonEvents(expert));
+  const chat = await openServerConversation(cfg, site, accountId, expert.expertId);
+  if (chat == null) throw new Error(`专家「${expert.displayName}」真会话打开失败`);
+  return [{
+    transport: 'desktop',
+    events: [
+      ...expertChatEvents(expert, chat.conversationId, chat.requestId),
+      expertActualUseEvent(expert, chat.conversationId, chat.requestId),
+    ],
+  }];
 }
 
 /**

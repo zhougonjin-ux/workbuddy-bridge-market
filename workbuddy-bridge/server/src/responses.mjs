@@ -8,6 +8,7 @@
 // 设计原则：只新增，不改动 /v1/chat/completions 的任何既有行为。
 import { resolveTarget } from './router.mjs';
 import { openWithModelChain } from './openai.mjs';
+import { aggregateOpen } from './aggregate.mjs';
 import { openChat, openChatRotating, classifyFrame, upstreamErrorMessage, reportFrameError } from './upstream.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
 import { startSSE, writeSSEEvent, sendJson, sendError, estimateTokens, startHeartbeat } from './util.mjs';
@@ -282,7 +283,10 @@ export async function handleResponses(ctx) {
   // 与 openai/anthropic 入口共用同一条降级编排（openWithModelChain：站点降级之上
   // 还带模型链）。原来只有网关 502/503/504 一条降级路径，连接失败/模型不存在/额度
   // 受限都直接报死给客户端。
-  const r = await openWithModelChain(cfg, target, chatReq, signal, (s, b) => openChatRotating(cfg, s, b, { signal }).then((x) => x.up));
+  const r = await openWithModelChain(cfg, target, chatReq, signal,
+    target.aggregate
+      ? (s, b) => aggregateOpen(cfg, target.aggregate.provider, b, signal)
+      : (s, b) => openChatRotating(cfg, s, b, { signal }).then((x) => x.up));
   const up = r.up;
   site = r.site;
   model = r.model;

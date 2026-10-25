@@ -4,6 +4,7 @@ import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErr
 import { ensureToken } from './auth.mjs';
 import { isQuotaError } from './pool.mjs';
 import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText, effectiveSuffixText, chainCandidates } from './router.mjs';
+import { aggregateOpen, aggregateModels } from './aggregate.mjs';
 import { recordUsage, estimateCredit, observedCostByModel } from './usage.mjs';
 import { startSSE, writeSSE, sendJson, sendError, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
@@ -220,7 +221,10 @@ export async function handleChatCompletions(ctx) {
     upstreamBody.max_tokens = cfg.defaultMaxTokens;
   }
 
-  const r = await openWithModelChain(cfg, target, upstreamBody, signal, (s, b) => openWithRetry(cfg, s, b, signal));
+  const r = await openWithModelChain(cfg, target, upstreamBody, signal,
+    target.aggregate
+      ? (s, b) => aggregateOpen(cfg, target.aggregate.provider, b, signal)
+      : (s, b) => openWithRetry(cfg, s, b, signal));
   let up = r.up;
   site = r.site;
   model = r.model;
@@ -321,7 +325,7 @@ export async function handleChatCompletions(ctx) {
   // 兜底：客户端 max_tokens 太小（思考型模型把预算全用在思考上）导致空回答时，放大预算重试一次
   const askedMax = Number(body.max_tokens ?? body.max_completion_tokens ?? 0);
   const emptyAnswer = !agg.content && agg.toolCallList.length === 0;
-  if (emptyAnswer && (agg.finishReason === 'length' || agg.frames > 0) && askedMax > 0 && askedMax < 1024) {
+  if (emptyAnswer && !target.aggregate && (agg.finishReason === 'length' || agg.frames > 0) && askedMax > 0 && askedMax < 1024) {
     const bumped = { ...upstreamBody, max_tokens: Math.max(1024, askedMax * 4) };
     delete bumped.max_completion_tokens;
     warn(`[${site}] 空回答（finish=${agg.finishReason}，max_tokens=${askedMax}），放大到 ${bumped.max_tokens} 重试一次`);
@@ -493,6 +497,16 @@ export async function handleModels(ctx) {
       data.push({ id: m.id, object: 'model', created: 1700000000, owned_by: 'workbuddy', name: m.name || m.id, site: cfg.defaultSite });
     }
   }
+
+  // 聚合渠道泳道（0.3.58）：自有 key 的外部 provider 模型，ID 形如 agg:<渠道>/<模型>。
+  // 目录拉取失败静默跳过（provider 不在线时不污染目录）。
+  try {
+    for (const a of await aggregateModels(cfg)) {
+      if (seen.has(a.id)) continue;
+      seen.add(a.id);
+      data.push({ id: a.id, object: 'model', created: 1700000000, owned_by: `aggregate:${a.provider}`, name: `${a.provider} · ${a.model}`, site: 'aggregate' });
+    }
+  } catch { /* 聚合目录失败不影响主目录 */ }
 
   sendJson(res, 200, { object: 'list', data, source: merged.length ? 'upstream' : 'config' });
 }

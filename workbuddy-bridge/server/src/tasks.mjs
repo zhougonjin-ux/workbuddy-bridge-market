@@ -209,6 +209,8 @@ export async function listGrowthTasks(cfg, site, accountId) {
       target: tgt,
       claimable: !claimed && tgt > 0 && cur >= tgt,
       claimed,
+      // 0.3.58：活动专家任务的 jump_url 内嵌 expertId（ex_xxx）——事件链按它定位专家
+      jumpUrl: String(t.jump_url || ''),
     };
   });
 }

@@ -1348,7 +1348,74 @@ async function loadModels() {
           <span class="muted" id="hcOnlyNow" style="font-size:12px">${(hcfg.only || []).length || hcfg.onlyFree ? '当前：' + esc(((hcfg.only || []).length ? (hcfg.only || []).join('、') : '全部') + (hcfg.onlyFree ? '（且仅免费）' : '')) : '当前：全量巡检'}</span>
         </div>
         <div style="overflow:auto">${hrows ? `<table><thead><tr><th>模型</th><th>站点</th><th>倍率</th><th>状态 / 延迟</th></tr></thead><tbody>${hrows}</tbody></table>` : '<div class="muted" style="padding:16px;text-align:center">还没有巡检结果 —— 点「▶ 全量巡检」实测所有模型（约 10~30 秒）</div>'}</div>
-      </div>`);
+      </div>
+      <details class="secd" id="aggCard" style="margin-top:14px">
+        <summary>🔗 聚合渠道 <span class="sub">自有 key 的 OpenAI 兼容 provider · 模型 ID 形如 agg:渠道/模型 · 多 key 自动轮换</span></summary>
+        <div style="padding:6px 0 12px">
+          <div id="aggList" style="margin-bottom:10px"></div>
+          <div class="row" style="flex-wrap:wrap;gap:8px">
+            <input id="aggName" placeholder="渠道名（字母数字_-）" style="width:150px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            <input id="aggUrl" placeholder="https://api.example.com/v1" style="flex:1;min-width:220px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            <input id="aggKeys" placeholder="API key（多个用逗号分隔，轮换使用）" style="flex:1;min-width:220px;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--panel2);color:var(--text);font-size:13px">
+            <button class="btn mini" id="aggAdd">＋ 添加渠道</button>
+            <button class="btn mini" id="aggRefresh">⟳ 拉取模型</button>
+            <span class="muted" id="aggMsg" style="font-size:12px"></span>
+          </div>
+          <div id="aggModels" class="muted" style="font-size:12px;margin-top:8px"></div>
+        </div>
+      </details>`);
+    // ---- 聚合渠道泳道（0.3.58）----
+    let aggProviders = [];
+    const renderAgg = () => {
+      $('#aggList').innerHTML = aggProviders.length ? aggProviders.map((p, i) => `
+        <div class="row" style="gap:8px;padding:7px 0;border-bottom:1px solid var(--line)">
+          <b style="min-width:90px">${esc(p.name)}</b>
+          <span class="muted" style="flex:1;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(p.baseUrl)}">${esc(p.baseUrl)}</span>
+          <span class="badge" title="key 已打码显示，保存时以 … 结尾的打码值会自动保留原值">${(p.apiKeys || []).map(esc).join(' , ') || '—'}</span>
+          <label style="display:flex;align-items:center;gap:4px;font-size:12.5px"><input type="checkbox" data-agg-en="${i}" ${p.enabled !== false ? 'checked' : ''}> 启用</label>
+          <button class="btn mini" data-agg-del="${i}">删除</button>
+        </div>`).join('') : '<div class="muted" style="font-size:12.5px;padding:6px 0">还没有聚合渠道 —— 填名称 / baseUrl / key 添加（例如任意 OpenAI 兼容中转的免费额度）</div>';
+      for (const b of el.querySelectorAll('[data-agg-del]')) b.onclick = () => { aggProviders.splice(Number(b.dataset.aggDel), 1); renderAgg(); };
+      for (const c of el.querySelectorAll('[data-agg-en]')) c.onchange = () => { aggProviders[Number(c.dataset.aggEn)].enabled = c.checked; };
+    };
+    const saveAgg = async () => {
+      try {
+        const r = await api('/aggregate', { method: 'POST', body: { providers: aggProviders } });
+        $('#aggMsg').textContent = `已保存 ${r.count} 个渠道`;
+        toast('聚合渠道已保存，模型 ID 形如 agg:渠道/模型', 'ok');
+        await loadAgg();
+      } catch (e) { $('#aggMsg').textContent = ''; toast('保存失败：' + e.message, 'bad'); }
+    };
+    const loadAgg = async () => {
+      try {
+        const r = await api('/aggregate');
+        aggProviders = r.providers || [];
+        renderAgg();
+        $('#aggModels').textContent = (r.models || []).length ? `已接入 ${(r.models || []).length} 个模型：${(r.models || []).slice(0, 8).join('、')}${(r.models || []).length > 8 ? ' …' : ''}` : '（还没有拉到模型 —— 添加渠道后点「⟳ 拉取模型」）';
+      } catch (e) { $('#aggModels').textContent = '聚合渠道加载失败：' + e.message; }
+    };
+    $('#aggAdd').onclick = () => {
+      const name = $('#aggName').value.trim();
+      const baseUrl = $('#aggUrl').value.trim();
+      const apiKeys = $('#aggKeys').value.split(/[,，;；\s]+/).map((s) => s.trim()).filter(Boolean);
+      if (!name || !baseUrl || !apiKeys.length) { toast('渠道名 / baseUrl / key 都要填', 'bad'); return; }
+      if (aggProviders.some((p) => p.name === name)) { toast(`渠道 ${name} 已存在`, 'bad'); return; }
+      aggProviders.push({ name, baseUrl, apiKeys, enabled: true });
+      $('#aggName').value = ''; $('#aggUrl').value = ''; $('#aggKeys').value = '';
+      renderAgg();
+      saveAgg();
+    };
+    $('#aggRefresh').onclick = async () => {
+      const b = $('#aggRefresh');
+      b.disabled = true; b.textContent = '拉取中…';
+      try {
+        const r = await api('/aggregate/refresh', { method: 'POST' });
+        toast(`已拉到 ${r.count} 个聚合模型`, 'ok');
+        await loadAgg();
+      } catch (e) { toast('拉取失败：' + e.message, 'bad'); }
+      b.disabled = false; b.textContent = '⟳ 拉取模型';
+    };
+    loadAgg();
     $('#btnModelsRefresh').onclick = async () => {
       const b = $('#btnModelsRefresh');
       b.disabled = true; b.textContent = '同步中…';

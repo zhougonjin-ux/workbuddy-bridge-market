@@ -402,19 +402,22 @@ export async function resolveTarget(cfg, requestedModel) {
 
   let target = await resolveTargetInner(cfg, requestedModel);
 
-  const 改派站点 = await 改派到有额度的站点(cfg, target.site, target.model);
-  if (改派站点) {
-    warn(
-      `[${target.site}] 该站点当前没有可用账号，直接改派到 ${改派站点}（模型 ${target.model}）`
-      + `，不再先撞一次失败`,
-    );
-    target = { ...target, site: 改派站点, fallback: await computeFallback(cfg, 改派站点, target.model) };
-  }
-
-  try {
-    await getCatalog(cfg, target.site);
-  } catch {
-    /* 目录拿不到不影响主流程，压缩会退化成「按比例收缩」 */
+  // 聚合渠道泳道（0.3.58）：自有 key 的外部 provider 没有「账号/额度改派」语义，
+  // 也不需要站点目录预载（转发是直连，不经过压缩上限表）
+  if (!target.aggregate) {
+    const 改派站点 = await 改派到有额度的站点(cfg, target.site, target.model);
+    if (改派站点) {
+      warn(
+        `[${target.site}] 该站点当前没有可用账号，直接改派到 ${改派站点}（模型 ${target.model}）`
+        + '，不再先撞一次失败',
+      );
+      target = { ...target, site: 改派站点, fallback: await computeFallback(cfg, 改派站点, target.model) };
+    }
+    try {
+      await getCatalog(cfg, target.site);
+    } catch {
+      /* 目录拿不到不影响主流程，压缩会退化成「按比例收缩」 */
+    }
   }
   return target;
 }
@@ -424,6 +427,24 @@ async function resolveTargetInner(cfg, requestedModel) {
   let raw = stripMultiplierSuffix(String(requestedModel || '').trim());
   const sites = siteKeys(cfg);
   if (!raw) raw = cfg.defaultModel;
+
+  // -1) 聚合渠道泳道（0.3.58）：agg:<渠道>/<模型> —— 用户自有 key 的 OpenAI 兼容
+  //     provider（控制台「资源池 → 聚合渠道」添加）。不走账号池/站点目录/换站降级，
+  //     入口层按 target.aggregate 改走直连转发。
+  if (raw.toLowerCase().startsWith('agg:')) {
+    const rest = raw.slice(4);
+    const slash = rest.indexOf('/');
+    const provider = slash > 0 ? rest.slice(0, slash).trim() : '';
+    const model = slash > 0 ? rest.slice(slash + 1).trim() : '';
+    if (!provider || !model) {
+      throw Object.assign(new Error(`聚合模型格式应为 agg:<渠道>/<模型>，收到 ${raw}`), { status: 400 });
+    }
+    const { aggregateProviders } = await import('./aggregate.mjs');
+    if (!aggregateProviders(cfg).some((p) => p.name === provider)) {
+      throw Object.assign(new Error(`聚合渠道 ${provider} 不存在或未启用（在控制台「资源池 → 聚合渠道」添加）`), { status: 404 });
+    }
+    return { site: 'aggregate', model, requested: raw, aggregate: { provider, model } };
+  }
 
   // 0) 特殊哨兵：客户端只配一个 `default` 模型，之后切换模型全在控制台完成；
   //    `auto` 是上游的自动路由入口（seedModels 里有同名条目）。

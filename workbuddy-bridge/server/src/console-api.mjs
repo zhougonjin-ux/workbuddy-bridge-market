@@ -1107,6 +1107,48 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, 200, { ok: true, aliases: cfg.modelAliases, routes: cfg.modelRoutes, chains: cfg.modelChains, allowModels: cfg.allowModels, excludeModels: cfg.excludeModels });
   }
 
+  // ---- 聚合渠道泳道（0.3.58）----
+  if (p === '/aggregate' && method === 'GET') {
+    const { aggregateProviders, aggregateModels } = await import('./aggregate.mjs');
+    const providers = aggregateProviders(cfg).map((x) => ({ ...x, apiKeys: x.apiKeys.map((k) => k.slice(0, 6) + '…') }));
+    let models = [];
+    try { models = (await aggregateModels(cfg)).map((m) => m.id); } catch { /* 目录失败给空 */ }
+    return sendJson(res, 200, { providers, models, all: (cfg.aggregate?.providers || []).length });
+  }
+  if (p === '/aggregate' && method === 'POST') {
+    // 整包替换 providers（前端聚合渠道卡编辑后提交）。key 打码值（以 … 结尾且长度≤7）
+    // 视为「保留原值」，避免 GET→POST 回显把真 key 抹掉
+    const body = ctx.body || {};
+    if (!Array.isArray(body.providers)) return sendJson(res, 400, { error: 'providers 必须是数组' });
+    const prev = new Map((cfg.aggregate?.providers || []).map((x) => [x.name, x]));
+    const next = [];
+    for (const q of body.providers) {
+      const name = String(q?.name ?? '').trim();
+      const baseUrl = String(q?.baseUrl ?? '').trim().replace(/\/+$/, '');
+      let apiKeys = Array.isArray(q?.apiKeys) ? q.apiKeys.map((k) => String(k ?? '').trim()).filter(Boolean) : [];
+      apiKeys = apiKeys.map((k) => (/…$/.test(k) && k.length <= 7 && prev.get(name) ? prev.get(name).apiKeys.find((old) => old.startsWith(k.slice(0, 6))) ?? k : k));
+      if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: `渠道名 ${JSON.stringify(q?.name)} 非法（字母数字_-，≤32）` });
+      if (!/^https?:\/\/.+/.test(baseUrl)) return sendJson(res, 400, { error: `渠道 ${name} 的 baseUrl 必须是 http(s) 地址` });
+      if (!apiKeys.length) return sendJson(res, 400, { error: `渠道 ${name} 至少要一个 API key` });
+      if (next.some((x) => x.name === name)) return sendJson(res, 400, { error: `渠道名 ${name} 重复` });
+      next.push({ name, baseUrl, apiKeys, enabled: q.enabled !== false });
+    }
+    cfg.aggregate = { providers: next };
+    const { invalidateAggregateCatalog } = await import('./aggregate.mjs');
+    invalidateAggregateCatalog();
+    saveConfig(cfg);
+    return sendJson(res, 200, { ok: true, count: next.length });
+  }
+  if (p === '/aggregate/refresh' && method === 'POST') {
+    const { aggregateModels, invalidateAggregateCatalog } = await import('./aggregate.mjs');
+    invalidateAggregateCatalog();
+    let models = [];
+    try { models = (await aggregateModels(cfg, { force: true })).map((m) => m.id); } catch (e) {
+      return sendJson(res, 502, { error: '聚合目录拉取失败：' + String(e.message || e).slice(0, 120) });
+    }
+    return sendJson(res, 200, { ok: true, models, count: models.length });
+  }
+
   // ---- T19：模型清单过滤（白/黑名单预览：保存前看看哪些模型会被剔除）----
   if (p === '/models-filter' && method === 'POST') {
     const body = ctx.body || {};
