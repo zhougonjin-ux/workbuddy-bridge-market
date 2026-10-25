@@ -17,6 +17,7 @@ import { accountSnapshot } from './src/auth.mjs';
 import { startLogin, pollLogin } from './src/device-login.mjs';
 import { poolPathFor } from './src/pool.mjs';
 import { log, warn } from './src/log.mjs';
+import { terminalQR } from './src/termqr.mjs';
 
 const cfg = loadConfig();
 const args = process.argv.slice(2);
@@ -83,7 +84,19 @@ async function main() {
   console.log('');
   console.log('============================================================');
   console.log(` 站点：${siteKey}  ${site.label}`);
-  console.log(' 请在浏览器中打开下面的链接，用你的账号登录：');
+  // 终端二维码（0.3.40）：手机微信直接扫屏幕即可，不必复制链接。
+  // --no-qr 可跳过（脚本化场景/终端不支持块字符时）。
+  if (!args.includes('--no-qr')) {
+    try {
+      console.log(' 用微信「扫一扫」扫描下方二维码登录：');
+      console.log('');
+      console.log(terminalQR(authUrl));
+      console.log('');
+    } catch (e) {
+      warn(`终端二维码生成失败（不影响登录，请用下方链接）：${e.message}`);
+    }
+  }
+  console.log(' 或在浏览器中打开下面的链接，用你的账号登录：');
   console.log('');
   console.log('   ' + authUrl);
   console.log('');

@@ -24,26 +24,52 @@ import { billingHeaders } from './headers.mjs';
 import { normalizeCreditDetail } from './expiry.mjs';
 import { siteKeys } from './config.mjs';
 import { log, warn } from './log.mjs';
+import { openEncryptedFieldAuto, desktopAuthFiles } from './wbatrest.mjs';
 
 /** iss / 域名 → 代理站点键。 */
 function siteByIss(iss) {
   const s = String(iss || '');
   if (/codebuddy\.cn/i.test(s)) return 'cn-cli';
+  // 国内版上游 apiBase 就是 copilot.tencent.com，客户端若改签这个 realm 也能对上号；
+  // workbuddy.cn 是国内版 WorkBuddy 的可能域名，一并归入国内 CLI 站点
+  if (/copilot\.tencent\.com/i.test(s)) return 'cn-cli';
+  if (/workbuddy\.cn/i.test(s)) return 'cn-cli';
   if (/codebuddy\.ai/i.test(s)) return 'intl-cli';
   if (/workbuddy\.ai/i.test(s)) return 'intl-work';
   return null;
 }
 
-/** 收集候选配置文件（.codebuddy 下的 settings*.json，兼容未来更多文件名）。 */
+/**
+ * 收集候选配置文件。0.3.42 起扫 ~/.codebuddy 根目录全部 *.json（单文件 ≤2MB），
+ * 不再限定 settings*.json 文件名 —— 客户端改文件名/加新配置文件时自动覆盖，
+ * 也接住实测存在的 settings.agent-studio-before-ide-hooks.json 这类派生文件。
+ * 只扫根目录不递归：实测 logs/diagnostics/local_storage 里没有明文 JWT，
+ * 递归只会白耗 IO。桌面客户端凭证见 detectDesktopLogin（加密，无法静态导入）。
+ */
 function candidateFiles() {
   // USERPROFILE 只在 Windows 有：macOS/Linux 跑代理时回落 homedir，别静默扫出 0 个文件
   const dir = path.join(process.env.USERPROFILE || os.homedir(), '.codebuddy');
   let names = [];
   try { names = fs.readdirSync(dir); } catch { return []; }
   return names
-    .filter((n) => /^settings.*\.json$/i.test(n))
-    .map((n) => path.join(dir, n));
+    .filter((n) => /\.json$/i.test(n))
+    .map((n) => path.join(dir, n))
+    .filter((p) => { try { return fs.statSync(p).size <= 2 * 1024 * 1024; } catch { return false; } });
 }
+
+/** 候选文件的 mtime+大小 签名：客户端续期 token 会改写 settings.json，签名随之一变。 */
+export function localImportSignature() {
+  return [
+    ...candidateFiles(),
+    ...desktopAuthFiles(),
+  ]
+    .map((p) => { try { const st = fs.statSync(p); return `${path.basename(p)}:${st.mtimeMs}:${st.size}`; } catch { return ''; } })
+    .filter(Boolean)
+    .join('|');
+}
+
+/** 毫秒/秒双形态时间戳归一（桌面客户端 .info 里的 expiresAt 两种都出现过）。 */
+const expiryToMs = (value) => (typeof value === 'number' && value > 0 ? (value > 1e12 ? value : value * 1000) : 0);
 
 /**
  * 检测 WorkBuddy 桌面客户端的登录态文件（0.3.41）。
@@ -158,10 +184,57 @@ export async function importLocalAccounts(cfg, { silent = false } = {}) {
     }
   }
 
+  // 桌面客户端多账号导入（0.3.43）：CodeBuddyExtension 的 auth 目录里，
+  // live 文件 + 每次换登留下的时间戳快照各是一个账号（换登几次就攒几个号）。
+  // token 是 $wbEncrypted 密文，密钥靠让 WorkBuddy.exe 自己交出（wbatrest.mjs）。
+  // 带 refreshToken —— 入池即可自动续期 + 保活，比 CLI 导入（只有 accessToken）更强。
+  let desktopDecryptFailed = false;
+  const desktopFiles = desktopAuthFiles();
+  for (const file of desktopFiles) {
+    let json;
+    try { json = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
+    const auth = typeof json.auth === 'object' && json.auth !== null ? json.auth : {};
+    const identity = typeof json.account === 'object' && json.account !== null ? json.account : {};
+    const uid = typeof identity.uid === 'string' ? identity.uid : '';
+    if (!uid) continue;
+    const site = siteByIss(typeof auth.domain === 'string' ? auth.domain : '');
+    if (!site || !cfg.sites[site] || cfg.sites[site].enabled === false || !siteKeys(cfg).includes(site)) continue;
+    // refresh 窗口已关的凭证救不回来（上游不再接受续期），跳过
+    const refreshExpiresAtMs = expiryToMs(auth.refreshExpiresAt);
+    if (refreshExpiresAtMs && refreshExpiresAtMs < Date.now()) {
+      found.push({ uid: uid.slice(0, 8) + '…', nickname: '桌面客户端快照', site, exp: null, status: 'skipped', reason: '凭证的刷新窗口已关闭，等客户端续期后的新快照' });
+      continue;
+    }
+    const short = uid.slice(0, 8) + '…';
+    const token = await openEncryptedFieldAuto(auth.accessToken);
+    if (!token) {
+      desktopDecryptFailed = true;
+      found.push({ uid: short, nickname: 'WorkBuddy 桌面客户端', site, exp: null, status: 'skipped', reason: '桌面客户端已登录，但 token 解密失败（未装客户端可执行文件或构建换了密钥）' });
+      continue;
+    }
+    const refreshToken = await openEncryptedFieldAuto(auth.refreshToken) || null;
+    const nickname = await openEncryptedFieldAuto(identity.nickname) || null;
+    const expMs = expiryToMs(auth.expiresAt) || 0;
+    if (expMs && expMs <= Date.now()) {
+      found.push({ uid: short, nickname: nickname || '', site, exp: expMs, status: 'skipped', reason: '快照 token 已过期，等客户端续期后再导入' });
+      continue;
+    }
+    const prev = byUid.get(uid);
+    // 同一账号多来源竞争：exp 新者胜；exp 相当（±5 分钟）时带 refreshToken 的桌面凭证胜——
+    // 它入池即可自动续期，长期价值高于 CLI 的裸 accessToken
+    const better = !prev
+      || expMs > prev.expMs
+      || (refreshToken && !prev.refreshToken && expMs > prev.expMs - 5 * 60_000);
+    if (better) byUid.set(uid, { token, claims: { sub: uid, nickname }, site, expMs, file, refreshToken, nickname });
+  }
+
   let imported = 0, updated = 0, skipped = 0;
+  const desktopImported = new Set();
+  let desktopRotationPending = false;
   for (const [uid, item] of byUid) {
-    const { token, claims, site, expMs } = item;
-    const auth = { accessToken: token, refreshToken: null, expiresAt: expMs || undefined, uid: String(uid) };
+    const { token, claims, site, expMs, refreshToken = null, nickname = null } = item;
+    const fromDesktop = Boolean(refreshToken);
+    const auth = { accessToken: token, refreshToken, expiresAt: expMs || undefined, uid: String(uid) };
     hydrateFromToken(site, auth);
 
     let credit = null;
@@ -169,10 +242,23 @@ export async function importLocalAccounts(cfg, { silent = false } = {}) {
     try {
       credit = await validateWithBilling(cfg, site, auth);
     } catch (e) {
-      // 网络抖动不拦导入（池里 token 临期会自动刷新，到期自动切换），401 类才拒绝
+      // 网络抖动不拦导入（池里 token 临期会自动刷新，到期自动切换），401 类才拒绝。
+      // 桌面来源的 401 有专属语义：客户端刷新轮换（Keycloak rotation）后旧 access
+      // 立即作废，live 快照可能落后于客户端内存里的最新会话——这是「等下一次写盘」
+      // 而不是「去扫码」，与 dsh 的 stale-sign-in 分类同源。
       if (/401|403|失效/.test(e.message)) {
         skipped++;
-        found.push({ uid: String(uid).slice(0, 8) + '…', nickname: claims.nickname || '', site, exp: expMs, status: 'skipped', reason: e.message });
+        // 桌面快照 401 = 客户端刷新轮换作废了旧 access：等下一次写盘，别出「去扫码」指引
+        if (fromDesktop) desktopRotationPending = true;
+        found.push({
+          uid: String(uid).slice(0, 8) + '…',
+          nickname: claims.nickname || '',
+          site, exp: expMs,
+          status: 'skipped',
+          reason: fromDesktop
+            ? '桌面快照的 token 已被客户端刷新轮换作废，等客户端下一次写盘后自动重试'
+            : e.message,
+        });
         continue;
       }
       verifyNote = `（上游验证暂不可达：${String(e.message).slice(0, 60)}，已先入池）`;
@@ -180,7 +266,7 @@ export async function importLocalAccounts(cfg, { silent = false } = {}) {
 
     const pool = loadPool(site);
     const exist = pool.accounts.find((a) => a.uid && String(a.uid) === uid);
-    if (exist && exist.refreshToken) {
+    if (exist && exist.refreshToken && !fromDesktop) {
       found.push({ uid: String(uid).slice(0, 8) + '…', nickname: claims.nickname || exist.label, site, exp: expMs, status: 'skipped', reason: '池里已有同账号且支持自动续期（扫码登录），不覆盖' });
       skipped++;
       continue;
@@ -190,16 +276,19 @@ export async function importLocalAccounts(cfg, { silent = false } = {}) {
       exist.expiresAt = expMs || exist.expiresAt;
       exist.lastError = null;
       exist.importedAt = new Date().toISOString();
-      if (!exist.label) exist.label = claims.nickname || exist.label;
+      // 桌面凭证带 refreshToken：写入后该账号即可自动续期 + 保活（CLI 来源只有裸 token）
+      if (refreshToken) exist.refreshToken = refreshToken;
+      if (!exist.label || fromDesktop) exist.label = claims.nickname || claims.preferred_username || exist.label;
       savePool(site, pool);
       updated++;
-      found.push({ uid: String(uid).slice(0, 8) + '…', nickname: exist.label || claims.nickname || '', site, exp: expMs, status: 'updated', reason: '已用客户端最新的 token 更新' + verifyNote });
+      if (fromDesktop) desktopImported.add(String(uid));
+      found.push({ uid: String(uid).slice(0, 8) + '…', nickname: exist.label || claims.nickname || '', site, exp: expMs, status: 'updated', reason: (fromDesktop ? '已用桌面客户端最新的 token 更新（含自动续期能力）' : '已用客户端最新的 token 更新') + verifyNote });
     } else {
       const acc = {
         id: 'acc_' + crypto.randomBytes(4).toString('hex'),
-        label: (claims.nickname || `本机账号${pool.accounts.length + 1}`) + '（本机导入）',
+        label: (claims.nickname || claims.preferred_username || `本机账号${pool.accounts.length + 1}`) + '（本机导入）',
         accessToken: token,
-        refreshToken: null,
+        refreshToken,
         expiresAt: expMs || null,
         uid: String(uid),
         nickname: claims.nickname || null,
@@ -213,22 +302,24 @@ export async function importLocalAccounts(cfg, { silent = false } = {}) {
         lastError: null,
         addedAt: new Date().toISOString(),
         importedAt: new Date().toISOString(),
-        source: 'local-import',
+        source: fromDesktop ? 'desktop-import' : 'local-import',
       };
       pool.accounts.push(acc);
       pool.nextLabel = Math.max(pool.nextLabel || 1, pool.accounts.length + 1);
       savePool(site, pool);
       imported++;
-      found.push({ uid: String(uid).slice(0, 8) + '…', nickname: acc.label, site, exp: expMs, status: 'imported', reason: '导入成功' + verifyNote });
+      if (fromDesktop) desktopImported.add(String(uid));
+      found.push({ uid: String(uid).slice(0, 8) + '…', nickname: acc.label, site, exp: expMs, status: 'imported', reason: '导入成功' + (fromDesktop ? '（桌面客户端，含自动续期能力）' : '') + verifyNote });
     }
     if (credit) updateCreditDetail(site, (loadPool(site).accounts.find((a) => a.uid && String(a.uid) === uid) || {}).id, credit);
   }
 
-  // WorkBuddy 桌面客户端登录态检测（0.3.41）：token 加密解不了，但 uid 明文可读。
-  // 检测到就在结果里如实告知「检测到登录但 token 加密」，别让弹窗笼统地说「没有发现」——
-  // 用户明明登录着客户端，看到那句话只会以为是桥接坏了。
+  // WorkBuddy 桌面客户端登录态检测（0.3.41 引入 / 0.3.43 升级）：desktopAuthFiles
+  // 解密成功并已入池的账号不再出指引；只有「检测到登录但解密失败」（未装客户端
+  // 可执行文件/构建换密钥）或「在池但快照未更新」时才如实告知，别让弹窗笼统地
+  // 说「没有发现」——用户明明登录着客户端，看到那句话只会以为是桥接坏了。
   const desktop = detectDesktopLogin();
-  if (desktop) {
+  if (desktop && !desktopImported.has(desktop.uid) && !desktopRotationPending) {
     const short = String(desktop.uid).slice(0, 8) + '…';
     const inPool = siteKeys(cfg).some((site) => loadPool(site).accounts.find((a) => a.uid && String(a.uid) === desktop.uid));
     found.push({
@@ -236,10 +327,12 @@ export async function importLocalAccounts(cfg, { silent = false } = {}) {
       nickname: 'WorkBuddy 桌面客户端',
       site: 'cn-cli',
       exp: null,
-      status: inPool ? 'skipped' : 'skipped',
+      status: 'skipped',
       reason: inPool
         ? '桌面客户端已登录（该账号已在账号池中，无需导入）'
-        : '检测到桌面客户端已登录，但 token 是加密存储（密钥只在客户端内存），无法静态导入——请在控制台「＋ 添加账号」扫码登录同一账号',
+        : desktopDecryptFailed
+          ? '检测到桌面客户端已登录，但 token 解密失败（未装客户端可执行文件或构建换了密钥）——请在控制台「＋ 添加账号」扫码登录同一账号'
+          : '检测到桌面客户端已登录，但 token 是加密存储（密钥只在客户端内存），无法静态导入——请在控制台「＋ 添加账号」扫码登录同一账号',
     });
   }
 
@@ -249,4 +342,52 @@ export async function importLocalAccounts(cfg, { silent = false } = {}) {
     else log(`本机导入：新增 ${imported} / 更新 ${updated} / 跳过 ${skipped}`);
   }
   return { scannedFiles: files.length, imported, updated, skipped, found, desktop };
+}
+
+/* ---------------- 客户端续期自动重扫（0.3.42） ----------------
+ *
+ * 本机导入的账号没有 refreshToken：token 过期后唯一的新鲜来源是客户端自己
+ * 续期时改写的 ~/.codebuddy/settings.json。以前只有「服务重启」或「用户手动
+ * 点导入」两个时机重扫 —— 客户端续期后池里的旧 token 撑到过期就 401，用户
+ * 还得手动补。现在 60 秒一跳对比候选文件的 mtime 签名，变了就自动重扫一次
+ * （最少间隔 5 分钟防抖：客户端写盘可能连发多次，导入本身带上游验证也不便宜）。
+ * data 目录 config.json 里 { "localImport": { "autoRescan": false } } 可关。 */
+
+let watchTimer = null;
+let lastSignature = null;
+let lastImportAt = 0;
+let rescanning = false;
+
+const WATCH_TICK_MS = 60_000;
+const RESCAN_MIN_GAP_MS = 5 * 60_000;
+
+/** 启动客户端续期监听（幂等；已启动直接返回 stop 函数）。 */
+export function startLocalImportWatch(cfg) {
+  if (cfg.localImport?.autoRescan === false) return () => {};
+  if (watchTimer) return stopLocalImportWatch;
+  try { lastSignature = localImportSignature(); } catch { lastSignature = null; }
+  watchTimer = setInterval(() => {
+    if (rescanning) return;
+    let sig;
+    try { sig = localImportSignature(); } catch { return; }
+    if (!sig || sig === lastSignature) return;
+    // 签名变了；启动后首次变化也要遵守防抖（客户端批量写盘的连续变化只重扫一次）
+    lastSignature = sig;
+    if (Date.now() - lastImportAt < RESCAN_MIN_GAP_MS) return;
+    rescanning = true;
+    importLocalAccounts(cfg, { silent: true })
+      .then((r) => {
+        lastImportAt = Date.now();
+        // 0 = 客户端只是改了别的配置；非 0 才值得留痕
+        if (r.imported || r.updated) log(`本机导入（客户端续期自动重扫）：新增 ${r.imported} / 更新 ${r.updated}`);
+      })
+      .catch((e) => warn('本机账号自动重扫失败：', e.message))
+      .finally(() => { rescanning = false; });
+  }, WATCH_TICK_MS);
+  watchTimer.unref?.();
+  return stopLocalImportWatch;
+}
+
+export function stopLocalImportWatch() {
+  if (watchTimer) { clearInterval(watchTimer); watchTimer = null; }
 }

@@ -201,6 +201,9 @@ export function defaultConfig() {
       //   round-robin   最久未用的先用（原上游代理默认行为）
       //   pinned        固定用 pinnedAccountId 指定的账号，不可用时回落 expiry-first
       //   free-first    default/auto 请求自动改道到「真免费」（倍率 x0）的模型；没有免费模型则维持默认
+      //   sticky        会话粘滞：同一对话（按首条 user 消息识别）钉死同一账号，保上游
+      //                 prompt cache（按账号隔离）；绑定 30 分钟无活动自动解除
+      //   balanced      随机偏向闲置久的账号（加权随机），长期消耗趋于均摊
       policy: 'expiry-first',
       pinnedAccountId: null,
     },
@@ -218,10 +221,12 @@ export function defaultConfig() {
       enabled: true,
       checkin: true,          // 每日签到（/v2/billing/meter/daily-checkin）
       growth: true,           // 成长任务（/v2/activity/growth/tasks*）
+      report: true,           // 活跃上报（0.3.47：每天一次 chat_request_send 事件，让成长中心知道账号还在用）
       checkinHours: [9, 21],  // 签到尝试时点（本地小时；已签到的账号自动跳过）
       growthHours: [1, 13],   // 成长任务扫描时点
       checkinTimes: [],       // 精确时点 ["HH:MM"]；非空时优先于 checkinHours
       growthTimes: [],        // 同上，精确到分钟
+      reportTimes: ['08:00'], // 活跃上报时点（借鉴 dsh：先于任务落地）
       travelTimes: ['09:00', '15:00', '21:00'], // 猫猫旅行巡逻时点（状态机幂等，一天可多次）
       listTimes: ['09:00', '15:00', '21:00'],  // 控制台任务中心列表的每日自动刷新时点（预取缓存）
       doctorTimes: ['10:00'], // 每日自动体检时点：有 fail 项推通知，全绿只记时间线；空数组=关闭
@@ -557,7 +562,7 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     fix('tasks 必须是对象，已回退为默认值');
     cfg.tasks = structuredClone(defaults.tasks);
   } else {
-    for (const k of ['enabled', 'checkin', 'growth']) {
+    for (const k of ['enabled', 'checkin', 'growth', 'report']) {
       if (typeof cfg.tasks[k] !== 'boolean') cfg.tasks[k] = defaults.tasks[k];
     }
     for (const k of ['checkinHours', 'growthHours']) {
@@ -567,7 +572,7 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
       }
     }
     // 精确时点 ["HH:MM"]：非空时优先于 *Hours
-    for (const k of ['checkinTimes', 'growthTimes', 'travelTimes', 'listTimes', 'doctorTimes']) {
+    for (const k of ['checkinTimes', 'growthTimes', 'reportTimes', 'travelTimes', 'listTimes', 'doctorTimes']) {
       if (cfg.tasks[k] === undefined) { cfg.tasks[k] = defaults.tasks[k]; continue; }
       if (!Array.isArray(cfg.tasks[k])) cfg.tasks[k] = structuredClone(defaults.tasks[k]);
       else {

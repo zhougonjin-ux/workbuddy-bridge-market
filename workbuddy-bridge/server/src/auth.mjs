@@ -230,7 +230,7 @@ export async function refreshToken(cfg, site, accountId = null) {
       if (res.status === 401 || res.status === 403) {
         clearAuth(site, id);
         throw new AuthError(
-          `[${site}] 登录态已失效（刷新响应 HTTP ${res.status} 非 JSON）：请重新登录 —— node login.mjs --site ${site}`,
+          `[${site}] 登录态已失效（刷新响应 HTTP ${res.status} 非 JSON）：请在控制台「账号」页点「🔁 扫码重登」或「＋ 添加账号」重新扫码，或 node login.mjs --site ${site}`,
           'not_logged_in',
         );
       }
@@ -246,7 +246,7 @@ export async function refreshToken(cfg, site, accountId = null) {
         clearAuth(site, id);
         err.code = 'not_logged_in';
         err.status = 401;
-        err.message = `[${site}] 登录态已失效（HTTP ${res.status} code=${json.code}）：请重新登录 —— node login.mjs --site ${site}`;
+        err.message = `[${site}] 登录态已失效（HTTP ${res.status} code=${json.code}）：请在控制台「账号」页点「🔁 扫码重登」或「＋ 添加账号」重新扫码，或 node login.mjs --site ${site}`;
         warn(err.message);
       }
       throw err;
@@ -322,19 +322,24 @@ export function accountSnapshot(site) {
     creditDetail: Array.isArray(a.creditDetail) ? a.creditDetail : null,
     creditCheckedAt: a.creditCheckedAt ?? null,
     manualExpireAt: a.manualExpireAt ?? null,
+    minRemain: Number.isFinite(Number(a.minRemain)) ? Number(a.minRemain) : null,
   }));
 }
 
 /**
  * 取站点可用 accessToken：临期自动刷新（单飞，避免并发刷新风暴）。
- * 返回值：{ token, accountId }（accountId 用于失败时上报给号池）。
+ * 返回值：{ token, accountId, auth }——auth 是本次选用账号的**快照**（token/uid/
+ * enterpriseId/domain 等拼身份头要用的字段都在里面）。调用方必须直接用这个返回值，
+ * 不要再跨 await 调 getAuth(site) 读全局「当前生效账号」：ensureToken 内部有 await
+ * （刷新单飞、401 强刷、保活），窗口期内其他并发请求会覆盖全局账号，之后读 getAuth
+ * 拿到的是别人的凭证——token 用错号、积分余额写进错的账号（0.3.53 P1 修复）。
  * exclude 里的账号 id 会被跳过——调用方在「换个号重试」时传入。
  */
-export async function ensureToken(cfg, site = cfg.defaultSite, { force = false, exclude = [], accountId = null } = {}) {
+export async function ensureToken(cfg, site = cfg.defaultSite, { force = false, exclude = [], accountId = null, stickyKey = null } = {}) {
   const id = accountId || (() => {
     // 优先选可用账号；一个都没有时退而取一个「耗尽/冷却中」的，
     // 让上游给最终答案（额度可能已重置），好过本地直接失败。
-    const picked = pickAccount(site, { exclude }) || pickAccount(site, { exclude, fallback: true });
+    const picked = pickAccount(site, { exclude, stickyKey }) || pickAccount(site, { exclude, fallback: true, stickyKey });
     return picked ? picked.id : null;
   })();
 
@@ -361,11 +366,14 @@ export async function ensureToken(cfg, site = cfg.defaultSite, { force = false, 
   // undefined，每个请求都会命中 needRefresh。10 秒内刚成功刷过就直接用现有 token，
   // 把「每请求一刷」压到最多 6 次/分钟；正常账号（有 exp）完全不受影响。
   if (!force && needRefresh && a.accessToken && Date.now() - (recentRefreshAt.get(key) || 0) < 10_000) {
-    return { token: a.accessToken, accountId: id };
+    return { token: a.accessToken, accountId: id, auth: { ...a } };
   }
-  if (!needRefresh) return { token: a.accessToken, accountId: id };
+  if (!needRefresh) return { token: a.accessToken, accountId: id, auth: { ...a } };
 
-  // 单飞按「站点 + 账号」粒度，不同账号互不阻塞
+  // 单飞按「站点 + 账号」粒度，不同账号互不阻塞。
+  // 刷新失败只由「创建 Promise 的一端」上报一次 markFailure：N 个并发请求 join 同一个
+  // Promise 时若在各自的 catch 里记账，一次瞬时失败会把失败计数放大 N 倍，冷却阶梯
+  // 从 30s 直接跳到 10 分钟（0.3.53 P2 修复）。joiner 只重抛，不重复记账。
   if (!refreshInFlight.has(key)) {
     const p = refreshToken(cfg, site, id)
       .then(() => {
@@ -374,21 +382,21 @@ export async function ensureToken(cfg, site = cfg.defaultSite, { force = false, 
         // 绝不把 undefined 拼成 Bearer undefined 打上游
         return getAccount(site, id)?.accessToken ?? a.accessToken;
       })
+      .catch((e) => {
+        // 刷新失败：把这个号标成不可用并退避，然后交给上层换号重试
+        if (e.code !== 'not_logged_in') {
+          try {
+            markFailure(site, id, { status: e.status || 0, message: e.message });
+          } catch {
+            /* 上报失败不影响主流程 */
+          }
+        }
+        throw e;
+      })
       .finally(() => refreshInFlight.delete(key));
     refreshInFlight.set(key, p);
   }
-  try {
-    const token = await refreshInFlight.get(key);
-    return { token, accountId: id };
-  } catch (e) {
-    // 刷新失败：把这个号标成不可用并退避，然后交给上层换号重试
-    if (e.code !== 'not_logged_in') {
-      try {
-        markFailure(site, id, { status: e.status || 0, message: e.message });
-      } catch {
-        /* 上报失败不影响主流程 */
-      }
-    }
-    throw e;
-  }
+  const token = await refreshInFlight.get(key);
+  const fresh = getAccount(site, id);
+  return { token, accountId: id, auth: fresh ? { ...fresh } : { ...a } };
 }

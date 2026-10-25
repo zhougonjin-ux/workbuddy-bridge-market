@@ -7,6 +7,7 @@
 // 所有上游调用走 upstream.mjs 现有封装（token 刷新、超时、错误分类都复用）。
 import { siteKeys, saveConfig } from './config.mjs';
 import { listAccounts, updateCreditDetail, markExhausted, pickAccount } from './pool.mjs';
+import { refreshToken } from './auth.mjs';
 import { queryCredit, supportsCreditQuery } from './upstream.mjs';
 import { suggestedPlan } from './expiry.mjs';
 import { log, warn } from './log.mjs';
@@ -44,6 +45,8 @@ export function scheduleCreditRefreshSoon(cfg, delayMs = 4000) {
  * 立即刷新一个站点所有启用账号的积分/到期明细。
  * 返回 { results: [{id, label, ok, remain?, error?}] }。
  */
+const balanceNotifyDay = new Map(); // uid → 已通知日期（保留线跌破气泡每账号每天一次）
+
 export async function refreshCreditsOnce(cfg, site) {
   const results = [];
   if (!supportsCreditQuery(cfg, site)) return results;
@@ -52,6 +55,17 @@ export async function refreshCreditsOnce(cfg, site) {
     try {
       const credit = await queryCredit(cfg, site, a.id);
       updateCreditDetail(site, a.id, credit);
+      // 保留线跌破通知（0.3.51）：用户设了保留积分下限且余额跌破——气泡（每账号每天一次），
+      // 该账号同时会被 pickAccount 停止派活（isUsable 的 minRemain 判断）。
+      try {
+        const min = Number(a.minRemain);
+        const dayKey = new Date().toISOString().slice(0, 10);
+        if (Number.isFinite(min) && min > 0 && typeof credit.remain === 'number' && credit.remain < min
+          && balanceNotifyDay.get(a.id) !== dayKey) {
+          balanceNotifyDay.set(a.id, dayKey);
+          notify(cfg, '余额跌破保留线', (a.label || a.id) + ' 剩 ' + credit.remain + '（保留线 ' + min + '）——该账号已暂停派活，充值或调低保留线后恢复');
+        }
+      } catch { /* 通知失败不影响刷新 */ }
       // 明细为空（计费接口偶发返回空 Accounts）时 remain 恒为 0，不能据此判耗尽——
       // 否则健康账号被误标 6 小时 exhaustedAt，且每轮刷新周而复始
       if (Array.isArray(credit.detail) && credit.detail.length > 0 && typeof credit.remain === 'number' && credit.remain <= 0) {
@@ -108,6 +122,12 @@ export function startCreditLoop(cfg) {
     } catch (e) {
       warn('积分刷新循环异常：', e.message);
     }
+    // Token 保活巡检（内部 24h/账号节流）：过期前主动续期，别让 token 走到「过期后刷新被判死」
+    try {
+      await tokenKeepAliveScan(cfg);
+    } catch (e) {
+      warn('token 保活巡检异常：', e.message);
+    }
     // 根据活跃度决定下一轮间隔：10 分钟内有请求 → 下限间隔；否则逐级放慢
     const active = Date.now() - lastRequestAt < 10 * 60_000;
     if (active) idleStretch = 1;
@@ -132,6 +152,43 @@ export function startCreditLoop(cfg) {
   log(`积分/到期明细刷新已启动（自适应 TTL：活跃 ${minMin} 分钟 / 空闲最多 ${baseMin * 3} 分钟）`);
 }
 
+/* ---------------- Token 保活巡检（0.3.41） ----------------
+ *
+ * 事故（2026-10-25 周火火 401 code=12153）：上游的刷新接口在 accessToken **过期后**
+ * 才调用会直接判死（12153「登录已过期，需重新授权」），而 ensureToken 只在临期
+ * 5 分钟内的请求里顺带续期 —— 过期窗口期间恰好没有请求（夜里/没在用），就永远
+ * 错过最后的续期机会，refreshToken 还活着也救不回来。
+ * 修复：积分刷新循环每轮顺带巡检，距过期 <48h 且有 refreshToken 的账号主动续期，
+ * 让 accessToken 永远不进入「已过期」状态（expiresIn 22 天的 token，每 24h 检查
+ * 一次、剩 2 天就刷，理论永续）。每账号 24h 节流，失败也节流（真死的凭证不该刷屏）。 */
+const keepAliveAt = new Map(); // `site\u0000accountId` → 上次主动续期尝试时间
+
+export async function tokenKeepAliveScan(cfg, now = Date.now()) {
+  const out = [];
+  for (const site of siteKeys(cfg)) {
+    for (const a of listAccounts(site)) {
+      if (a.enabled === false || !a.accessToken || !a.refreshToken || !a.expiresAt) continue;
+      const leftMs = a.expiresAt - now;
+      if (leftMs > 48 * 3600_000) continue; // 离过期还远
+      const key = `${site}\u0000${a.id}`;
+      if (now - (keepAliveAt.get(key) || 0) < 24 * 3600_000) continue; // 每账号每天最多试一次
+      keepAliveAt.set(key, now);
+      const label = a.label || a.id;
+      try {
+        await refreshToken(cfg, site, a.id);
+        log(`[保活] ${label}（${site}）token 已提前续期（距过期 ${Math.max(0, Math.round(leftMs / 3600_000))}h 时触发）`);
+        recordEvent('login', `token 保活：${label}（${site}）提前续期成功`, { site, accountId: a.id });
+        out.push({ id: a.id, site, label, ok: true });
+      } catch (e) {
+        warn(`[保活] ${label}（${site}）提前续期失败：${String(e.message || e).slice(0, 120)}`);
+        recordEvent('login', `token 保活失败：${label}（${site}）——${String(e.message || e).slice(0, 100)}`, { site, accountId: a.id });
+        out.push({ id: a.id, site, label, ok: false, error: String(e.message || e).slice(0, 120) });
+      }
+    }
+  }
+  return out;
+}
+
 export function stopCreditLoop() {
   creditLoopStopped = true;
   if (timers.credit) clearTimeout(timers.credit);
@@ -149,8 +206,8 @@ export function stopCreditLoop() {
 export function setPolicy(cfg, patch = {}) {
   const issues = [];
   if (patch.policy !== undefined) {
-    if (!['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first'].includes(patch.policy)) {
-      issues.push(`未知策略：${patch.policy}（可用：expiry-first / balance-first / round-robin / pinned / free-first）`);
+    if (!['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first', 'sticky', 'balanced'].includes(patch.policy)) {
+      issues.push(`未知策略：${patch.policy}（可用：expiry-first / balance-first / round-robin / pinned / free-first / sticky / balanced）`);
     } else {
       cfg.pool.policy = patch.policy;
     }
@@ -194,6 +251,7 @@ export function bridgeStatus(cfg, { redact = false } = {}) {
   return {
     policy: cfg.pool?.policy || 'expiry-first',
     pinnedAccountId: cfg.pool?.pinnedAccountId || null,
+    defaultModel: cfg.defaultModel,
     creditRefreshMinutes: cfg.creditRefreshMinutes,
     // tasks + budget 一起下发：任务页预算卡（T13/T63）输入框初值要用真实配置——
     // 以前 tasks 里没有 budget，改过 dailyCredits/按账号预算后重开页面输入框永远显示默认值。

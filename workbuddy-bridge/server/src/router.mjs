@@ -227,11 +227,14 @@ function 有可用账号(site) {
  * 它真正生效的位置是 resolveTargetInner 对 default/auto 哨兵的改道（见 pickFreeModelFromCatalogs）。
  */
 export function rankSiteCandidates(candidates, defaultSite) {
+  // defaultSite 的比较必须对称：双方都不是默认站点时要返回 0（旧三元式在这种情况
+  // 恒返回 1，违反比较器一致性约定，排序结果依赖 V8 实现细节——0.3.53 P3 修复）
+  const defRank = (x) => (x.site === defaultSite ? 0 : 1);
   return [...candidates].sort(
     (a, b) =>
       Number(Boolean(b.usable)) - Number(Boolean(a.usable)) ||
       a.mult - b.mult ||
-      (a.site === defaultSite ? -1 : 1),
+      defRank(a) - defRank(b),
   );
 }
 
@@ -561,4 +564,62 @@ export async function mergedModels(cfg) {
     }
   }
   return out;
+}
+
+const fmtK = (n) => (n >= 1000 ? `${Math.round(n / 100) / 10}K` : String(n));
+
+/**
+ * 模型限制摘要的纯拼装部分（单测入口）：info 是目录里的模型对象（contextWindow/
+ * maxTokens/credits/supportsXxx），只列有值的字段；没有任何可说的事实就返回空串。
+ * 只描述目录事实，不下「因此被拒」的结论 —— supportsXxx 是 Boolean 化的，false
+ * 混着「未标记」，没有把握说因果。status=429 时附一句限流指引。
+ */
+export function buildLimitSummary(info, site, model, status = null) {
+  if (!info) return '';
+  const bits = [];
+  if (info.contextWindow) bits.push(`上下文 ${fmtK(info.contextWindow)}`);
+  if (info.maxTokens) bits.push(`最大输出 ${fmtK(info.maxTokens)}`);
+  const mult = parseMultiplier(info.credits);
+  if (Number.isFinite(mult)) bits.push(mult === 0 ? '免费（x0）' : `倍率 x${mult}`);
+  const caps = [];
+  if (info.supportsImages) caps.push('图片输入');
+  if (info.supportsToolCall) caps.push('工具调用');
+  if (info.supportsReasoning) caps.push('推理模式');
+  if (caps.length) bits.push(`支持${caps.join('/')}`);
+  if (!bits.length) return '';
+  let s = `\n[模型限制] ${model}（${site}）：${bits.join(' · ')}`;
+  if (status === 429) s += '。429 多为限流或额度不足：控制台「模型库」可见各模型限流恢复时间，或稍后重试';
+  return s;
+}
+
+/**
+ * 模型限制摘要（0.3.40）：上游拒绝请求时由 openChat 附加在错误文本尾部，让用户
+ * 不翻模型库就能看到该模型的边界。目录查不到（未登录/缓存空/模型不在该站点目录）
+ * 返回空串 —— 提示是锦上添花，任何异常都不能把真正的上游错误盖掉。
+ */
+export async function modelLimitSuffix(cfg, site, model, status = null) {
+  try {
+    const cat = await getCatalog(cfg, site);
+    const models = cat?.models;
+    const key = String(model || '');
+    const bare = key.includes('/') ? key.split('/').pop() : key;
+    const m = (models instanceof Map) ? (models.get(key) || models.get(bare)) : null;
+    let s = buildLimitSummary(m, site, bare, status);
+    // 限流退路（0.3.46，借鉴 dsh）：上游按「行」分别限流——免费/某行被冷却时，
+    // 同前缀的兄弟行（hy3→hy3-x、deepseek-v4.1-flash→…-sg）走的是另一条限流
+    // 通道，通常仍可用。倍率相同的不算退路（同一行）。目录查不到就不提。
+    if (status === 429 && m && (models instanceof Map)) {
+      const mult = parseMultiplier(m.credits);
+      const sib = [...models.values()].find((x) => x.id !== bare
+        && (x.id.startsWith(bare) || bare.startsWith(x.id))
+        && parseMultiplier(x.credits) !== mult);
+      if (sib) {
+        const sm = parseMultiplier(sib.credits);
+        s += `。退路：兄弟行「${sib.id}」（${sm === 0 ? '免费' : 'x' + sm}）是另一条限流通道，通常仍可用，可在控制台「模型库」切换`;
+      }
+    }
+    return s;
+  } catch {
+    return '';
+  }
 }

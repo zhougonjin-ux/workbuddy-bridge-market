@@ -1,0 +1,289 @@
+// 模型池自动同步（workbuddy-bridge）：把 WorkBuddy 供应商与模型清单写进
+// ZCode 的个人供应商配置（provider_config.json），让「管理模型/模型选择器」
+// 直接出现 WorkBuddy 分组，并随上游清单自动增删。
+//
+// 两处复用：
+//   - 服务端定时循环（startProviderConfigSync）：上游加/删模型或倍率变动时自动跟上
+//   - SessionStart 钩子（hooks/sync-provider.mjs）：会话启动时的快路径触发
+//
+// 本模块只依赖 node 内置模块 + 同目录 config.mjs（读数据目录，不拖起服务端其它模块）。
+//
+// schema 要点（从 ZCode 运行内核逆向 + 桌面日志实证，详见项目记忆）：
+//   - 文件每 60 秒被 ZCode 轮询，解析成功即热加载进模型目录，无需重启
+//   - 解析失败会静默降级为空配置（只在 v2/logs 里记「加载失败」），所以
+//     写入形状必须严格正确；改动本文件的合并逻辑后务必实测一轮轮询
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import { getConfigDir } from './config.mjs';
+
+export const PROVIDER_ID = 'workbuddy-bridge';
+export const PROVIDER_NAME = 'WorkBuddy';
+
+/** 生产数据目录（未设 WB_CONFIG_DIR 时用的那个）。 */
+function productionConfigDir() {
+  return path.join(os.homedir(), '.zcode', 'workbuddy-bridge');
+}
+
+/**
+ * ZCode 个人供应商配置的目标路径（ZCODE_PERSONAL_PROVIDER_CONFIG_FILE 可覆盖，便于测试）。
+ *
+ * 隔离守卫：显式设了 WB_CONFIG_DIR 的实例（临时目录试启、冒烟测试）**不得**写
+ * 生产配置。这类实例的端口通常是临时的（试启常用 8794 之类），一旦写进全局
+ * provider_config.json，ZCode 就会把 baseUrl 指向那个一次性端口，之后每回合
+ * 全部 ECONNREFUSED，直到生产实例下一次同步刷回来。
+ * 事故记录：2026-10-03 22:08 试启实例（port=8794）把 baseUrl 刷成 8794，
+ * 22:09–22:16 连续 106 次拨号失败、整回合报废。
+ *
+ * 落到隔离目录时写 <数据目录>/provider_config.json —— 试启仍能自检配置形状，
+ * 但绝不外溢。想显式指定别的路径仍然用 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE。
+ */
+export function providerConfigTarget() {
+  const dataDir = getConfigDir();
+  const isolated = path.resolve(dataDir) !== path.resolve(productionConfigDir());
+
+  // 隔离实例（临时目录试启 / 冒烟测试）绝不写生产配置。
+  // 注意 ZCODE_PERSONAL_PROVIDER_CONFIG_FILE 优先级最低：ZCode 桌面端会把这个变量
+  // 注入到插件/hook 子进程（值就是生产全局路径），若照它写，隔离守卫会被整条短路，
+  // 试启实例照样把临时端口刷进生产配置 —— 2026-10-03 的 8794 污染就是这么复现的。
+  if (isolated) return path.join(dataDir, 'provider_config.json');
+
+  return process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE
+    || path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
+}
+
+/** 拉取代理当前暴露的模型（带倍率后缀的 ID、上下文/输出上限、图像支持）。 */
+export async function fetchPickerModels(port, timeoutMs = 3000) {
+  const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!res.ok) throw new Error(`/v1/models HTTP ${res.status}`);
+  const body = await res.json();
+  return (Array.isArray(body?.data) ? body.data : [])
+    .filter((m) => typeof m?.id === 'string' && m.id)
+    .map((m) => ({
+      id: m.id,
+      contextWindow: Number.isFinite(m.context_window) ? m.context_window : null,
+      maxOutputTokens: Number.isFinite(m.max_output_tokens) ? m.max_output_tokens : null,
+      supportsImages: m.supports_images === true,
+    }));
+}
+
+/**
+ * 按手动模型规则的严格 schema 构建单条规则。
+ *
+ * 字段全部必填、多余键整份文件校验失败（strict schema）：
+ *   - properties 禁止 supportsToolCall / requiresMfjsToolSchema / outputFormat
+ *     （工具支持由内置兜底规则的 supportsToolCall:true 在解析时保留）
+ *   - optionSpecs 必填：reasoningLevel{values,map} 与 maxOutputTokens{max}
+ *     map 是必填的可编译选项映射串，"{}" 表示恒等映射
+ */
+export function buildModelRule(m) {
+  return {
+    providerId: PROVIDER_ID,
+    modelId: m.id,
+    config: {
+      properties: {
+        contextWindow: Number.isFinite(m.contextWindow) && m.contextWindow > 0 ? m.contextWindow : 200000,
+        supportsJsonSchemaOutput: false,
+        supportsNativeWebSearch: false,
+        supportsMidConversationSystem: false,
+        inputFormat: {
+          supportsImage: m.supportsImages === true,
+          supportsVideo: false,
+          supportsPdf: false,
+        },
+      },
+      optionSpecs: {
+        // 思考强度档位：值会原样作为 OpenAI 风格 reasoning_effort 发给上游，
+        // 实测上游呈梯度响应（none≈17 思考 tok / low≈169 / high≈185，trivial 题）。
+        // values 必须落在 ZCode 的枚举内（none/minimal/low/medium/high/xhigh），
+        // 否则序列化时被整字段丢弃。map 保持 '{}'：值即 effort，无需变换。
+        reasoningLevel: { values: ['none', 'low', 'medium', 'high'], map: '{}' },
+        maxOutputTokens: { max: Number.isFinite(m.maxOutputTokens) && m.maxOutputTokens > 0 ? m.maxOutputTokens : 32000 },
+      },
+    },
+  };
+}
+
+/**
+ * 把 WorkBuddy 供应商条目合并进 provider_config.json（只动自己的条目）。
+ * 返回 'written' | 'unchanged'；结构不合法的现存文件不动（那是应用恢复逻辑的事）。
+ */
+export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
+  // 读文件时区分「不存在」与「存在但读不了/解析不了」：后者绝不能整份重建——
+  // ZCode 自己也在写这个文件（共享锁/半截写入），整份重建会把用户的其他供应商
+  // 条目连同 apiKey 一起抹掉。跳过本轮，等下一轮 30 分钟后再试。
+  let raw;
+  try {
+    raw = fs.readFileSync(target, 'utf8');
+  } catch (e) {
+    if (e.code !== 'ENOENT') {
+      console.warn(`[workbuddy-bridge] provider_config.json 读取失败，本轮跳过同步：${e.message}`);
+      return 'skipped';
+    }
+    raw = null; // 文件确实不存在：首次注册，以空 doc 起步
+  }
+  let doc;
+  if (raw === null) {
+    doc = { schemaVersion: 1, config: {} };
+  } else {
+    try {
+      doc = JSON.parse(raw);
+    } catch {
+      // 解析失败（用户手改坏了）：结构不合法的现存文件不动（那是应用恢复逻辑的事）
+      console.warn('[workbuddy-bridge] provider_config.json 解析失败，本轮跳过同步（文件保持原样）');
+      return 'skipped';
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return 'skipped';
+    if (!doc.config || typeof doc.config !== 'object' || Array.isArray(doc.config)) doc.config = {};
+  }
+  const cfgRoot = doc.config;
+  doc.schemaVersion = 1;
+
+  // --- providerRules：删掉自己旧的，追加新条目 ---
+  const pcr = (cfgRoot.providerConfigRules && typeof cfgRoot.providerConfigRules === 'object' && !Array.isArray(cfgRoot.providerConfigRules))
+    ? cfgRoot.providerConfigRules
+    : {};
+  const providerRules = Array.isArray(pcr.providerRules) ? pcr.providerRules.filter((r) => r && typeof r === 'object') : [];
+  const previous = providerRules.find((r) => r?.providerId === PROVIDER_ID);
+  const keptRules = providerRules.filter((r) => r?.providerId !== PROVIDER_ID);
+
+  const modelIds = models.map((m) => m.id);
+  if (modelIds.length === 0 && Array.isArray(previous?.config?.personalModelIds) && previous.config.personalModelIds.length > 0) {
+    // 这轮一个模型都拉不到，但已注册过旧清单：整体保留旧状态直接返回——
+    // 否则会「模型列在 personalModelIds 里、modelConfigRules 却被清空」，
+    // 编译规则缺失导致模型回退内置默认行为，直到下次成功同步才自愈
+    return 'unchanged';
+  }
+  const personalModelIds = modelIds.length > 0
+    ? modelIds
+    : (Array.isArray(previous?.config?.personalModelIds) ? previous.config.personalModelIds : []);
+  if (personalModelIds.length === 0 && !previous) return 'skipped'; // 首次注册但一个模型都拿不到，等下次
+
+  keptRules.push({
+    providerId: PROVIDER_ID,
+    providerName: PROVIDER_NAME,
+    enabled: true,
+    config: {
+      group: 'standard-personal',
+      access: { type: 'api-key', apiKey },
+      api: { type: 'openai-chat-completions', baseUrl },
+      personalModelIds,
+      modelOrder: personalModelIds,
+    },
+  });
+  pcr.providerRules = keptRules;
+  cfgRoot.providerConfigRules = pcr;
+
+  // --- modelConfigRules：只替换自己供应商的规则 ---
+  const mcr = (cfgRoot.modelConfigRules && typeof cfgRoot.modelConfigRules === 'object' && !Array.isArray(cfgRoot.modelConfigRules))
+    ? cfgRoot.modelConfigRules
+    : {};
+  const manualRules = Array.isArray(mcr.manualProviderModelRules)
+    ? mcr.manualProviderModelRules.filter((r) => r && typeof r === 'object' && r.providerId !== PROVIDER_ID)
+    : [];
+  for (const m of models) manualRules.push(buildModelRule(m));
+  mcr.manualProviderModelRules = manualRules;
+  // providerModelRules 是必填键（且不能与 manual 规则同 provider/model 重复）
+  if (!Array.isArray(mcr.providerModelRules)) mcr.providerModelRules = [];
+  mcr.providerModelRules = mcr.providerModelRules.filter((r) => r?.providerId !== PROVIDER_ID);
+  cfgRoot.modelConfigRules = mcr;
+
+  // --- providerOrder：不存在就放最前，已存在保持用户排的顺序 ---
+  if (!Array.isArray(cfgRoot.providerOrder)) cfgRoot.providerOrder = [];
+  if (!cfgRoot.providerOrder.includes(PROVIDER_ID)) cfgRoot.providerOrder.unshift(PROVIDER_ID);
+
+  const next = JSON.stringify({ schemaVersion: 1, config: cfgRoot }, null, 2);
+  let current = null;
+  try { current = fs.readFileSync(target, 'utf8'); } catch { /* 不存在 */ }
+  if (current === next) return 'unchanged';
+
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  const tmp = path.join(path.dirname(target), `.provider_config.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, next, 'utf8');
+  fs.renameSync(tmp, target);
+  return 'written';
+}
+
+/**
+ * 完整同步流程：拉模型清单（代理不在时退回 fallbackModels，
+ * 再不行保留已注册的旧清单）→ 合并写入。异常向上抛由调用方兜住。
+ */
+export async function runProviderConfigSync({ port, apiKey, fallbackModels = [] }) {
+  let models = [];
+  try {
+    models = await fetchPickerModels(port);
+  } catch {
+    /* 代理没起来，走兜底 */
+  }
+  if (models.length === 0 && fallbackModels.length > 0) {
+    models = fallbackModels.map((id) => ({ id, contextWindow: null, maxOutputTokens: null, supportsImages: false }));
+  }
+  const target = providerConfigTarget();
+  const result = syncProviderConfigFile({ apiKey, baseUrl: `http://127.0.0.1:${port}/v1`, models, target });
+  return { result, models: models.length, target };
+}
+// ---- 服务端定时循环 ----
+
+const timers = { sync: null };
+let syncing = false;
+let currentCfg = null;
+
+/**
+ * 立即执行一次模型池同步（控制台「手动同步」按钮用）。
+ * 返回 { result, models? }；正在同步中则跳过（result: 'busy'）。
+ */
+export async function triggerProviderConfigSyncNow() {
+  if (!currentCfg || syncing) return { result: 'busy' };
+  syncing = true;
+  try {
+    const r = await runProviderConfigSync({
+      port: currentCfg.port,
+      apiKey: currentCfg.apiKey,
+      fallbackModels: (currentCfg.models || []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
+    });
+    if (r.result === 'written') {
+      const { log } = await import('./log.mjs');
+      log(`手动同步：模型池已写入 ZCode 选择器（${r.models} 个模型）`);
+    }
+    return r;
+  } finally {
+    syncing = false;
+  }
+}
+
+/** 启动模型池自动同步循环（启动后 20 秒先跑一次，之后按 providerSyncMinutes 间隔）。 */
+export function startProviderConfigSync(cfg, onError) {
+  currentCfg = cfg;
+  if (timers.sync) return;
+  const tick = async () => {
+    if (syncing) return;
+    syncing = true;
+    try {
+      const r = await runProviderConfigSync({
+        port: cfg.port,
+        apiKey: cfg.apiKey,
+        fallbackModels: (cfg.models || []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
+      });
+      if (r.result === 'written') {
+        const { log } = await import('./log.mjs');
+        log(`模型池已同步进 ZCode 选择器（${r.models} 个模型）`);
+      }
+    } catch (e) {
+      (onError || (() => {}))(e);
+    } finally {
+      syncing = false;
+    }
+  };
+  const boot = setTimeout(tick, 20_000);
+  boot.unref?.();
+  const ms = Math.max(5, Number(cfg.providerSyncMinutes) || 30) * 60_000;
+  timers.sync = setInterval(tick, ms);
+  timers.sync.unref?.();
+}
+
+export function stopProviderConfigSync() {
+  if (timers.sync) clearInterval(timers.sync);
+  timers.sync = null;
+  currentCfg = null;
+}

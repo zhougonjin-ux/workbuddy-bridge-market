@@ -163,8 +163,15 @@ export async function handleMessages(ctx) {
     const askedMax = Number(body.max_tokens ?? 0);
     if (!agg.content && agg.toolCallList.length === 0 && (agg.finishReason === 'length' || agg.frames > 0) && askedMax > 0 && askedMax < 1024) {
       warn(`[${site}] 空回答（finish=${agg.finishReason}，max_tokens=${askedMax}），放大到 1024 重试一次`);
-      const up2 = await openChat(cfg, site, { ...openaiBody, max_tokens: Math.max(1024, askedMax * 4) }, { signal });
-      if (up2.ok) {
+      // 与 openai 入口对齐（0.3.53 P2）：①改走 openChatRotating 拿账号轮换（重试不该
+      // 又选中刚失败的号）；②重试的传输失败不顶掉已拿到的（空但合法的）结果
+      let up2 = null;
+      try {
+        up2 = await openChatRotating(cfg, site, { ...openaiBody, max_tokens: Math.max(1024, askedMax * 4) }, { signal }).then((r) => r.up);
+      } catch (e) {
+        warn(`[${site}] 空回答放大重试失败（保留原结果）：`, e?.message || String(e));
+      }
+      if (up2?.ok) {
         try {
           agg = await aggregateFrames(up2.frames);
         } catch {
@@ -172,7 +179,7 @@ export async function handleMessages(ctx) {
         } finally {
           up2.close();
         }
-      } else {
+      } else if (up2) {
         up2.close?.();
       }
     }

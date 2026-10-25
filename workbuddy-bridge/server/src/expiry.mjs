@@ -120,13 +120,28 @@ export function accountEarliestExpiry(a, now = Date.now()) {
  * （markSuccess 清零 A 的计数），B 永远轮不到 → failCount 永远清不了零。实测
  * 11128 风暴后 expiry-first 就这样被永久钉死在单账号上。失败惩罚只认冷却与耗尽。
  */
-export function orderAccounts(accounts, { policy = 'expiry-first', pinnedAccountId = null, now = Date.now() } = {}) {
+export function orderAccounts(accounts, { policy = 'expiry-first', pinnedAccountId = null, now = Date.now(), rand = Math.random } = {}) {
   const list = Array.isArray(accounts) ? [...accounts] : [];
   if (!list.length) return list;
 
   const exhaustedRank = (a, t) => (a.exhaustedAt && t - a.exhaustedAt < EXHAUST_TTL_MS ? 1 : 0);
 
   const byStability = (a, b) => exhaustedRank(a, now) - exhaustedRank(b, now);
+
+  if (policy === 'balanced') {
+    // 随机偏向闲置久（0.3.47，借鉴 dsh 的 balanced）：权重 = 闲置分钟数 + 1，
+    // 加权随机抽一个先用。与 round-robin 的差别：不严格轮转，长期消耗趋于均摊
+    // 又保留随机性；耗尽账号照旧沉底，只在全员耗尽时参与（fallback 语义）。
+    list.sort(byStability);
+    const fresh = list.filter((a) => !exhaustedRank(a, now));
+    const pool2 = fresh.length ? fresh : list;
+    const weight = (a) => Math.max(1, Math.floor((now - (a.lastUsedAt || 0)) / 60000) + 1);
+    const total = pool2.reduce((s, a) => s + weight(a), 0);
+    let roll = rand() * total;
+    let picked = pool2[pool2.length - 1];
+    for (const a of pool2) { roll -= weight(a); if (roll <= 0) { picked = a; break; } }
+    return [picked, ...list.filter((a) => a !== picked)];
+  }
 
   if (policy === 'round-robin') {
     // 最久未用的先用（lastUsedAt 为空视为最久）

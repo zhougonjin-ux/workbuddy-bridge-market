@@ -120,7 +120,7 @@ export function reloadUsage() {
 
 function dayOf(key = todayKey()) {
   ensureLoaded();
-  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, hours: {}, models: {}, accounts: {} };
+  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0, hours: {}, models: {}, accounts: {} };
   // 老数据（在 accounts 维度上线前落的盘）就地补，不动已有字段
   if (!data.days[key].accounts) data.days[key].accounts = {};
   return data.days[key];
@@ -128,6 +128,13 @@ function dayOf(key = todayKey()) {
 
 /** 记录一次调用。account = 实际出力的账号 id（T36 报表的账号维度；缺失时记 'unknown'）。
  *  upstreamCredit = 上游 usage 实报的 credit（未实报传 null）——只有实报值（含 0）才能进观测样本。 */
+/** 换号救回（0.3.51）：请求在前一个账号失败、换号后成功——计数进当日统计。 */
+export function recordRecovered() {
+  const day = dayOf();
+  day.recovered = (day.recovered || 0) + 1;
+  scheduleSave();
+}
+
 export function recordUsage({ site, model, mode, status, promptTokens = 0, completionTokens = 0, credit = 0, ms = 0, tools = 0, account = null, upstreamCredit = null }) {
   const day = dayOf();
   const ok = status >= 200 && status < 400;
@@ -210,7 +217,7 @@ export function usageDays() {
 export function usageSnapshot(days = 7) {
   ensureLoaded();
   const today = todayKey();
-  const t = data.days[today] || { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, models: {} };
+  const t = data.days[today] || { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, recovered: 0, models: {} };
   // 今日小时分布（T7）：固定 24 桶（本地时区），旧数据没有 hours 字段时全为 0
   const todayHours = [];
   for (let i = 0; i < 24; i++) {
@@ -219,7 +226,7 @@ export function usageSnapshot(days = 7) {
   }
   const keys = Object.keys(data.days).sort().slice(-days);
   const recent = keys.map((k) => ({ date: k, ...data.days[k], models: undefined }));
-  const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0 };
+  const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0 };
   const byModel = new Map();
   for (const k of Object.keys(data.days)) {
     const d = data.days[k];
@@ -229,6 +236,7 @@ export function usageSnapshot(days = 7) {
     totals.completionTokens += d.completionTokens;
     totals.credit += d.credit;
     totals.ms += d.ms || 0;
+    totals.recovered += d.recovered || 0;
     for (const [mid, m] of Object.entries(d.models || {})) {
       const cur = byModel.get(mid) || { id: mid, site: m.site, model: m.model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0 };
       cur.calls += m.calls;
@@ -241,7 +249,7 @@ export function usageSnapshot(days = 7) {
     }
   }
   return {
-    today: { date: today, ...t, hours: undefined, models: undefined },
+    today: { date: today, ...t, recovered: t.recovered || 0, hours: undefined, models: undefined },
     todayHours,
     todayByModel: Object.values(t.models || {}).sort((a, b) => b.calls - a.calls),
     recent,

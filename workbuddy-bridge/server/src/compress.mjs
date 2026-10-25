@@ -22,6 +22,7 @@ const learnedLimits = new Map();
 import fs from 'node:fs';
 import path from 'node:path';
 import { paths } from './config.mjs';
+import { writeJsonFileAtomic } from './util.mjs';
 
 const LEARNED_FILE = () => path.join(paths.root, 'learned.json');
 const LEARNED_SAVE_DELAY_MS = 3000;
@@ -63,7 +64,8 @@ function saveLearnedNow() {
       calibration: Object.fromEntries(estimateCalibration),
       compressions: { totals: compressTotals, events: compressEvents.slice(-MAX_COMPRESS_EVENTS) },
     };
-    fs.writeFileSync(LEARNED_FILE(), JSON.stringify(data, null, 2) + '\n', 'utf8');
+    // 原子写（0.3.53 P3）：与 pool/auth 落盘同一套 tmp+rename，写一半被杀不留半截文件
+    writeJsonFileAtomic(LEARNED_FILE(), data);
   } catch {
     // 写不进去（磁盘满等）就留在内存，下次再试
   }

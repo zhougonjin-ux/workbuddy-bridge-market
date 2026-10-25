@@ -12,6 +12,7 @@ import {
   setAccountEnabled,
   setAccountLabel,
   setAccountManualExpiry,
+  setAccountMinRemain,
   resetAccountState,
   markExhausted,
   updateCreditDetail,
@@ -26,8 +27,9 @@ import { recentEvents, recordEvent, reloadEvents } from './events.mjs';
 import { compressionStats, reloadLearned } from './compress.mjs';
 import { sendJson, writeJsonFileAtomic } from './util.mjs';
 import { bridgeStatus, setPolicy, refreshCreditsAll } from './scheduler.mjs';
-import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask, startTaskLoop, stopTaskLoop, heatmapView, syncAccountNickname, reloadTasksState } from './tasks.mjs';
+import { runTasks, taskStatus, taskCenterView, runSingleTask, claimSingleTask, playAllTasks, startTaskLoop, stopTaskLoop, heatmapView, syncAccountNickname, reloadTasksState } from './tasks.mjs';
 import { importLocalAccounts } from './localimport.mjs';
+import { clientStatus, installClient, uninstallClient } from './clientinstall.mjs';
 import { budgetStatus, budgetCheckAndAnnounce, accountBudgetCheckAndAnnounce, accountBudgetStatus } from './budget.mjs';
 import { backupList, backupNow, startBackupLoop, stopBackupLoop } from './backup.mjs';
 import { testChannels } from './notify.mjs';
@@ -413,7 +415,7 @@ export async function handleConsoleApi(ctx) {
   }
   if (p === '/tasks/run' && method === 'POST') {
     const body = ctx.body || {};
-    const kind = ['checkin', 'growth', 'travel', 'streak', 'all'].includes(body.kind) ? body.kind : 'all';
+    const kind = ['checkin', 'growth', 'travel', 'streak', 'report', 'all'].includes(body.kind) ? body.kind : 'all';
     const site = body.site ? String(body.site) : null;
     const results = await runTasks(cfg, kind, site);
     return sendJson(res, 200, { ok: true, kind, results });
@@ -435,6 +437,7 @@ export async function handleConsoleApi(ctx) {
     const norm = {
       checkinTimes: body.checkinTimes !== undefined ? parseTimes(body.checkinTimes) : null,
       growthTimes: body.growthTimes !== undefined ? parseTimes(body.growthTimes) : null,
+      reportTimes: body.reportTimes !== undefined ? parseTimes(body.reportTimes) : null,
       travelTimes: body.travelTimes !== undefined ? parseTimes(body.travelTimes) : null,
       listTimes: body.listTimes !== undefined ? parseTimes(body.listTimes) : null,
       doctorTimes: body.doctorTimes !== undefined ? parseTimes(body.doctorTimes) : null,
@@ -543,6 +546,24 @@ export async function handleConsoleApi(ctx) {
       return sendJson(res, 502, { error: String(e.message || e).slice(0, 160) });
     }
   }
+  // 一键代打（0.3.40，body: { site?, accountId?, cap? }——都可选：默认全部站点全部账号，
+  // 签到+连登+成长任务（报名/代打/领奖）+猫猫巡逻一口气跑完，无视每日幂等）。同步执行，
+  // 多账号 × 多任务可能要一两分钟 —— 前端按钮自带 spinner，MCP 调用方给足超时。
+  if (p === '/task-center/play-all' && method === 'POST') {
+    const body = ctx.body || {};
+    const site = body.site ? String(body.site) : null;
+    const accountId = body.accountId ? String(body.accountId) : null;
+    const cap = body.cap != null ? Number(body.cap) : null;
+    if (site && !cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
+    if (accountId && site && !getAccount(site, accountId)) return sendJson(res, 404, { error: `账号不存在：${accountId}` });
+    if (cap != null && (!Number.isFinite(cap) || cap < 1)) return sendJson(res, 400, { error: 'cap 必须是 ≥1 的数字' });
+    try {
+      const r = await playAllTasks(cfg, { site, accountId, cap });
+      return sendJson(res, r.busy ? 409 : 200, r);
+    } catch (e) {
+      return sendJson(res, 502, { error: String(e.message || e).slice(0, 200) });
+    }
+  }
 
   // ---- T52：官方打卡热力图（权威全历史，从账号注册日起算；6h 服务端缓存）----
   // ?refresh=1 强拉；与本地 checkinDays 日历（插件启用日起算）并存，前端注明口径差异。
@@ -636,6 +657,19 @@ export async function handleConsoleApi(ctx) {
   if (p === '/local/import' && method === 'POST') {
     const result = await importLocalAccounts(cfg);
     return sendJson(res, 200, { ok: true, ...result });
+  }
+
+  // ---- 桌面客户端（0.3.46）：状态查询 + 一键安装/卸载（帮助页「桌面客户端」卡片用） ----
+  if (p === '/client' && method === 'GET') {
+    return sendJson(res, 200, clientStatus());
+  }
+  if (p === '/client/install' && method === 'POST') {
+    const r = installClient();
+    return sendJson(res, r.ok ? 200 : 500, r);
+  }
+  if (p === '/client/uninstall' && method === 'POST') {
+    const r = uninstallClient();
+    return sendJson(res, r.ok ? 200 : 500, r);
   }
 
   // 手动同步模型池进 ZCode 选择器（模型页「手动同步」按钮；自动循环 30 分钟一次，这里立即触发）
@@ -863,6 +897,7 @@ export async function handleConsoleApi(ctx) {
     if (body.reset) resetAccountState(site, id);
     if (typeof body.label === 'string' && body.label.trim()) setAccountLabel(site, id, body.label.trim());
     if (body.manualExpireAt !== undefined) setAccountManualExpiry(site, id, body.manualExpireAt);
+    if (body.minRemain !== undefined) setAccountMinRemain(site, id, body.minRemain);
     return sendJson(res, 200, { ok: true, account: accountSnapshot(site).find((a) => a.id === id) || null });
   }
 

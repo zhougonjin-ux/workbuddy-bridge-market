@@ -837,6 +837,8 @@ const POLICIES = [
   { id: 'balance-first', name: '余额优先', desc: '余额多的账号先用' },
   { id: 'round-robin', name: '轮询均摊', desc: '最久未用的先用，均匀消耗' },
   { id: 'free-first', name: '免费优先', desc: 'default/auto 请求自动改道到倍率 x0 的免费模型，省积分' },
+  { id: 'sticky', name: '会话粘滞', desc: '同一对话钉死同一账号，保上游缓存（新对话自动换下一个）' },
+  { id: 'balanced', name: '均衡随机', desc: '随机偏向闲置久的账号，长期消耗趋于均摊' },
   { id: 'pinned', name: '固定账号', desc: '始终使用指定的账号' },
 ];
 
@@ -970,7 +972,7 @@ async function loadAccounts() {
       };
       sel.onclick = (ev) => ev.stopPropagation();
     }
-    for (const b of el.querySelectorAll('[data-act]')) bindAcctAction(b, loadAccounts);
+    for (const b of el.querySelectorAll('[data-act]')) bindAcctAction(b, loadAccounts, sites);
   } catch (e) {
     paint(el, `<div class="empty">加载失败：${esc(e.message)}</div>`);
   }
@@ -1053,16 +1055,34 @@ function acctCard(site, row, raw) {
       <button class="btn mini" data-act="manual" data-site="${esc(site.site)}" data-id="${esc(a.id)}">到期兜底</button>
       <button class="btn mini" data-act="reset" data-site="${esc(site.site)}" data-id="${esc(a.id)}">重置状态</button>
       <button class="btn mini" data-act="syncnick" data-site="${esc(site.site)}" data-id="${esc(a.id)}" title="从官方控制台拉取最新昵称并更新显示名（改了上游昵称后不用手动改备注；手动触发，不进定时轮询）">同步昵称</button>
+      <button class="btn mini" data-act="minremain" data-site="${esc(site.site)}" data-id="${esc(a.id)}" data-cur="${esc(a.minRemain ?? '')}" title="保留积分下限：余额低于该值的账号不派活（省给手动用）；不判耗尽，余额未知也不拦">🛡 保留积分${a.minRemain ? ' ≥' + esc(a.minRemain) : ''}</button>
+      ${String(a.lastError || '').includes('401') ? `<button class="btn mini" data-act="relogin" data-site="${esc(site.site)}" data-id="${esc(a.id)}" style="color:var(--accent)" title="登录态已失效（401）：弹出扫码窗口重新登录；若本机客户端登录着同一账号，「导入本机账号」也能直接救活">🔁 扫码重登</button>` : ''}
       <span class="spacer"></span>
       <button class="btn mini danger" data-act="remove" data-site="${esc(site.site)}" data-id="${esc(a.id)}">删除</button>
     </div>
   </div>`;
 }
 
-function bindAcctAction(btn, done) {
+function bindAcctAction(btn, done, sites = null) {
   btn.onclick = async () => {
     const { act, site, id } = btn.dataset;
     try {
+      if (act === 'relogin') {
+        // 登录态失效（401）的一键入口：直接弹出扫码窗口并预选该账号所在站点
+        openLoginModal(sites || [], site);
+        return; // 弹窗自己的流程负责后续刷新
+      }
+      if (act === 'minremain') {
+        // 保留积分下限（借鉴 dsh）：余额低于它不派活，省给手动用
+        const v = await askText('保留积分下限（余额低于它不派活）', btn.dataset.cur || '', { placeholder: '如 200；留空清除', okText: '保存' });
+        if (v !== null) {
+          const trimmed = String(v).trim();
+          await api('/pool/account', { method: 'POST', body: { site, id, minRemain: trimmed === '' ? null : (Number(trimmed) || trimmed) } });
+          toast(trimmed === '' ? '已清除保留积分下限' : '保留积分下限 ≥ ' + trimmed, 'ok');
+          done();
+        }
+        return;
+      }
       if (act === 'rename') {
         const name = await askText('修改账号显示名', '', { placeholder: '留空则不改', okText: '保存' });
         if (name && name.trim()) await api('/pool/account', { method: 'POST', body: { site, id, label: name.trim() } });
@@ -1150,8 +1170,8 @@ function askConfirm(title, { okText = '确定', danger = true } = {}) {
   });
 }
 
-function openLoginModal(sites) {
-  const siteOpts = (sites || []).map((s) => `<option value="${esc(s.site)}">${esc(s.label)}</option>`).join('');
+function openLoginModal(sites, preselect = null) {
+  const siteOpts = (sites || []).map((s) => `<option value="${esc(s.site)}"${s.site === preselect ? ' selected' : ''}>${esc(s.label)}</option>`).join('');
   $('#modalRoot').innerHTML = `<div class="modal" id="mWrap"><div class="box">
     <h3>添加 WorkBuddy 账号</h3>
     <div class="fld"><label>站点</label><select id="lgSite">${siteOpts}</select></div>
@@ -1165,7 +1185,12 @@ function openLoginModal(sites) {
 
   function stopLogin() { clearInterval(pollT); closeModal(); }
 
-  $('#lgGo').onclick = async () => {
+  $('#lgGo').onclick = runQrFlow;
+
+  // 生成二维码 + 轮询授权结果。「生成登录二维码」按钮与 8 分钟自动换新共用同一流程：
+  // 上游授权 state 的有效期短于旧版的 10 分钟等待窗，等到超时才提示太晚 ——
+  // 8 分钟没扫上就自动向上游换一份新 state 重画二维码，用户无感，总窗口不变。
+  async function runQrFlow() {
     // 防连点：await 期间再点会覆盖 pollT，旧的 3s 轮询定时器泄漏且互相写状态
     $('#lgGo').disabled = true;
     clearInterval(pollT);
@@ -1183,7 +1208,7 @@ function openLoginModal(sites) {
           <b style="color:var(--text)">微信扫码登录：</b><br>
           ① 打开微信「扫一扫」，扫描上方二维码 → 在手机上打开授权页并登录确认；<br>
           ${safeUrl ? `② 或点 <a href="${esc(r.authUrl)}" target="_blank" rel="noopener" style="color:var(--accent)">在电脑浏览器打开授权页</a>，按页面提示用微信扫码登录。<br>` : ''}
-          登录完成后本窗口会自动检测到（最长等 10 分钟）。
+          二维码 8 分钟未扫会自动换新；登录完成后本窗口会自动检测到。
         </div>
         <div id="lgStatus" class="muted"><span class="spin"></span>等待你在手机/浏览器上确认…</div>`;
       const t0 = Date.now();
@@ -1200,6 +1225,7 @@ function openLoginModal(sites) {
           const wait = Math.round((Date.now() - t0) / 1000);
           $('#lgStatus').innerHTML = `<span class="spin"></span>等待确认中（${wait}s）… 上游：${esc(p.msg || '待扫码').slice(0, 60)}`;
           if (Date.now() - t0 > 600000) { clearInterval(pollT); $('#lgStatus').innerHTML = '<span class="bad">等待超时，请重新生成二维码</span>'; }
+          else if (Date.now() - t0 > 480000) { $('#lgStatus').innerHTML = '<span class="wn">二维码超过 8 分钟未扫，自动换新一份…</span>'; runQrFlow(); }
         } catch (e) { /* 轮询报错继续等 */ }
       }, 3000);
     } catch (e) {
@@ -1236,8 +1262,8 @@ function showImportModal(r) {
     ${(r.found || []).map((f) => `<div class="card" style="padding:9px 13px;margin-bottom:8px">
       <div class="row"><b style="font-size:13px">${esc(f.nickname || f.uid)}</b>${badge(f.status)}<span class="spacer"></span><span class="badge">${esc(f.site)}</span></div>
       <div class="muted" style="font-size:12px;margin-top:3px">${esc(f.reason || '')}${f.exp ? ' · token 有效期至 ' + new Date(f.exp).toLocaleDateString() : ''}</div>
-    </div>`).join('') || '<div class="empty" style="padding:14px">没有发现可导入的登录态 —— 需要本机装有已登录的 WorkBuddy / CodeBuddy 客户端<br><span style="font-size:12px">客户端凭证是加密存储，代理只能读 CodeBuddy CLI 的 settings*.json 明文 token；想找回在控制台删除的账号，用「备份与恢复」选最近一份备份恢复即可</span></div>'}
-    <div class="qrhint">本机导入的账号没有 refreshToken：token 到期后（客户端会自动续期）再点一次「导入本机账号」即可拿到新 token；服务每次启动也会自动重扫一次。若同账号已用扫码登录（支持自动续期），则不会被覆盖。</div>
+    </div>`).join('') || '<div class="empty" style="padding:14px">没有发现可导入的登录态 —— 需要本机装有已登录的 WorkBuddy / CodeBuddy 客户端<br><span style="font-size:12px">桌面客户端凭证是加密存储（密钥只在客户端内存），代理只能读 CodeBuddy CLI 的 *.json 明文 token；想找回在控制台删除的账号，用「系统设置 → 备份与恢复」选最近一份备份恢复即可</span></div>'}
+    <div class="qrhint">本机导入的账号没有 refreshToken：本插件每 60 秒监听客户端配置变化，客户端续期/切换账号后新 token 会自动跟进入池（无需手动操作）；服务每次启动也会自动重扫一次。若同账号已用扫码登录（有 refreshToken 且自动保活），则不会被覆盖。</div>
     <div class="row"><span class="spacer"></span><button class="btn" id="imClose">关闭</button></div>
   </div></div>`;
   $('#imClose').onclick = () => $('#mWrap2').remove();
@@ -1547,6 +1573,7 @@ async function loadTasks() {
       <div class="card" style="margin-bottom:14px">
         <div class="row" style="flex-wrap:wrap;gap:10px">
           <select id="tcAccount" style="min-width:220px"></select>
+          <button class="btn" id="tcPlayAll" title="无视每日幂等强制跑一遍：签到 + 连登管家 + 成长任务（报名/代打/领奖）+ 猫猫巡逻；选了账号就只跑该账号，选「（没有账号）」占位或全空则跑全部账号" style="color:var(--ac)">🚀 一键代打</button>
           <button class="btn" id="tcReload">↻ 手动刷新</button>
           <span class="muted" id="tcStatus" style="font-size:12px"></span>
         </div>
@@ -1570,7 +1597,7 @@ async function loadTasks() {
       <h2>最近记录</h2>
       <div class="card" style="padding:0">${(t.history || []).length ? `<table><tbody>${t.history.slice(0, 15).map((h) => `
         <tr><td style="width:120px" class="muted">${esc(new Date(h.at).toLocaleString())}</td>
-        <td style="width:70px"><span class="badge ${h.kind === 'checkin' ? 'acc' : h.kind === 'travel' ? 'warn' : h.kind === 'streak' ? 'acc' : 'ok'}">${{ checkin: '签到', growth: '成长', travel: '旅行', streak: '连登' }[h.kind] || h.kind}</span></td>
+        <td style="width:70px"><span class="badge ${h.kind === 'checkin' ? 'acc' : h.kind === 'travel' ? 'warn' : h.kind === 'streak' ? 'acc' : h.kind === 'report' ? 'acc' : 'ok'}">${{ checkin: '签到', growth: '成长', travel: '旅行', streak: '连登', report: '活跃' }[h.kind] || h.kind}</span></td>
         <td><span class="${h.ok ? 'ok' : 'bad'}">${h.ok ? '✓' : '✗'}</span> ${esc(h.msg || `报名${h.accepted ?? 0} 代打${h.autoChats ?? 0} 领奖${h.claimed ?? 0} +${h.creditGained ?? 0}分${(h.autoNotes || []).length ? '。' + h.autoNotes.join('；') : ''}`)}</td></tr>`).join('')}</tbody></table>`
         : '<div class="muted" style="padding:18px;text-align:center">还没有运行记录</div>'}</div>
       <details style="margin-top:14px">
@@ -1700,6 +1727,29 @@ async function loadTasks() {
       if (lastTc && accOptions.some((o) => o.site + '|' + o.id === lastTc)) tcSel.value = lastTc;
       tcSel.onchange = () => { store.set('wbTcAccount', tcSel.value); loadTaskCenter({ spinner: true }); loadOfficialHeat(); };
       $('#tcReload').onclick = () => loadTaskCenter({ force: true, spinner: true });
+      $('#tcPlayAll').onclick = async () => {
+        const b = $('#tcPlayAll');
+        // 账号下拉 value 形如 site|accountId —— 选了具体账号就只代打该账号，否则跑全部
+        const raw = ($('#tcAccount') || {}).value || '';
+        const sep = raw.indexOf('|');
+        const body = sep > 0 ? { site: raw.slice(0, sep), accountId: raw.slice(sep + 1) } : {};
+        b.disabled = true;
+        const old = b.textContent;
+        b.textContent = '⏳ 代打中…（可能要一两分钟）';
+        try {
+          const r = await api('/task-center/play-all', { method: 'POST', body: { ...body, cap: 50 } });
+          if (r.busy) { toast(r.msg || '任务正在进行中，请稍后再试', 'warn'); return; }
+          toast(r.text || '一键代打完成', r.ok ? 'ok' : 'bad', 12000);
+          loadTasks();
+          loadTaskCenter({ force: true });
+          void loadTcSummary();
+        } catch (e) {
+          toast('一键代打失败：' + (e.message || e), 'bad');
+        } finally {
+          b.disabled = false;
+          b.textContent = old;
+        }
+      };
       if (accOptions.length) renderTcList(); // 回填最近一次数据（showView 的按需拉取稍后自动覆盖）
       else $('#tcList').innerHTML = '<div class="empty" style="padding:14px">没有可用账号</div>';
       loadOfficialHeat(); // T52：官方热力图跟随当前选中账号（tcAccount 就绪后）
@@ -2087,9 +2137,64 @@ async function loadEvents() {
  * 自动任务与积分玩法、常见问题、命令与端点速查。
  * 写作原则：说「点哪里」而不是「有什么」；数值（时点/阈值）标注为默认值并指向设置位置，
  * 避免文档与实际配置漂移。内容较长，整页用 <details> 分节默认展开前两节。 */
+/* ---------- 桌面客户端卡片（0.3.46） ---------- */
+
+function loadClientCard() {
+  const el = $('#clientCard');
+  if (!el) return;
+  api('/client').then((c) => {
+    if (c.installed) {
+      el.innerHTML = `
+        <div class="row" style="align-items:center;gap:12px;flex-wrap:wrap">
+          <div style="font-weight:600">🖥️ 桌面客户端 <span class="badge ok">v${esc(c.version || '')}</span></div>
+          <span class="muted" style="font-size:12px">已安装：${esc(c.installDir || '')}<br>服务目录：${esc(c.bridgePath || '')}</span>
+          <span class="spacer"></span>
+          <button class="btn mini" id="clientUninstall" style="color:var(--bad)">卸载</button>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:8px">托盘常驻中（任务栏图标，双击打开控制台；菜单可启动/停止/重启服务）。开始菜单与桌面快捷方式已就绪；控制面板「应用和功能」也可卸载。卸载不影响账号数据。</div>`;
+      $('#clientUninstall').onclick = async () => {
+        if (!await askConfirm('卸载桌面客户端？\n（账号数据不受影响，重装即恢复）', { okText: '卸载' })) return;
+        try {
+          await api('/client/uninstall', { method: 'POST' });
+          toast('桌面客户端已卸载', 'ok');
+          loadClientCard();
+        } catch (e) { toast('卸载失败：' + (e.message || e), 'bad'); }
+      };
+    } else if (!c.canInstall) {
+      el.innerHTML = `
+        <div class="row" style="align-items:center;gap:12px">
+          <div style="font-weight:600">🖥️ 桌面客户端</div>
+          <span class="muted" style="font-size:12px">当前环境不支持安装，或插件分发里缺少预编译产物（client/WorkBuddyBridgeTray.exe）</span>
+        </div>`;
+    } else {
+      el.innerHTML = `
+        <div class="row" style="align-items:center;gap:12px;flex-wrap:wrap">
+          <div style="font-weight:600">🖥️ 桌面客户端</div>
+          <span class="muted" style="font-size:12px">托盘常驻、双击即用；打开时自动拉起本地服务；开始菜单/桌面快捷方式；控制面板可卸载。服务路径：${esc(c.bridgePath || '')}</span>
+          <span class="spacer"></span>
+          <button class="btn primary" id="clientInstall">安装桌面客户端</button>
+        </div>
+        <div class="muted" style="font-size:12px;margin-top:8px">安装到 %LOCALAPPDATA%\\WorkBuddyBridge，不碰账号数据；对话面板（/wbp）与网页控制台保持可用。</div>`;
+      $('#clientInstall').onclick = async () => {
+        const b = $('#clientInstall');
+        b.disabled = true; b.textContent = '安装中…';
+        try {
+          const r = await api('/client/install', { method: 'POST' });
+          toast('桌面客户端已安装：' + (r.installDir || ''), 'ok', 8000);
+          loadClientCard();
+        } catch (e) {
+          toast('安装失败：' + (e.message || e), 'bad');
+          b.disabled = false; b.textContent = '安装桌面客户端';
+        }
+      };
+    }
+  }).catch(() => { el.innerHTML = '<div class="muted" style="padding:10px">桌面客户端状态获取失败</div>'; });
+}
+
 function loadHelp() {
   const el = $('#view-help');
   if (!el) return;
+  loadClientCard();
   const sec = (title, sub, inner, open) => `
     <details class="secd" ${open ? 'open' : ''}>
       <summary>${esc(title)} <span class="sub">${esc(sub)}</span></summary>
@@ -2105,6 +2210,7 @@ function loadHelp() {
 
   el.innerHTML = `
     <h2>使用说明 <span class="sub">T67 · 本机代理的使用手册；数值均为默认值，可在对应设置页调整</span></h2>
+    <div id="clientCard" class="card" style="margin-bottom:14px"><div class="muted" style="padding:10px">桌面客户端状态加载中…</div></div>
     ${sec('三步接上 ZCode', '首次使用必看；已接好的可直接跳到「功能导览」', `
       ${p(`本插件在<b>本机</b>跑一个 OpenAI/Anthropic 双协议代理，把 WorkBuddy / CodeBuddy 的积分与模型接进 ZCode（也兼容 Cherry Studio、Cline、Dify 等任何 OpenAI 客户端）。只监听 127.0.0.1，凭证不出本机。`)}
       ${li([

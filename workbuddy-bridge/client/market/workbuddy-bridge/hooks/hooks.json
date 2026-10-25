@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/ensure-server.mjs"
+            ],
+            "timeoutMs": 15000
+          },
+          {
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${CLAUDE_PLUGIN_ROOT}/hooks/sync-provider.mjs"
+            ],
+            "timeoutMs": 15000
+          }
+        ]
+      }
+    ]
+  }
+}

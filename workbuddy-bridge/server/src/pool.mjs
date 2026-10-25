@@ -30,6 +30,7 @@ import { orderAccounts, EXHAUST_TTL_MS } from './expiry.mjs';
 import { warn } from './log.mjs';
 import { writeJsonFileAtomic, readJsonFileWithBackup } from './util.mjs';
 import { recordEvent } from './events.mjs';
+import { notify } from './notify.mjs';
 
 /** 池文件里代表「旧版单账号凭证」的固定 id。 */
 export const DEFAULT_ACCOUNT_ID = 'default';
@@ -245,12 +246,17 @@ export function getAccount(site, id) {
   return loadPool(site).accounts.find((a) => a.id === id) || null;
 }
 
-/** 账号是否处于「可用」状态（启用 + 没冷却 + 没被判额度耗尽）。 */
+/** 账号是否处于「可用」状态（启用 + 没冷却 + 没被判额度耗尽 + 没触保留积分线）。 */
 export function isUsable(a, now = Date.now()) {
   if (!a || a.enabled === false) return false;
   if (!a.accessToken) return false;
   if (a.cooldownUntil && now < a.cooldownUntil) return false;
   if (a.exhaustedAt && now - a.exhaustedAt < EXHAUST_TTL_MS) return false;
+  // 保留积分下限（0.3.46，借鉴 dsh 的「保留积分」）：用户给账号设的省分线——
+  // 余额低于它就不派活（省给手动用），但**不判耗尽**（exhausted 是 6h TTL 强状态，
+  // 余额未知/null 也不拦——查询失败不应误伤可用账号）。
+  const min = Number(a.minRemain);
+  if (Number.isFinite(min) && min > 0 && typeof a.creditRemain === 'number' && a.creditRemain < min) return false;
   return true;
 }
 
@@ -269,7 +275,7 @@ export function isUsable(a, now = Date.now()) {
  * fallback 为 true 时：若没有任何「可用」账号，退而返回一个「已耗尽/冷却中」的账号。
  * 这样上游能给最终答案，好过本地直接失败——额度可能已经重置了。
  */
-export function pickAccount(site, { exclude = [], now = Date.now(), fallback = false } = {}) {
+export function pickAccount(site, { exclude = [], now = Date.now(), fallback = false, stickyKey = null } = {}) {
   const pool = loadPool(site);
   const skip = new Set(exclude);
   const candidates = pool.accounts.filter((a) => !skip.has(a.id) && a.enabled !== false && a.accessToken);
@@ -286,8 +292,60 @@ export function pickAccount(site, { exclude = [], now = Date.now(), fallback = f
   } catch {
     /* 配置读不出来就按默认策略，选号不能被配置问题卡死 */
   }
+
+  // sticky（0.3.47）：同一个对话钉死同一个账号——上游 prompt cache 按账号隔离，
+  // 多轮对话中途换号等于把整段缓存作废（重算整段上下文）。会话键由 openChat 从
+  // 首条 user 消息算出；绑定失效/账号不可用时按 expiry-first 重选并重新绑定。
+  if (policy === 'sticky' && stickyKey) {
+    const hit = stickyPick(site, stickyKey, 池, now);
+    if (hit) return hit;
+    const sorted = orderAccounts(池, { policy: 'expiry-first', now });
+    const chosen = sorted[0] || null;
+    if (chosen) stickyRemember(site, stickyKey, chosen.id, now);
+    return chosen;
+  }
+
   const sorted = orderAccounts(池, { policy, pinnedAccountId, now });
   return sorted[0] || null;
+}
+
+/* ---------------- sticky 会话绑定（0.3.47） ---------------- */
+
+const STICKY_TTL_MS = 30 * 60_000; // 30 分钟没有活动的对话解除绑定（上游缓存 TTL 也差不多这个量级）
+const STICKY_MAX = 500;
+
+const stickyMap = new Map(); // `${site}\u0000${key}` → { id, at }
+
+/** 从请求消息算会话键：多轮对话里首条 user 消息内容不变，取它的前 1024 字符哈希。 */
+export function stickyKeyOf(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return null;
+  const first = messages.find((m) => m && m.role === 'user') || messages[0];
+  if (!first || typeof first !== 'object') return null;
+  const text = typeof first.content === 'string' ? first.content : JSON.stringify(first.content);
+  if (!text) return null;
+  return crypto.createHash('sha1').update(text.slice(0, 1024)).digest('hex').slice(0, 16);
+}
+
+/** 查会话绑定：命中且账号仍在候选里 → 返回该账号；过期/失效 → null（调用方重选重绑）。 */
+export function stickyPick(site, stickyKey, candidates, now = Date.now()) {
+  if (!stickyKey) return null;
+  const entry = stickyMap.get(`${site}\u0000${stickyKey}`);
+  if (!entry) return null;
+  if (now - entry.at > STICKY_TTL_MS) { stickyMap.delete(`${site}\u0000${stickyKey}`); return null; }
+  const acc = candidates.find((a) => a.id === entry.id);
+  if (!acc) { stickyMap.delete(`${site}\u0000${stickyKey}`); return null; }
+  entry.at = now; // 活跃对话滑动续期
+  return acc;
+}
+
+/** 记录/刷新会话绑定；超上限时清最旧的一半（简单粗暴，避免无限增长）。 */
+export function stickyRemember(site, stickyKey, accountId, now = Date.now()) {
+  if (!stickyKey || !accountId) return;
+  stickyMap.set(`${site}\u0000${stickyKey}`, { id: accountId, at: now });
+  if (stickyMap.size > STICKY_MAX) {
+    const oldest = [...stickyMap.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, Math.floor(STICKY_MAX / 2));
+    for (const [k] of oldest) stickyMap.delete(k);
+  }
 }
 
 /** 把一次积分查询结果写进账号条目（到期明细 / 余额缓存），供到期优先调度使用。 */
@@ -447,6 +505,7 @@ export function markSuccess(site, id, model = '') {
     if (a.exhaustedAt) a.exhaustedAt = null;
     if (model && a.modelCooldowns) delete a.modelCooldowns[model];
     a.lastUsedAt = Date.now();
+    if (model) a.lastModel = model; // 桌面客户端账号卡显示「上次模型」用
   };
   if (!hasPoolFile(site)) {
     return mutateLegacy(site, id, clear);
@@ -473,15 +532,24 @@ export function markSuccess(site, id, model = '') {
  * 但状态仍要记进内存态覆盖——否则 usableCount 永远说「可用」，
  * 路由就会一直把已经 429 的单账号站点当成健康站点（详见 legacyState 说明）。
  */
+// 事件节流（0.3.53 P3）：同账号同状态码的失败 60 秒内只进一次时间线——上游持续 5xx
+// 时轮换链会高频调用 markFailure，不节流几分钟就刷满 300 条环形时间线，把其他账号/
+// 种类的事件全部挤掉。冷却阶梯/失败计数等状态机本身不受节流影响。
+const failEventAt = new Map(); // `${site}\0${id}\0${status}` → 上次进时间线的时间
 export function markFailure(site, id, { status = 0, message = '', model = '', modelCooldownMs = 0 } = {}) {
-  // 事件时间线（T6）：账号失败/冷却进时间线。冷却阶梯会挡住连续重试，
-  // 所以正常情况下不会刷屏；真刷屏本身就是「该账号在持续失败」的信号。
-  recordEvent(
-    'account',
-    `账号请求失败${status ? `（HTTP ${status}）` : ''}：${String(message || '未知原因').slice(0, 140)}`
-      + (isQuotaError(status, message) ? '，判定额度耗尽' : ''),
-    { site, accountId: id },
-  );
+  const evKey = `${site}\u0000${id}\u0000${status}`;
+  const now = Date.now();
+  if (now - (failEventAt.get(evKey) || 0) > 60_000) {
+    failEventAt.set(evKey, now);
+    // 事件时间线（T6）：账号失败/冷却进时间线。冷却阶梯会挡住连续重试，
+    // 所以正常情况下不会刷屏；真刷屏本身就是「该账号在持续失败」的信号。
+    recordEvent(
+      'account',
+      `账号请求失败${status ? `（HTTP ${status}）` : ''}：${String(message || '未知原因').slice(0, 140)}`
+        + (isQuotaError(status, message) ? '，判定额度耗尽' : ''),
+      { site, accountId: id },
+    );
+  }
   const extra = { status, message, model, modelCooldownMs };
   if (!hasPoolFile(site)) return mutateLegacy(site, id, (a) => applyFailure(a, extra));
   return mutate(site, (pool) => {
@@ -492,11 +560,24 @@ export function markFailure(site, id, { status = 0, message = '', model = '', mo
 }
 
 /** 明确标记某账号额度耗尽（由额度查询/业务码驱动）。 */
+const exhaustNotifyDay = new Map(); // uid → 已通知日期（积分限额气泡每账号每天一次）
+
 export function markExhausted(site, id, message = '额度不足') {
   // 事件时间线（T6）：只在「可用 → 耗尽」的转变时记一条——余额轮询会对已耗尽的
   // 账号反复调用这里，不判转变的话时间线每 30 秒就被刷一条重复事件。
   const announce = (a) => {
     if (!a.exhaustedAt) {
+        // 积分限额提示（0.3.51，借鉴 dsh）：首次转变发气泡（每账号每天一次），
+        // 用户在智能体里看到失败时，托盘/通知中心已经解释过原因。
+        try {
+          const dayKey = new Date().toISOString().slice(0, 10);
+          if (exhaustNotifyDay.get(id) !== dayKey) {
+            exhaustNotifyDay.set(id, dayKey);
+            const acct = loadPool(site).accounts.find((x) => x.id === id);
+            const remainTxt = acct && acct.creditRemain != null ? String(acct.creditRemain) : '?';
+            notify(loadConfig(), '账号积分限额', (acct && acct.label ? acct.label : id) + ' 积分限额（剩 ' + remainTxt + '），已自动切换其他账号继续（同模型）');
+          }
+        } catch { /* 通知失败不影响标记 */ }
       recordEvent('account', `账号额度耗尽：${String(message).slice(0, 140)}`, { site, accountId: id });
     }
   };
@@ -569,6 +650,18 @@ export function setAccountManualExpiry(site, id, value) {
     if (!a) return null;
     if (value === null || value === undefined || String(value).trim() === '') delete a.manualExpireAt;
     else a.manualExpireAt = String(value).trim().slice(0, 40);
+    return a;
+  });
+}
+
+/** 保留积分下限（0.3.46）：余额低于它的账号不派活（省给手动用）。null/空 = 清除。 */
+export function setAccountMinRemain(site, id, value) {
+  return mutate(site, (pool) => {
+    const a = pool.accounts.find((x) => x.id === id);
+    if (!a) return null;
+    const n = Number(value);
+    if (value === null || value === undefined || String(value).trim() === '' || !Number.isFinite(n) || n <= 0) delete a.minRemain;
+    else a.minRemain = Math.min(Math.floor(n), 100000);
     return a;
   });
 }

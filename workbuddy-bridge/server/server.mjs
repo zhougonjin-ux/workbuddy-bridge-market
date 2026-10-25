@@ -28,7 +28,7 @@ import { startHealthLoop, stopHealthLoop } from './src/health.mjs';
 import { startWeeklyLoop, stopWeeklyLoop } from './src/weekly.mjs';
 import { startBackupLoop, stopBackupLoop } from './src/backup.mjs';
 import { startDoctorLoop, stopDoctorLoop } from './src/doctor.mjs';
-import { importLocalAccounts } from './src/localimport.mjs';
+import { importLocalAccounts, startLocalImportWatch, stopLocalImportWatch } from './src/localimport.mjs';
 import { startProviderConfigSync, stopProviderConfigSync, triggerProviderConfigSyncNow } from './src/pickersync.mjs';
 
 // 配置读不出来时要给出可读提示，而不是抛一串裸栈。
@@ -791,7 +791,7 @@ server.listen(cfg.port, cfg.host, () => {
   // 需要活跃计数与各循环的 stop/flush 函数；onClose 走 server.close → 进程退出。
   bootLifecycle({
     activeRequestsRef: () => activeRequests,
-    stoppers: [stopCreditLoop, stopTaskLoop, stopHealthLoop, stopWeeklyLoop, stopBackupLoop, stopDoctorLoop, stopProviderConfigSync],
+    stoppers: [stopCreditLoop, stopTaskLoop, stopHealthLoop, stopWeeklyLoop, stopBackupLoop, stopDoctorLoop, stopProviderConfigSync, stopLocalImportWatch],
     flushers: [flushUsage, flushPool, flushLearned, flushEvents],
   });
   setRestartHandler(doRestart);
@@ -799,6 +799,9 @@ server.listen(cfg.port, cfg.host, () => {
   setStopHandler(doStop);
   // 自动导入本机已登录客户端的账号（静默；客户端续期 token 后重启服务即自动跟进）
   importLocalAccounts(cfg, { silent: true }).catch((e) => warn('本机账号自动导入失败：', e.message));
+  // 0.3.40：客户端续期会改写 ~/.codebuddy/*.json 的 mtime —— 监听它自动重扫导入，
+  // 本机导入的账号 token 过期前就能换上新 token，不用再等重启或手动点导入
+  startLocalImportWatch(cfg);
 });
 
 let sigintCount = 0;

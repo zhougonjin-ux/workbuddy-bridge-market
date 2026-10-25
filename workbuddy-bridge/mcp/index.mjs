@@ -6,8 +6,8 @@
 //
 // 协议：MCP stdio（换行分隔的 JSON-RPC 2.0）。日志一律走 stderr，stdout 只发协议帧。
 import { loadConfig, primaryKey } from '../server/src/config.mjs';
-import { ensureProxyRunning } from '../server/src/autostart.mjs';
 import { readFileSync } from 'node:fs';
+import { ensureProxyRunning } from '../server/src/autostart.mjs';
 
 // 版本号以 server/package.json 为唯一事实源（serverInfo 版本号会报告给客户端）。
 // 曾硬编码 '0.1.0' 而 server 已是 0.3.2，两端版本号对不上。
@@ -151,11 +151,11 @@ const TOOLS = [
   },
   {
     name: 'wb_switch',
-    description: '切换 WorkBuddy 账号调度策略或固定某个账号。policy 取值：expiry-first（最早到期优先，默认）/ balance-first（余额优先）/ round-robin（轮询）/ pinned（固定账号，需给 accountId）/ free-first（有 0 倍率免费站点的模型优先走免费站点）。',
+    description: '切换 WorkBuddy 账号调度策略或固定某个账号。policy 取值：expiry-first（最早到期优先，默认）/ balance-first（余额优先）/ round-robin（轮询）/ pinned（固定账号，需给 accountId）/ free-first（有 0 倍率免费站点的模型优先走免费站点）/ sticky（会话粘滞：同一对话钉死同一账号，保上游缓存）/ balanced（随机偏向闲置久的账号，长期均摊）。',
     inputSchema: {
       type: 'object',
       properties: {
-        policy: { type: 'string', enum: ['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first'], description: '调度策略' },
+        policy: { type: 'string', enum: ['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first', 'sticky', 'balanced'], description: '调度策略' },
         accountId: { type: 'string', description: 'pinned 策略下固定使用的账号 id（wb_status 里可查）' },
       },
       required: ['policy'],
@@ -183,28 +183,40 @@ const TOOLS = [
   },
   {
     name: 'wb_login_start',
-    description: '添加 WorkBuddy 账号（第一步）：发起设备授权登录，返回一个授权链接，请用户在浏览器打开并登录。',
+    description: '添加 WorkBuddy 账号（第一步）：发起设备授权登录，返回终端二维码与授权链接，用户用微信扫码或在浏览器打开登录。',
     inputSchema: {
       type: 'object',
       properties: { site: { type: 'string', enum: ['cn-cli', 'intl-cli', 'intl-work'], description: '站点，默认 cn-cli（国内版）' } },
     },
     run: async (cfg, args) => {
       const r = await callLocal(cfg, '/console/api/login/start', { method: 'POST', body: { site: args?.site || 'cn-cli' } });
-      if (r.authUrl) return `请在浏览器打开下面的链接并登录 WorkBuddy：\n${r.authUrl}\n\n登录完成后用 wb_login_poll 轮询结果（state=${r.state}）。`;
+      if (r.authUrl) {
+        // 终端二维码（0.3.40）：等宽代码块包住，用户在 ZCode 终端里直接用微信扫，
+        // 不必复制链接；链接一并保留兜底（终端字体不等宽/块字符缺失时扫不出来）。
+        let out = `请用微信「扫一扫」扫描下方二维码登录（也可在浏览器打开链接）：\n\n`;
+        try {
+          const { terminalQR } = await import('../server/src/termqr.mjs');
+          out += `\`\`\`\n${terminalQR(r.authUrl)}\n\`\`\`\n\n`;
+        } catch { /* 二维码生成失败不影响登录，链接兜底 */ }
+        out += `链接：${r.authUrl}\n\n登录完成后用 wb_login_poll 轮询结果（state=${r.state}，不传 state 则自动查最新一次发起）。`;
+        return out;
+      }
       return `已发起：${JSON.stringify(r).slice(0, 300)}`;
     },
   },
   {
     name: 'wb_login_poll',
-    description: '添加 WorkBuddy 账号（第二步）：查询设备授权登录是否完成；完成后账号自动入池。',
+    description: '添加 WorkBuddy 账号（第二步）：查询设备授权登录是否完成；完成后账号自动入池。state 可省略——自动查询该站点最近一次发起的登录。',
     inputSchema: {
       type: 'object',
-      properties: { site: { type: 'string', description: '站点，与 wb_login_start 一致' }, state: { type: 'string', description: 'wb_login_start 返回的 state' } },
-      required: ['state'],
+      properties: { site: { type: 'string', description: '站点，与 wb_login_start 一致' }, state: { type: 'string', description: 'wb_login_start 返回的 state；省略时查该站点最新的发起' } },
+      required: [],
     },
     run: async (cfg, args) => {
       const site = args?.site || 'cn-cli';
-      const r = await callLocal(cfg, `/console/api/login/poll?site=${encodeURIComponent(site)}&state=${encodeURIComponent(args.state)}`);
+      const qs = new URLSearchParams({ site });
+      if (args?.state) qs.set('state', String(args.state));
+      const r = await callLocal(cfg, `/console/api/login/poll?${qs.toString()}`);
       return r.done ? `登录成功 ✅ 账号「${r.auth?.label || r.auth?.nickname || r.auth?.id}」已入池。` : `尚未完成：${r.msg || '等待用户在浏览器确认'}`;
     },
   },
@@ -233,7 +245,7 @@ const TOOLS = [
   },
   {
     name: 'wb_tasks_run',
-    description: '立即执行自动任务：kind=checkin（每日签到+连登管家）/ growth（成长任务报名+领奖）/ travel（猫猫巡逻）/ streak（仅连登管家：补签+兑换+抽奖）/ all。',
+      description: '立即执行自动任务：kind=checkin（每日签到+连登管家）/ growth（成长任务报名+领奖）/ travel（猫猫巡逻）/ streak（仅连登管家：补签+兑换+抽奖）/ report（活跃上报：每天一次让成长中心知道账号还在用）/ all。',
     inputSchema: {
       type: 'object',
       properties: { kind: { type: 'string', enum: ['checkin', 'growth', 'travel', 'streak', 'all'], description: '任务类型，默认 all' } },
@@ -290,13 +302,13 @@ const TOOLS = [
   },
   {
     name: 'wb_task_play',
-    description: '单任务代打/领奖（成长任务中心）：对指定任务手动代打几次极小对话或领取已达标的奖励。先用 wb_tasks_status 或控制台任务中心看任务 code。',
+    description: '单任务代打/领奖（成长任务中心）：对指定任务手动代打几次极小对话或领取已达标的奖励。code 传 "all" 时执行一键代打（签到+连登+全部成长任务报名/代打/领奖+猫猫巡逻，无视每日幂等）。先用 wb_tasks_status 或控制台任务中心看任务 code。',
     inputSchema: {
       type: 'object',
       properties: {
-        action: { type: 'string', enum: ['play', 'claim'], description: 'play=代打几次对话点亮进度；claim=领取达标奖励' },
-        accountId: { type: 'string', description: '账号 id（wb_status 里可查）；缺省用第一个可用账号' },
-        code: { type: 'string', description: '任务 code（如 Model_chat_GLM5.2、black_cat）' },
+        action: { type: 'string', enum: ['play', 'claim'], description: 'play=代打几次对话点亮进度；claim=领取达标奖励；code=all 时忽略此参数' },
+        accountId: { type: 'string', description: '账号 id（wb_status 里可查）；缺省用第一个可用账号；code=all 时缺省跑全部账号' },
+        code: { type: 'string', description: '任务 code（如 Model_chat_GLM5.2、black_cat）；"all"=一键代打全部' },
         times: { type: 'string', description: 'play 时代打次数（默认补齐到 target，受单任务上限约束）' },
       },
       required: ['action', 'code'],
@@ -304,6 +316,14 @@ const TOOLS = [
     run: async (cfg, args) => {
       const code = String(args.code || '').trim();
       if (!code) return '缺少任务 code（先在控制台任务中心或 wb_tasks_status 里看任务列表）。';
+      // 一键代打：不收窄账号（除非显式传 accountId）；同步执行可能要一两分钟，超时给足
+      if (/^all$/i.test(code)) {
+        if (args.action === 'claim') return '一键模式只支持 play（领奖已包含在流程里）。';
+        const body = {};
+        if (args.accountId) body.accountId = String(args.accountId);
+        const r = await callLocal(cfg, '/console/api/task-center/play-all', { method: 'POST', body, timeoutMs: 300_000 });
+        return r.busy ? `⏳ ${r.msg}` : `🚀 ${r.text || '一键代打完成'}`;
+      }
       let site = null, accountId = String(args.accountId || '');
       if (accountId) {
         // 从桥接状态反查账号所在站点
@@ -404,11 +424,6 @@ async function handle(msg) {
 
 let buf = '';
 process.stdin.setEncoding('utf8');
-
-// MCP 进程起来就拉一次代理（幂等）：SessionStart hook 失效时（未注册/被禁用/新机器异常），
-// 首个 MCP 工具调用前的这一步是第二条兜底链路；拉起不阻塞协议握手（waitMs=0）。
-ensureProxyRunning({ source: 'mcp-boot' });
-
 process.stdin.on('data', (chunk) => {
   buf += chunk;
   let idx;

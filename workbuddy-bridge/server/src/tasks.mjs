@@ -17,7 +17,8 @@ import { siteKeys, getConfigDir } from './config.mjs';
 import { listAccounts, getAccount, setAccountLabel, updateCreditDetail, markExhausted } from './pool.mjs';
 import { queryCredit, openChat, aggregateFrames, upstreamErrorMessage, reportChatActivity } from './upstream.mjs';
 import { billingHeaders } from './headers.mjs';
-import { getAuth, ensureToken } from './auth.mjs';
+import { ensureToken } from './auth.mjs';
+import { sendEventChainsForTasks, isEventChainTask } from './taskevents.mjs';
 import { log, warn } from './log.mjs';
 import { recordEvent } from './events.mjs';
 import { notify, notifyTask } from './notify.mjs';
@@ -64,7 +65,16 @@ export function reloadTasksState() {
   state = null;
 }
 
-const KIND_LABEL = { checkin: '每日签到', growth: '成长任务', travel: '猫猫旅行', streak: '连登管家', 'growth-manual': '任务操作' };
+const KIND_LABEL = { checkin: '每日签到', growth: '成长任务', travel: '猫猫旅行', streak: '连登管家', report: '活跃上报', 'growth-manual': '任务操作' };
+
+/** 活跃上报（0.3.47，借鉴 dsh 的 report 任务）：每天给每个账号发一次 chat_request_send
+ *  事件（POST /v2/report，复用 black_cat 的 reportChatActivity）——让成长中心知道账号
+ *  还在活跃。dsh 强调它要先于任务落地。实现就是一个薄包装。 */
+async function reportScanAccount(cfg, site, accountId) {
+  const model = cfg.defaultModel || 'glm-5.2';
+  const ok = await reportChatActivity(cfg, site, { accountId, modelId: model, modelName: model });
+  return { ok, msg: ok ? '活跃已上报' : '上报失败（本轮跳过，明天再试）' };
+}
 
 function record(kind, uid, entry) {
   const s = loadState();
@@ -155,8 +165,7 @@ function unwrap(json, what) {
  * 每日签到。已签到也算成功（幂等）。
  */
 export async function checkinAccount(cfg, site, accountId) {
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const siteCfg = cfg.sites[site];
   const headers = billingHeaders(siteCfg, auth);
   const { json } = await callJSON(cfg, siteCfg.billingBase + '/v2/billing/meter/daily-checkin', {
@@ -172,8 +181,7 @@ export async function checkinAccount(cfg, site, accountId) {
 
 /** 成长任务列表（宽松解析：progress 可能是对象或平铺字段）。 */
 export async function listGrowthTasks(cfg, site, accountId) {
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const siteCfg = cfg.sites[site];
   const headers = billingHeaders(siteCfg, auth);
   const { json } = await callJSON(cfg, siteCfg.apiBase + '/v2/activity/growth/tasks', {
@@ -343,8 +351,16 @@ export function inNightWindow(d = new Date()) {
  * 22:00–02:00 窗口）都由 judgeTask 判定；growth 扫描落在窗口外时跳过并记说明，
  * 不额外为夜猫子安排定时器；次数上限 maxChatsPerTask。
  */
-async function autoCompleteChatTasks(cfg, site, accountId, tasks, now = new Date()) {
-  const cap = Number(cfg.tasks?.maxChatsPerTask) || 5;
+/**
+ * 代打次数上限的统一口径：cap 覆盖（一键代打传 1–200）优先，回落 maxChatsPerTask
+ * （默认 5）。上限 200 是防失控护栏 —— 万一上游判定异常导致 target 特别大，最多打 200 次。
+ */
+export function effectiveChatCap(cfg, cap = null) {
+  return cap != null ? Math.min(Math.max(1, Math.trunc(Number(cap) || 0)), 200) : (Number(cfg?.tasks?.maxChatsPerTask) || 5);
+}
+
+async function autoCompleteChatTasks(cfg, site, accountId, tasks, now = new Date(), { cap = null } = {}) {
+  const effectiveCap = effectiveChatCap(cfg, cap);
   const notes = [];
   const todo = [];
   for (const t of tasks) {
@@ -354,7 +370,7 @@ async function autoCompleteChatTasks(cfg, site, accountId, tasks, now = new Date
       if (j.why) notes.push(`${t.title}：${j.why}，本轮跳过`);
       continue;
     }
-    todo.push({ task: t, attempts: Math.min(t.target - t.current, cap), model: j.model });
+    todo.push({ task: t, attempts: Math.min(t.target - t.current, effectiveCap), model: j.model });
   }
   let chats = 0;
   const touched = [];
@@ -427,9 +443,11 @@ async function autoplayChats(cfg, site, accountId, task, attempts, model, notes 
  * 成长任务扫描：报名所有可报名任务 → 代打「对话体验类」任务 → 领取所有达标奖励。
  * 非对话类任务（公众号关注、体验客户端功能等）无法服务端代打，保持只报名+领奖。
  */
-export async function growthScanAccount(cfg, site, accountId) {
+export async function growthScanAccount(cfg, site, accountId, { cap = null } = {}) {
   let tasks = await listGrowthTasks(cfg, site, accountId);
-  const auth = getAuth(site);
+  // 不读全局 getAuth（并发竞态，0.3.53）：显式按本账号 ensureToken 拿快照，
+  // 后续 acceptTasks/claimReward 都用这一份，报名/领奖不会落到别的账号头上
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const siteCfg = cfg.sites[site];
 
   const toAccept = tasks.filter((t) => !t.locked && t.code && t.acceptStatus === 'not_accepted').map((t) => t.code);
@@ -443,17 +461,27 @@ export async function growthScanAccount(cfg, site, accountId) {
     }
   }
 
-  // 对话体验类任务代打（可关）；打过之后重新拉一次列表，让新达标的奖励在本轮就被领走
+  // 对话体验类任务代打 + 事件链重放（同受 autoComplete 开关控制）；打过之后重新拉一次
+  // 列表，让新达标的奖励在本轮就被领走（事件链的打分要几秒才落，链函数末尾已代等）
   let autoChats = 0;
+  let autoChains = 0;
   let autoTasks = [];
   let autoNotes = [];
   if (cfg.tasks?.autoComplete !== false) {
     try {
-      ({ chats: autoChats, tasks: autoTasks, notes: autoNotes } = await autoCompleteChatTasks(cfg, site, accountId, tasks));
-      if (autoChats > 0) tasks = await listGrowthTasks(cfg, site, accountId);
+      ({ chats: autoChats, tasks: autoTasks, notes: autoNotes } = await autoCompleteChatTasks(cfg, site, accountId, tasks, new Date(), { cap }));
     } catch (e) {
       warn(`[${site}] 对话类任务代打异常：`, e.message);
     }
+    try {
+      const ev = await sendEventChainsForTasks(cfg, site, accountId, tasks);
+      autoChains = ev.sent;
+      if (ev.notes.length) autoNotes.push(...ev.notes);
+      if (ev.tasks.length) autoTasks.push(...ev.tasks.map((x) => `${x}（事件链）`));
+    } catch (e) {
+      warn(`[${site}] 事件链重放异常：`, e.message);
+    }
+    if (autoChats > 0 || autoChains > 0) tasks = await listGrowthTasks(cfg, site, accountId);
   }
 
   let claimed = 0;
@@ -471,13 +499,14 @@ export async function growthScanAccount(cfg, site, accountId) {
   }
   invalidateTaskCenter(site, accountId); // 扫描可能报名/代打/领奖，缓存的进度视图已过期
   // T56：人工任务（已报名、未达标、不能代打——公众号关注/体验客户端等）收集给通知，
-  // 不领白不领的奖励经常因为「没人看任务页」被漏掉。
+  // 不领白不领的奖励经常因为「没人看任务页」被漏掉。事件链任务（模板/画布/专家…）
+  // 已由链重放自动化，不算人工任务。
   const manualTasks = cfg.tasks?.manualRemind !== false
     ? tasks.filter((t) => !t.claimed && t.code && t.acceptStatus === 'accepted' && !t.locked
-        && t.target > 0 && t.current < t.target && !judgeTask(t, cfg, site).autoplayable)
+        && t.target > 0 && t.current < t.target && !judgeTask(t, cfg, site).autoplayable && !isEventChainTask(t.code))
       .map((t) => t.title)
     : [];
-  return { ok: true, accepted, autoChats, autoTasks, autoNotes, claimed, creditGained, manualTasks, tasks: tasks.length };
+  return { ok: true, accepted, autoChats, autoChains, autoTasks, autoNotes, claimed, creditGained, manualTasks, tasks: tasks.length };
 }
 
 /** T56：人工任务提醒（每账号每天最多一次；notify 自带的 5 分钟节流挡不住一天多次扫描）。 */
@@ -531,8 +560,7 @@ async function billingJSON(cfg, site, auth, siteCfg, path, body, what) {
 }
 
 export async function travelScanAccount(cfg, site, accountId) {
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const siteCfg = cfg.sites[site];
 
   const info = await growthJSON(cfg, site, auth, siteCfg, 'GET', '/activity/growth/buddy/info', null);
@@ -651,8 +679,7 @@ export async function heatmapView(cfg, site, accountId, { force = false } = {}) 
   if (!force && hit && Date.now() - hit.at < HEATMAP_TTL_MS) {
     return { cells: hit.cells, cachedAt: hit.at, fromCache: true };
   }
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const data = await growthJSON(cfg, site, auth, cfg.sites[site], 'GET', '/activity/growth/heatmap', null, '官方热力图');
   const cells = parseHeatmapCells(data);
   hmCache.set(key, { at: Date.now(), cells });
@@ -665,8 +692,7 @@ export async function heatmapView(cfg, site, accountId, { force = false } = {}) 
  * 礼包/补偿/兑换/抽奖失败都只记 notes 不中断——一次扫描里能拿的尽量拿。
  */
 export async function streakScanAccount(cfg, site, accountId) {
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const siteCfg = cfg.sites[site];
   const notes = [];
   let creditGained = 0;
@@ -823,8 +849,7 @@ export function parseAccountProfile(json) {
 export async function syncAccountNickname(cfg, site, accountId) {
   const acct = getAccount(site, accountId);
   if (!acct) throw Object.assign(new Error(`账号不存在：${accountId}`), { status: 404 });
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const siteCfg = cfg.sites[site];
   const headers = billingHeaders(siteCfg, auth);
   headers['x-client-platform'] = 'web';
@@ -852,8 +877,7 @@ export async function syncAccountNickname(cfg, site, accountId) {
  * 没提醒过的批次 → notify + 事件。活动未开放/没有券时静默——绝大多数日子零调用。
  */
 export async function fetchVouchers(cfg, site, accountId) {
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const siteCfg = cfg.sites[site];
   const headers = billingHeaders(siteCfg, auth);
   const { json } = await callJSON(cfg, siteCfg.billingBase + '/portal/activity/school/vouchers', { headers, what: '券码列表' });
@@ -896,11 +920,15 @@ export async function checkVoucherExpiry(cfg, now = new Date()) {
 /* ---------------- 批量执行 ---------------- */
 
 /** 对一个站点的所有账号跑一类任务。travel/streak 是幂等扫描（一天可多次），checkin/growth 每天一次。 */
-async function runForSite(cfg, site, kind) {
+async function runForSite(cfg, site, kind, { force = false, cap = null, onlyAccountId = null } = {}) {
   const out = [];
   for (const a of listAccounts(site)) {
     if (a.enabled === false || !a.accessToken) continue;
-    if (kind !== 'travel' && kind !== 'streak' && doneToday(kind, a.uid || a.id)) {
+    // 一键代打收窄到单账号时，其余账号整体跳过（不算 skipped，避免污染汇总）
+    if (onlyAccountId && a.id !== onlyAccountId) continue;
+    // force（一键代打）：无视 doneToday 幂等强制再跑 —— 签到/连登/猫猫上游幂等兜底，
+    // growth 重跑是为补打新报名任务与窗口外跳过的夜猫子
+    if (!force && kind !== 'travel' && kind !== 'streak' && doneToday(kind, a.uid || a.id)) {
       out.push({ id: a.id, label: a.label || a.id, skipped: true, ok: true });
       continue;
     }
@@ -911,6 +939,10 @@ async function runForSite(cfg, site, kind) {
       if (kind === 'checkin') {
         result = await withRetryOnce(() => checkinAccount(cfg, site, a.id));
         record('checkin', uid, { ok: true, site, msg: result.msg });
+      } else if (kind === 'report') {
+        // 活跃上报（0.3.47）：一天一次 chat_request_send 事件，让成长中心知道账号还活着
+        result = await withRetryOnce(() => reportScanAccount(cfg, site, a.id));
+        record('report', uid, { ok: result.ok, site, msg: result.msg });
       } else if (kind === 'travel') {
         // T11 通知：猫猫到站领奖值得弹（旅行要数小时，不看控制台根本不知道）。
         // claimed_and_departed（领到积分并再出发）是 T59 之后的最常见结局，同属领奖
@@ -935,7 +967,7 @@ async function runForSite(cfg, site, kind) {
         record('streak', uid, { ok: true, site, msg, ...result });
         if ((result.creditGained || 0) > 0) await refreshAfterGain(cfg, site, a.id);
       } else {
-        result = await withRetryOnce(() => growthScanAccount(cfg, site, a.id));
+        result = await withRetryOnce(() => growthScanAccount(cfg, site, a.id, { cap }));
         const { tasks, ...rest } = result;
         record('growth', uid, { ok: true, site, ...rest });
         if (result.claimed > 0) await refreshAfterGain(cfg, site, a.id);
@@ -968,8 +1000,13 @@ export async function runTasks(cfg, kind = 'all', site = null) {
     const result = {};
     const wantStreak = kind === 'streak' || kind === 'all';
     const wantCheckin = kind === 'checkin' || kind === 'all';
+    const wantReport = kind === 'report' || kind === 'all';
     for (const s of sites) {
       if (!cfg.sites[s]) continue;
+      // 活跃上报放最前（借鉴 dsh：Order matters——报到要先于任务落地）
+      if (wantReport && cfg.tasks?.report !== false) {
+        result[`report:${s}`] = await runForSite(cfg, s, 'report');
+      }
       if (wantCheckin && cfg.tasks?.checkin !== false) {
         result[`checkin:${s}`] = await runForSite(cfg, s, 'checkin');
       }
@@ -988,6 +1025,72 @@ export async function runTasks(cfg, kind = 'all', site = null) {
     return result;
   } finally {
     runningTasks.delete(kind);
+  }
+}
+
+/**
+ * 一键代打（0.3.40）：立即把所有白嫖动作跑一遍 —— 签到 → 连登管家 → 成长任务
+ * （报名 + 对话类代打 + 领奖）→ 猫猫巡逻，全部无视 doneToday 幂等强制执行。
+ * 与每日调度的差别就在「force + cap」：调度层今天跑过就跳过、单任务最多补
+ * maxChatsPerTask 次，一键代打把这两个限制都放开（cap 可传，护栏 200）。
+ * 返回 { ok, text, totalChats, totalCredit, perSite }，text 是给人看的汇总。
+ */
+export async function playAllTasks(cfg, { site = null, accountId = null, cap = null } = {}) {
+  // 与 runTasks('all') 共用防重入锁：两边同时跑会对同一账号重复代打
+  if (runningTasks.has('all')) {
+    return { ok: false, busy: true, msg: '任务正在进行中，请稍后再试' };
+  }
+  runningTasks.add('all');
+  try {
+    const sites = site ? [site] : siteKeys(cfg);
+    const perSite = {};
+    const lines = [];
+    let totalChats = 0;
+    let totalCredit = 0;
+    const manualAll = [];
+    for (const s of sites) {
+      if (!cfg.sites[s] || cfg.sites[s].enabled === false) continue;
+      const opts = { force: true, cap, onlyAccountId: accountId || null };
+      const checkin = cfg.tasks?.checkin !== false ? await runForSite(cfg, s, 'checkin', opts) : [];
+      const streak = await runForSite(cfg, s, 'streak', opts);
+      const growth = cfg.tasks?.growth !== false ? await runForSite(cfg, s, 'growth', opts) : [];
+      const travel = cfg.tasks?.travel !== false ? await runForSite(cfg, s, 'travel', opts) : [];
+      perSite[s] = { checkin, streak, growth, travel };
+      for (const a of listAccounts(s)) {
+        if (a.enabled === false || !a.accessToken) continue;
+        if (accountId && a.id !== accountId) continue;
+        const uid = a.uid || a.id;
+        const label = a.label || a.id;
+        const ck = checkin.find((x) => x.id === a.id);
+        const st = streak.find((x) => x.id === a.id);
+        const g = growth.find((x) => x.id === a.id);
+        const tv = travel.find((x) => x.id === a.id);
+        if (ck?.skipped && st?.skipped && g?.skipped && tv?.skipped) continue; // 全跳过（不该发生，force 下）
+        const bits = [];
+        bits.push(`签到 ${ck?.error ? '✗ ' + String(ck.error).slice(0, 40) : (ck?.msg || '✗')}`);
+        if (st && !st.error) bits.push(`连登 ${st.days ?? 0} 天${st.creditGained ? ` +${st.creditGained}` : ''}分`);
+        else if (st?.error) bits.push(`连登 ✗ ${String(st.error).slice(0, 40)}`);
+        if (g && !g.error) {
+          bits.push(`成长：报名${g.accepted ?? 0} 代打${(g.autoTasks || []).length}任务/${g.autoChats ?? 0}次 领奖${g.claimed ?? 0}个 +${g.creditGained ?? 0}分`);
+          totalChats += g.autoChats || 0;
+          totalCredit += g.creditGained || 0;
+          for (const m of g.manualTasks || []) manualAll.push(`${label}：${m}`);
+        } else if (g?.error) bits.push(`成长 ✗ ${String(g.error).slice(0, 40)}`);
+        if (tv && !tv.error) {
+          bits.push(`猫猫：${tv.msg || tv.action || '—'}`);
+          if (tv.credit) totalCredit += tv.credit;
+        } else if (tv?.error) bits.push(`猫猫 ✗ ${String(tv.error).slice(0, 40)}`);
+        if (st?.creditGained) totalCredit += st.creditGained;
+        lines.push(`【${label}】${bits.join(' · ')}`);
+      }
+    }
+    const head = `一键代打完成：代打 ${totalChats} 次对话，合计 +${totalCredit} 积分`;
+    const text = [head, ...lines, ...(manualAll.length ? [`⚠️ 需手动完成（无法代打）：${manualAll.join('；')}`] : [])].join('\n');
+    recordEvent('task', `${head}（${lines.length} 个账号）`);
+    for (const l of lines) log(l);
+    return { ok: true, text, totalChats, totalCredit, perSite };
+  } finally {
+    runningTasks.delete('all');
   }
 }
 
@@ -1019,11 +1122,14 @@ export async function growthTasksView(cfg, site, accountId) {
   const now = new Date();
   return tasks.map((t) => {
     const j = judgeTask(t, cfg, site, now);
+    // 可代打口径 = 对话代打规则 ∪ 事件链任务（0.3.54：模板/画布/资料库/专家等 11 类）
+    const chainTask = isEventChainTask(t.code);
     return {
       ...t,
-      autoplayable: cfg.tasks?.autoComplete !== false && j.autoplayable && t.current < t.target,
+      autoplayable: cfg.tasks?.autoComplete !== false && t.current < t.target && (j.autoplayable || chainTask),
       autoplayModel: j.model || null,
-      autoplayBlockedReason: j.why || null,
+      autoplayKind: chainTask && !j.autoplayable ? 'chain' : (j.autoplayable ? 'chat' : null),
+      autoplayBlockedReason: (j.autoplayable || chainTask) ? null : (j.why || '该任务类型不支持代打（人工任务）'),
       remain: Math.max(0, t.target - t.current),
     };
   });
@@ -1071,7 +1177,8 @@ export async function prewarmTaskCenter(cfg) {
 }
 
 /** 代打/领奖等改变上游进度的操作之后调用：丢弃该账号的缓存视图，下次查看时重新拉取。 */
-function invalidateTaskCenter(site, accountId) {
+/** 丢弃任务中心缓存视图（进度/登录态变化后调用；导出给 device-login 在登录成功后用）。 */
+export function invalidateTaskCenter(site, accountId) {
   tcCache.delete(`${site}|${accountId}`);
 }
 
@@ -1086,6 +1193,24 @@ export async function runSingleTask(cfg, site, accountId, taskCode, { times = nu
   if (t.claimed) return { ok: true, chats: 0, msg: '奖励已领取', task: t };
   const j = judgeTask(t, cfg, site);
   if (!j.autoplayable) {
+    // 非对话类但属于事件链任务（模板/画布/资料库/专家…）：走链重放而不是对话代打
+    if (isEventChainTask(t.code)) {
+      const r = await sendEventChainsForTasks(cfg, site, accountId, [t]);
+      const fresh = (await listGrowthTasks(cfg, site, accountId)).find((x) => x.code === taskCode) || t;
+      invalidateTaskCenter(site, accountId);
+      record('growth-manual', accountId, {
+        ok: r.sent > 0, site,
+        msg: `手动事件链「${t.title}」发出 ${r.sent} 条${r.notes.length ? `，${r.notes.join('；')}` : ''}`,
+      });
+      return {
+        ok: r.sent > 0,
+        chats: 0,
+        chains: r.sent,
+        error: r.notes.length ? r.notes.join('；') : null,
+        msg: r.sent > 0 ? `事件链 ${r.sent} 条已发出，进度 ${fresh.current}/${fresh.target}` : `事件链失败：${r.notes.join('；') || '未知原因'}`,
+        task: fresh,
+      };
+    }
     return { ok: false, chats: 0, msg: j.why || '该任务类型不支持代打（人工任务）', task: t };
   }
   const cap = Number(cfg.tasks?.maxChatsPerTask) || 5;
@@ -1133,7 +1258,7 @@ export async function claimSingleTask(cfg, site, accountId, taskCode) {
   const t = tasks.find((x) => x.code === taskCode);
   if (!t) throw Object.assign(new Error(`任务不存在：${taskCode}`), { status: 404 });
   if (!t.claimable) return { ok: false, msg: t.claimed ? '奖励已领取过' : `进度未达标（${t.current}/${t.target}）`, task: t };
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const r = await claimReward(cfg, site, auth, cfg.sites[site], t.code);
   invalidateTaskCenter(site, accountId);
   record('growth-manual', accountId, { ok: true, site, msg: `手动领奖「${t.title}」+${r.credit} 积分`, credit: r.credit });
@@ -1160,6 +1285,7 @@ function scheduledNow(cfg, kind, d = new Date()) {
   const times = kind === 'checkin' ? t.checkinTimes
     : kind === 'growth' ? t.growthTimes
     : kind === 'travel' ? t.travelTimes
+    : kind === 'report' ? t.reportTimes
     : t.listTimes;
   if (Array.isArray(times) && times.length) {
     const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -1192,6 +1318,8 @@ export function missedRunToday(cfg, kind, d = new Date()) {
   const t = cfg.tasks || {};
   const times = kind === 'checkin' ? (Array.isArray(t.checkinTimes) && t.checkinTimes.length ? t.checkinTimes : null)
     : kind === 'growth' ? (Array.isArray(t.growthTimes) && t.growthTimes.length ? t.growthTimes : null)
+    // report（活跃上报）也参与补跑：服务在时点那一刻没活着的话，当天还有一次补救机会
+    : kind === 'report' ? (Array.isArray(t.reportTimes) && t.reportTimes.length ? t.reportTimes : null)
     : null;
   if (times) {
     const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -1223,8 +1351,9 @@ export function startTaskLoop(cfg) {
       }
       // T55 补跑：今天的时点已错过（服务那一刻没活着）且今天还没跑过 → 立即补跑。
       // 连登管家搭 checkin 的车，签到补跑时连登一起补——连登断一天要重攒 7 天，这是主保护对象。
-      // 失败回滚后的重试有 15 分钟冷却：上游/token 持续故障时不能变成全天分钟级重试轰炸
-      for (const k of ['checkin', 'growth']) {
+      // 失败回滚后的重试有 15 分钟冷却：上游/token 持续故障时不能变成全天分钟级重试轰炸。
+      // report（活跃上报）也在补跑之列——错过 10:00 当天补一次，别让「没开机」白丢一天
+      for (const k of ['checkin', 'growth', 'report']) {
         if (cfg.tasks?.[k] === false) continue;
         if (firedDay[k] !== today && missedRunToday(cfg, k) && Date.now() - (retryFailAt[k] || 0) > 15 * 60_000) {
           firedDay[k] = today;
@@ -1242,6 +1371,10 @@ export function startTaskLoop(cfg) {
         : scheduledNow(cfg, 'growth') && firedDay.growth !== today
           ? 'growth'
           : null;
+      // 活跃上报（0.3.47）：独立时点（默认 10:00，先于任务），一天一次
+      if (!kind && cfg.tasks?.report !== false && scheduledNow(cfg, 'report') && firedDay.report !== today) {
+        kind = 'report';
+      }
       if (!kind && cfg.tasks?.travel !== false && scheduledNow(cfg, 'travel') && Date.now() - lastTravelMs > 10 * 60_000) {
         kind = 'travel';
         lastTravelMs = Date.now();

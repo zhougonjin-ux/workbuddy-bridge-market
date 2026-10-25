@@ -288,8 +288,15 @@ export async function handleChatCompletions(ctx) {
     const bumped = { ...upstreamBody, max_tokens: Math.max(1024, askedMax * 4) };
     delete bumped.max_completion_tokens;
     warn(`[${site}] 空回答（finish=${agg.finishReason}，max_tokens=${askedMax}），放大到 ${bumped.max_tokens} 重试一次`);
-    const up2 = await openWithRetry(cfg, site, bumped, signal);
-    if (up2.ok) {
+    // 重试的传输失败不得把已经拿到的（空但合法的）结果顶成 5xx——包 try，失败保留原聚合
+    // （0.3.53 P2 修复；旧版 openWithRetry 抛 UpstreamError 会一路冒泡成 500）
+    let up2 = null;
+    try {
+      up2 = await openWithRetry(cfg, site, bumped, signal);
+    } catch (e) {
+      warn(`[${site}] 空回答放大重试失败（保留原结果）：`, e?.message || String(e));
+    }
+    if (up2?.ok) {
       try {
         agg = await aggregateFrames(up2.frames);
       } catch {
@@ -297,7 +304,7 @@ export async function handleChatCompletions(ctx) {
       } finally {
         up2.close();
       }
-    } else {
+    } else if (up2) {
       up2.close?.();
     }
   }

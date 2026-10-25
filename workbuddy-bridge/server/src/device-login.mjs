@@ -4,6 +4,7 @@ import { hydrateFromToken } from './auth.mjs';
 import { addAccount } from './pool.mjs';
 import { commonHeaders } from './headers.mjs';
 import { recordEvent } from './events.mjs';
+import { invalidateTaskCenter } from './tasks.mjs';
 
 const jars = new Map(); // site → Map(cookie)
 
@@ -95,7 +96,23 @@ export async function pollLogin(cfg, site, state, { label = null } = {}) {
   // 加进号池：同一 uid 会覆盖更新，不同 uid 则新增一个账号。
   // 首个账号加入时会自动把旧的单账号凭证并进池（用户无感迁移）。
   const saved = addAccount(site, auth, { label });
+  // 登录成功/更新后立即丢弃该账号的任务中心缓存：旧缓存里还是「登录失效」的
+  // 快照，不失效的话控制台要等缓存过期才恢复绿色（2026-10-25 周火火重登实测）。
+  try {
+    invalidateTaskCenter(site, saved.id);
+  } catch {
+    /* 缓存清理失败不影响登录 */
+  }
   // 事件时间线（T6）：登录成功是时间线上最有用的锚点之一（登录态失效后何时被修复）
   recordEvent('login', `账号登录成功：${saved.label || saved.nickname || saved.id}（${site}）`, { site, accountId: saved.id });
+  // 登录成功立刻刷新一次积分/到期明细（0.3.40）：CLI 与 MCP 的登录路径此前要等
+  // 30 分钟自动轮询才能在控制台看到新账号的余额；动态 import 避免 device-login
+  // ↔ scheduler 的模块加载期相互牵扯。
+  try {
+    const { scheduleCreditRefreshSoon } = await import('./scheduler.mjs');
+    scheduleCreditRefreshSoon(cfg);
+  } catch {
+    /* 刷新调度失败不影响登录结果 */
+  }
   return { done: true, auth: saved };
 }

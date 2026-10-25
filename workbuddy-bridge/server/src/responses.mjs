@@ -153,6 +153,7 @@ export function toChatRequest(body) {
 }
 
 /** Responses 的 content 可能是字符串或分块数组，统一压成字符串。 */
+let lastImageWarnAt = 0; // 图片输入提示的节流（别刷屏）
 function normalizeContent(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return content ?? '';
@@ -164,6 +165,11 @@ function normalizeContent(content) {
     }
     if (typeof p.text === 'string') parts.push(p.text);
     else if (p.type === 'input_text' && typeof p.text === 'string') parts.push(p.text);
+    else if (p.type === 'input_image' && Date.now() - lastImageWarnAt > 60_000) {
+      // 不再静默丢弃：客户端至少能从日志得知图片没被透传（0.3.53 P3）
+      lastImageWarnAt = Date.now();
+      warn('[responses] 请求携带图片输入，当前 Responses 转换层按纯文本继续（openai/anthropic 入口支持图片透传）');
+    }
   }
   return parts.join('');
 }
@@ -348,6 +354,7 @@ export async function handleResponses(ctx) {
   let textItemId = null;
   let textOpened = false;
   let textDone = false;
+  let contentAll = ''; // 跨正文 item 的全量正文（正文重开后 response.completed 要汇总全量）
   let reasoningItemId = null;
   let reasoningOpened = false;
   let reasoningDone = false;
@@ -430,7 +437,12 @@ export async function handleResponses(ctx) {
 
       // 正文
       if (typeof delta.content === 'string' && delta.content) {
-        if (!textOpened) {
+        // 工具项收尾后上游又来正文（少见形态）：旧正文 item 已 done，必须另起新 item，
+        // 否则后续 delta 会写进已关闭的 item_id（0.3.53 P3 修复）。contentText 换成
+        // 新 item 自己的缓冲，contentAll 继续累积全量正文。
+        if (!textOpened || textDone) {
+          textDone = false;
+          contentText = '';
           // 正文开始前，先把 reasoning 项收尾并让出 output_index
           await closeReasoning();
           textItemId = rid('msg');
@@ -448,6 +460,7 @@ export async function handleResponses(ctx) {
         }
         contentChars += delta.content.length;
         contentText += delta.content;
+        contentAll += delta.content;
         await emit('response.output_text.delta', {
           item_id: textItemId,
           output_index: outputIndex,
@@ -568,7 +581,7 @@ export async function handleResponses(ctx) {
         id: textItemId,
         status: 'completed',
         role: 'assistant',
-        content: [{ type: 'output_text', text: contentText, annotations: [] }],
+        content: [{ type: 'output_text', text: contentAll, annotations: [] }],
       });
     }
     for (const [, cur] of [...toolItems.entries()].sort((a, b) => a[1].output_index - b[1].output_index)) {
@@ -630,7 +643,7 @@ export async function handleResponses(ctx) {
       account: up.accountId,
       model,
       mode: 'responses',
-      status: finished ? 200 : 499,
+      status: streamFailed ? 502 : finished ? 200 : 499,
       ms: Date.now() - started,
       credit,
     });
@@ -638,7 +651,7 @@ export async function handleResponses(ctx) {
       site,
       model,
       mode: 'responses',
-      status: finished ? 200 : 499,
+      status: streamFailed ? 502 : finished ? 200 : 499,
       promptTokens: upstreamUsage?.prompt_tokens ?? estimateTokens(JSON.stringify(chatReq.messages || [])),
       completionTokens: upstreamUsage?.completion_tokens ?? estimateTokens('x'.repeat(contentChars)),
       credit,
