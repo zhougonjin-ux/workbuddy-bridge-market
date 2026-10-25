@@ -3,7 +3,7 @@
 import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId, reportFrameError } from './upstream.mjs';
 import { ensureToken } from './auth.mjs';
 import { isQuotaError } from './pool.mjs';
-import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText, effectiveSuffixText } from './router.mjs';
+import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText, effectiveSuffixText, chainCandidates } from './router.mjs';
 import { recordUsage, estimateCredit, observedCostByModel } from './usage.mjs';
 import { startSSE, writeSSE, sendJson, sendError, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
@@ -135,6 +135,42 @@ export async function openWithSiteFallback(cfg, target, upstreamBody, signal, op
   return { up, site, model };
 }
 
+/**
+ * 模型链编排（0.3.56，借鉴 dsh 路由页「把多个模型串成链」）：
+ * openWithSiteFallback 之上再套一层「模型层降级」——账号轮换（openChatRotating）与
+ * 站点降级都救不回来时（限流 429 / 额度 402·quota / 模型不存在），按 cfg.modelChains
+ * 配的链换下一个模型再试。链没配时候选只有请求模型自身，行为与直接调
+ * openWithSiteFallback 完全一致。只对「模型层」错误续链：401（登录态）、传输错误、
+ * 参数 400 换模型救不了；候选项解析/请求异常只跳过该候选，绝不吞掉最后的失败结果。
+ */
+export async function openWithModelChain(cfg, target, upstreamBody, signal, opener, opts = {}) {
+  let r = await openWithSiteFallback(cfg, target, upstreamBody, signal, opener, opts);
+  if (r.up.ok) return r;
+  const candidates = chainCandidates(cfg, target.requested || upstreamBody.model);
+  for (const next of candidates.slice(1)) {
+    if (signal?.aborted) return r;
+    const s = r.up.status || 0;
+    const chainable = s === 429 || s === 402 || isQuotaError(s, r.up.text) || isModelNotFound(s, r.up.text);
+    if (!chainable) return r;
+    let nextTarget;
+    try {
+      nextTarget = await (opts.resolveTarget || resolveTarget)(cfg, next);
+    } catch (e) {
+      warn(`[链] 候选 ${next} 解析失败（${String(e.message || e).slice(0, 100)}），跳过`);
+      continue;
+    }
+    warn(`[链] ${r.model || target.model} 失败（HTTP ${s}），按链换 ${nextTarget.model}（${nextTarget.site}）重试`);
+    try {
+      r = await openWithSiteFallback(cfg, nextTarget, { ...upstreamBody, model: nextTarget.model }, signal, opener, opts);
+    } catch (e) {
+      warn(`[链] 候选 ${next} 请求异常（${String(e.message || e).slice(0, 100)}），跳过`);
+      continue;
+    }
+    if (r.up.ok) return r;
+  }
+  return r;
+}
+
 /** 换个站点重试同一请求（用于降级）。换站点后账号池也换了一套，因此 exclude 重置。 */
 async function openWithFallback(cfg, target, upstreamBody, signal, 原因) {
   const 目标站点 = target.fallback.site;
@@ -184,7 +220,7 @@ export async function handleChatCompletions(ctx) {
     upstreamBody.max_tokens = cfg.defaultMaxTokens;
   }
 
-  const r = await openWithSiteFallback(cfg, target, upstreamBody, signal, (s, b) => openWithRetry(cfg, s, b, signal));
+  const r = await openWithModelChain(cfg, target, upstreamBody, signal, (s, b) => openWithRetry(cfg, s, b, signal));
   let up = r.up;
   site = r.site;
   model = r.model;

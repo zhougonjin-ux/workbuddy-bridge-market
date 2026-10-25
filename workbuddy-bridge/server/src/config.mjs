@@ -174,6 +174,9 @@ export function defaultConfig() {
     sites: structuredClone(SITE_PRESETS),
     // 模型 → 站点 的显式路由（可选），例如 { "claude-4.5": "intl-cli" }
     modelRoutes: {},
+    // 模型链（0.3.56，可选）：模型层失败（限流/额度/模型不存在）时按序换下一个模型，
+    // 例如 { "glm-5.3-flash": ["glm-5.2", "hy3"] }
+    modelChains: {},
     timeouts: {
       headerMs: 90000, // 上游首字节（响应头）超时
       idleMs: 300000, // 流中空闲超时
@@ -455,6 +458,10 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
   if (!isPlainObject(cfg.modelRoutes)) {
     fix('modelRoutes 必须是对象，已回退为 {}');
     cfg.modelRoutes = {};
+  }
+  if (!isPlainObject(cfg.modelChains)) {
+    fix('modelChains 必须是对象（模型 → 候选数组），已回退为 {}');
+    cfg.modelChains = {};
   }
   if (!isPlainObject(cfg.modelAliases)) {
     fix('modelAliases 必须是对象，已回退为 {}');
@@ -875,6 +882,21 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     if (!isStr(site) || !cfg.sites[site]) {
       fix(`modelRoutes.${model} 指向不存在的站点 "${site}"，已移除该路由`);
       delete cfg.modelRoutes[model];
+    }
+  }
+  // 模型链（0.3.56）：值必须是「非空字符串组成的数组」；含自身的链会打转，剔除自身项
+  for (const [model, list] of Object.entries(cfg.modelChains || {})) {
+    if (!Array.isArray(list) || list.length === 0) {
+      fix(`modelChains.${model} 必须是非空数组，已移除该链`);
+      delete cfg.modelChains[model];
+      continue;
+    }
+    const clean = [...new Set(list.map((x) => String(x ?? '').trim()))].filter((x) => x && x !== model).slice(0, 6);
+    if (clean.length === 0) {
+      fix(`modelChains.${model} 剔除空项/自身后没有有效候选，已移除该链`);
+      delete cfg.modelChains[model];
+    } else if (clean.length !== list.length) {
+      cfg.modelChains[model] = clean;
     }
   }
 

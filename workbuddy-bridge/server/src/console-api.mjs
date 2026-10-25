@@ -1055,6 +1055,7 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, 200, {
       aliases: cfg.modelAliases || {},
       routes: cfg.modelRoutes || {},
+      chains: cfg.modelChains || {},
       allowModels: cfg.allowModels || [],
       excludeModels: cfg.excludeModels || [],
       models: m.map((x) => ({ id: x.id, site: x.site, aliasOf: x.aliasOf || null })),
@@ -1077,6 +1078,23 @@ export async function handleConsoleApi(ctx) {
       }
       cfg.modelRoutes = body.routes;
     }
+    // 模型链（0.3.56）：模型 → 候选数组。键不能为空、候选必须是非空字符串、
+    // 不能包含自身（打转）；最多 6 个候选（与 config 层清洗同口径）
+    if (body.chains !== undefined) {
+      if (!isPlainObj(body.chains)) return sendJson(res, 400, { error: 'chains 必须是对象（模型 → 候选数组）' });
+      const clean = {};
+      for (const [k, list] of Object.entries(body.chains)) {
+        const key = k.trim();
+        if (!key) return sendJson(res, 400, { error: 'chains 的键（模型名）不能为空' });
+        if (!Array.isArray(list) || !list.length || list.some((x) => typeof x !== 'string' || !x.trim())) {
+          return sendJson(res, 400, { error: `链 ${key} 的候选必须是非空字符串数组` });
+        }
+        const vals = [...new Set(list.map((x) => x.trim()))].filter(Boolean).slice(0, 6);
+        if (vals.includes(key)) return sendJson(res, 400, { error: `链 ${key} 不能包含自身（会在链上原地打转）` });
+        if (vals.length) clean[key] = vals;
+      }
+      cfg.modelChains = clean;
+    }
     for (const field of ['allowModels', 'excludeModels']) {
       if (body[field] !== undefined) {
         if (!Array.isArray(body[field]) || body[field].some((s) => typeof s !== 'string')) {
@@ -1086,7 +1104,7 @@ export async function handleConsoleApi(ctx) {
       }
     }
     saveConfig(cfg);
-    return sendJson(res, 200, { ok: true, aliases: cfg.modelAliases, routes: cfg.modelRoutes, allowModels: cfg.allowModels, excludeModels: cfg.excludeModels });
+    return sendJson(res, 200, { ok: true, aliases: cfg.modelAliases, routes: cfg.modelRoutes, chains: cfg.modelChains, allowModels: cfg.allowModels, excludeModels: cfg.excludeModels });
   }
 
   // ---- T19：模型清单过滤（白/黑名单预览：保存前看看哪些模型会被剔除）----

@@ -2,7 +2,7 @@
 // Trae 的「Claude 型自定义模型」走 Anthropic Messages 协议，这里做双向转换。
 import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId, reportFrameError } from './upstream.mjs';
 import { resolveTarget } from './router.mjs';
-import { openWithSiteFallback } from './openai.mjs';
+import { openWithSiteFallback, openWithModelChain } from './openai.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
 import { startSSE, writeSSEEvent, sendJson, sendError, writeAsync, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
@@ -129,10 +129,11 @@ export async function handleMessages(ctx) {
   const openaiBody = toOpenAIBody({ ...body, model });
   if (openaiBody.max_tokens === undefined) openaiBody.max_tokens = cfg.defaultMaxTokens;
 
-  // 与 openai/responses 入口共用同一条降级编排（openWithSiteFallback）：
+  // 与 openai/responses 入口共用同一条降级编排（openWithModelChain：站点降级之上
+  // 还带模型链——cfg.modelChains 配了链时，模型层失败按序换下一个模型）：
   // 连接失败 / 模型不存在 / 网关 5xx / 额度 429·402 四条路径在这里统一处理，
   // 补齐了原实现缺的「额度层换站」——429/402 是 return 不是 throw，原来根本进不了降级。
-  const r = await openWithSiteFallback(
+  const r = await openWithModelChain(
     cfg,
     target,
     openaiBody,

@@ -2375,7 +2375,7 @@ function healthState(a) {
         </div>
         <div style="overflow:auto">${keyRows ? `<table><thead><tr><th>密钥</th><th>说明</th><th></th></tr></thead><tbody>${keyRows}</tbody></table>` : '<div class="muted" style="padding:14px;text-align:center">加载失败或没有 key</div>'}</div>
       </div>
-      <h2>路由规则 <span class="sub">T19 · 别名（模型→模型/站点/模型）、钉死路由（模型→站点）、白/黑名单（支持 * 通配符）</span></h2>
+      <h2>路由规则 <span class="sub">T19 · 别名（模型→模型/站点/模型）、钉死路由（模型→站点）、模型链（模型层失败按序换下一个）、白/黑名单（支持 * 通配符）</span></h2>
       <div class="card" style="margin-bottom:20px">
         <div class="grid" style="grid-template-columns:1fr 1fr;gap:14px">
           <div>
@@ -2394,6 +2394,10 @@ function healthState(a) {
             <label class="muted" style="font-size:12.5px;display:block;margin-bottom:5px" title="逗号分隔，支持 * 通配符。命中的模型从目录剔除、不可调用">黑名单（excludeModels）</label>
             <input type="text" id="rtExclude" style="width:100%" placeholder="如 claude-opus-* , gpt-6-astra">
           </div>
+        </div>
+        <div style="margin-top:14px">
+          <label class="muted" style="font-size:12.5px;display:block;margin-bottom:5px" title="一行一条：模型=候选1,候选2,…。请求的模型撞上限流/额度/不存在这类模型层失败（账号轮换与换站都救不了）时，按序换候选再试；候选项可以是别名或 站点/模型。不能包含自身">模型链（modelChains）· 顺序降级</label>
+          <textarea id="rtChains" rows="3" style="width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--text);border-radius:8px;padding:9px;font:12.5px/1.6 Consolas,monospace" placeholder="glm-5.3-flash=glm-5.2, hy3&#10;kimi=glm-5.2, deepseek-v4.1-flash"></textarea>
         </div>
         <div class="row" style="margin-top:12px">
           <button class="btn primary" id="rtSave">保存路由规则</button>
@@ -2568,9 +2572,10 @@ function healthState(a) {
     };
     const rt = await api('/routes').catch(() => null);
     if (rt) {
-      for (const id of ['rtAliases', 'rtRoutes', 'rtAllow', 'rtExclude']) markDirty($('#' + id));
+      for (const id of ['rtAliases', 'rtRoutes', 'rtChains', 'rtAllow', 'rtExclude']) markDirty($('#' + id));
       fillIfIdle($('#rtAliases'), Object.entries(rt.aliases || {}).map(([k, v]) => `${k}=${v}`).join('\n'));
       fillIfIdle($('#rtRoutes'), Object.entries(rt.routes || {}).map(([k, v]) => `${k}=${v}`).join('\n'));
+      fillIfIdle($('#rtChains'), Object.entries(rt.chains || {}).map(([k, v]) => `${k}=${(v || []).join(', ')}`).join('\n'));
       fillIfIdle($('#rtAllow'), (rt.allowModels || []).join(', '));
       fillIfIdle($('#rtExclude'), (rt.excludeModels || []).join(', '));
     }
@@ -2585,17 +2590,34 @@ function healthState(a) {
       }
       return out;
     };
+    // 模型链解析：一行一条「模型=候选1,候选2」（候选逗号/分号分隔，支持中英文标点）
+    const parseChains = (text) => {
+      const out = {};
+      for (const line of String(text || '').split('\n')) {
+        const t = line.trim();
+        if (!t) continue;
+        const i = t.indexOf('=');
+        if (i <= 0 || !t.slice(i + 1).trim()) throw new Error(`模型链格式不对：${t}（应为 模型=候选1,候选2，一行一条）`);
+        const key = t.slice(0, i).trim();
+        const vals = t.slice(i + 1).split(/[,，;；]+/).map((s) => s.trim()).filter(Boolean);
+        if (!vals.length) throw new Error(`链 ${key} 没有有效候选`);
+        if (vals.includes(key)) throw new Error(`链 ${key} 不能包含自身`);
+        out[key] = vals;
+      }
+      return out;
+    };
     $('#rtSave').onclick = async () => {
       try {
         const body = {
           aliases: parseKv($('#rtAliases').value, '别名'),
           routes: parseKv($('#rtRoutes').value, '路由'),
+          chains: parseChains($('#rtChains').value),
           allowModels: $('#rtAllow').value.split(/[,，;；\s]+/).map((s) => s.trim()).filter(Boolean),
           excludeModels: $('#rtExclude').value.split(/[,，;；\s]+/).map((s) => s.trim()).filter(Boolean),
         };
         await api('/routes', { method: 'POST', body });
-        $('#rtMsg').textContent = '已保存（' + Object.keys(body.aliases).length + ' 别名 · ' + Object.keys(body.routes).length + ' 路由 · 白' + body.allowModels.length + '/黑' + body.excludeModels.length + '）';
-        for (const id of ['rtAliases', 'rtRoutes', 'rtAllow', 'rtExclude']) delete $('#' + id).dataset.dirty;
+        $('#rtMsg').textContent = '已保存（' + Object.keys(body.aliases).length + ' 别名 · ' + Object.keys(body.routes).length + ' 路由 · ' + Object.keys(body.chains).length + ' 链 · 白' + body.allowModels.length + '/黑' + body.excludeModels.length + '）';
+        for (const id of ['rtAliases', 'rtRoutes', 'rtChains', 'rtAllow', 'rtExclude']) delete $('#' + id).dataset.dirty;
         toast('路由规则已保存，立即生效', 'ok');
       } catch (e) { $('#rtMsg').textContent = ''; toast('保存失败：' + e.message, 'bad'); }
     };

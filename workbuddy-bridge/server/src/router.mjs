@@ -238,6 +238,27 @@ export function rankSiteCandidates(candidates, defaultSite) {
   );
 }
 
+/**
+ * 模型链候选（0.3.56，借鉴 dsh 路由页的「把多个模型串成链」）：
+ * cfg.modelChains = { 请求模型: [候选1, 候选2, …] }——首个候选失败（限流/额度/
+ * 模型不存在这类**模型层**错误）时按序换下一个。返回去重后的候选数组，首项恒为
+ * 请求模型自身（剥掉选择器倍率后缀再查表/比较）；没配链就只有一项，行为与旧版全等。
+ * 候选项本身可以是别名或 `站点/模型`（每个候选独立走 resolveTarget）。
+ * 上限 7 项防手滑配出环状长链。
+ */
+export function chainCandidates(cfg, requestedModel) {
+  const key = stripMultiplierSuffix(String(requestedModel || '').trim());
+  const out = [key];
+  const chain = cfg?.modelChains?.[key];
+  if (Array.isArray(chain)) {
+    for (const m of chain) {
+      const v = stripMultiplierSuffix(String(m ?? '').trim());
+      if (v && !out.includes(v) && out.length < 7) out.push(v);
+    }
+  }
+  return out;
+}
+
 /** 从 cfg 里读调度策略；读不到按空串处理（走原有行为）。 */
 function poolPolicy(cfg) {
   return (cfg && cfg.pool && cfg.pool.policy) || '';
