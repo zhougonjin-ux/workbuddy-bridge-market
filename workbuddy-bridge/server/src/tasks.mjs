@@ -1095,6 +1095,25 @@ export async function playAllTasks(cfg, { site = null, accountId = null, cap = n
 }
 
 /** 任务状态视图（/admin/tasks 用）。 */
+/**
+ * 今日白嫖收益（0.3.57，借鉴 dsh「今日收益按来源分账」）：从 history（带时间戳的
+ * 最近 200 条运行记录）推导，跨天自动清零——不用单独的落盘结构。签到上游不回报积分
+ * 数值只计成功次数；growth/streak 用 creditGained、travel 用 credit 进分账。
+ * 纯函数（history 可注入），history 截断只影响久远历史，今日条目恒在场。
+ */
+export function gainedTodayFrom(history, today = todayKey()) {
+  const out = { credit: 0, checkins: 0, growthCredit: 0, travelCredit: 0, streakCredit: 0, travels: 0, claims: 0 };
+  for (const h of Array.isArray(history) ? history : []) {
+    if (!h || h.ok === false || !String(h.at || '').startsWith(today)) continue;
+    if (h.kind === 'checkin') out.checkins += 1;
+    else if (h.kind === 'growth') { out.growthCredit += Number(h.creditGained) || 0; out.claims += h.claimed || 0; }
+    else if (h.kind === 'travel') { out.travelCredit += Number(h.credit) || 0; if (Number(h.credit) > 0) out.travels += 1; }
+    else if (h.kind === 'streak') out.streakCredit += Number(h.creditGained) || 0;
+  }
+  out.credit = out.growthCredit + out.travelCredit + out.streakCredit;
+  return out;
+}
+
 export function taskStatus() {
   const s = loadState();
   return {
@@ -1107,6 +1126,8 @@ export function taskStatus() {
     // T15：签到日历（'YYYY-MM-DD' → 当天签到的 uid 数组）与累计白嫖统计
     checkinDays: s.checkinDays || {},
     gainedTotal: s.gainedTotal || { credit: 0, checkins: 0, claims: 0, travels: 0, streaks: 0 },
+    // 0.3.57：今日收益按来源分账（从全量 history 推导，跨天自动清零）
+    gainedToday: gainedTodayFrom(s.history),
     stateFile: statePath(),
   };
 }

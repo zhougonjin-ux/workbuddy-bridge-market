@@ -1707,7 +1707,10 @@ async function loadTasks() {
     // ---- T15：累计白嫖 KPI（同上，仅重建时重画）----
     if (changed) {
       const g = t.gainedTotal || { credit: 0, checkins: 0, claims: 0, travels: 0, streaks: 0 };
+      const gt = t.gainedToday || {};
+      const gtDetail = [`任务 +${fmtCredit(gt.growthCredit || 0)}`, `旅行 +${fmtCredit(gt.travelCredit || 0)}`, `连登 +${fmtCredit(gt.streakCredit || 0)}`].join(' · ');
       $('#gainedKpis').innerHTML = `
+        <div class="kpi"><b class="ok">+${fmtCredit(gt.credit ?? 0)}</b><span title="${esc(gtDetail)}${gt.checkins ? ` · 签到 ${gt.checkins} 个账号` : ''}">今日白嫖积分（${esc(gtDetail)}）</span></div>
         <div class="kpi"><b class="ok">${fmtCredit(g.credit ?? 0)}</b><span>成长任务+旅行+连登领回积分</span></div>
         <div class="kpi"><b>${g.checkins ?? 0}</b><span>累计签到（账号·天）</span></div>
         <div class="kpi"><b>${g.claims ?? 0}</b><span>累计领奖次数</span></div>
