@@ -349,7 +349,10 @@ class MainForm : Form
     readonly Dictionary<string, Panel> pages = new Dictionary<string, Panel>();
     readonly Label navVersion = new Label();
     NotifyIcon tray;
-    bool busy;
+    bool busy;          // 轮询互斥（RefreshAll 专用）
+    bool actionBusy;    // 按钮动作互斥——与轮询分离：轮询进行中点击不再被静默吞掉（0.3.59）
+    Label taskRunStatus;   // 任务页按钮的执行反馈（旧版点按钮零反馈，用户以为没点上）
+    ListView modelList; Label modelCur; Label modelMsg; string modelsDefaultModel = "";
     string currentPolicy = "";
     string pinnedId = "";
 
@@ -460,8 +463,9 @@ class MainForm : Form
 
         AddNav("账号管理", "accounts", 68);
         AddNav("任务中心", "tasks", 110);
-        AddNav("用量", "usage", 152);
-        AddNav("设置", "settings", 194);
+        AddNav("模型", "models", 152);
+        AddNav("用量", "usage", 194);
+        AddNav("设置", "settings", 236);
 
         navVersion.Dock = DockStyle.Bottom;
         navVersion.Height = 36;
@@ -537,6 +541,7 @@ class MainForm : Form
 
         pages["accounts"] = BuildAccountsPage();
         pages["tasks"] = BuildTasksPage();
+        pages["models"] = BuildModelsPage();
         pages["usage"] = BuildUsagePage();
         pages["settings"] = BuildSettingsPage();
         foreach (var p in pages.Values) bodyPanel.Controls.Add(p);
@@ -587,20 +592,9 @@ class MainForm : Form
         b.MouseLeave += delegate { b.BackColor = CardBack; };
         b.Click += delegate
         {
-            if (busy) return;
-            busy = true;
-            new Thread(delegate()
-            {
-                string error = null;
-                try { act(); }
-                catch (Exception ex) { error = ex.Message; }
-                BeginInvoke((MethodInvoker)delegate
-                {
-                    busy = false;
-                    if (error != null) MessageBox.Show(error, Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
-                    RefreshAll();
-                });
-            }).Start();
+            // 0.3.59：不再在此层做 busy 门控——旧版与 60s 轮询共用 busy，轮询进行中点击被
+            // 静默吞掉（用户「点了没反应」的根源）。所有调用点的 act 都自带线程与互斥（Run/RunBlocking）。
+            act();
         };
         panel.Controls.Add(b);
     }
@@ -691,6 +685,9 @@ class MainForm : Form
         AddBtn(btnPanel, "活跃上报", delegate { RunTask("report"); });
         AddBtn(btnPanel, "连登管家", delegate { RunTask("streak"); });
         page.Controls.Add(btnPanel);
+        // 执行反馈行（0.3.59）：放在标题右侧，不挤占下方任何布局
+        taskRunStatus = new Label { Location = new Point(210, 26), AutoSize = true, ForeColor = Accent, Font = new Font("Microsoft YaHei UI", 9F), Text = "" };
+        page.Controls.Add(taskRunStatus);
 
         var kpiCards = new List<Panel>();
         kpiCards.Add(AddKpiCard(page, "累计白嫖积分", kpiCredit, 32, 156));
@@ -798,6 +795,117 @@ class MainForm : Form
         }
         TextRenderer.DrawText(g, "浅绿=部分账号已签 · 深绿=全部 · 红框=今天",
             new Font("Microsoft YaHei UI", 8F), new Point(x0, y0 + 4 * (cell + gap) + 6), SubText);
+    }
+
+    /** 模型页（0.3.59）：目录/倍率/促销/限流 + 设默认——此前这些只在网页控制台可见。 */
+    Panel BuildModelsPage()
+    {
+        var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
+        page.Controls.Add(PageTitle("模型"));
+        page.Controls.Add(PageSub("可用模型目录与限流状态（跟随上游刷新）；★ = 当前默认模型，双击行或按钮设为默认。", 60));
+
+        modelCur = new Label { Location = new Point(32, 86), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold), Text = "当前默认模型：—" };
+        page.Controls.Add(modelCur);
+
+        var topRow = new FlowLayoutPanel { Location = new Point(32, 112), Size = new Size(900, 36) };
+        AddBtn(topRow, "⟳ 刷新列表", delegate { LoadModels(); });
+        AddBtn(topRow, "设选中为默认", delegate { SetDefaultModelFromSelection(); });
+        modelMsg = new Label { AutoSize = true, ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 9F), Text = "", Margin = new Padding(8, 7, 4, 4) };
+        topRow.Controls.Add(modelMsg);
+        page.Controls.Add(topRow);
+
+        modelList = new ListView();
+        modelList.Location = new Point(32, 156);
+        modelList.Size = new Size(880, 520);
+        modelList.View = View.Details;
+        modelList.FullRowSelect = true;
+        modelList.Font = new Font("Microsoft YaHei UI", 9F);
+        modelList.Columns.Add("模型", 240);
+        modelList.Columns.Add("站点", 90);
+        modelList.Columns.Add("倍率", 90);
+        modelList.Columns.Add("促销", 130);
+        modelList.Columns.Add("上下文", 90);
+        modelList.Columns.Add("限流", 160);
+        modelList.DoubleClick += delegate { SetDefaultModelFromSelection(); };
+        page.Controls.Add(modelList);
+
+        page.HorizontalScroll.Enabled = false;
+        page.HorizontalScroll.Visible = false;
+        page.Resize += delegate { modelList.Width = Math.Max(360, page.ClientSize.Width - 64); };
+        return page;
+    }
+
+    void SetDefaultModelFromSelection()
+    {
+        if (modelList == null || modelList.SelectedItems.Count == 0)
+        {
+            if (modelMsg != null) modelMsg.Text = "先在列表里选中一个模型";
+            return;
+        }
+        string id = modelList.SelectedItems[0].SubItems[0].Text;
+        if (id.StartsWith("★ ")) id = id.Substring(2);
+        string picked = id;
+        if (modelMsg != null) modelMsg.Text = "设置默认：" + picked + " …";
+        Run(delegate
+        {
+            Program.Api("POST", "/console/api/default-model", "{\"model\":\"" + J(picked) + "\"}");
+            BeginInvoke((MethodInvoker)delegate { if (modelMsg != null) modelMsg.Text = "默认模型 → " + picked; });
+            LoadModels();
+        });
+    }
+
+    void LoadModels()
+    {
+        if (modelMsg != null) modelMsg.Text = "加载中…";
+        Run(delegate
+        {
+            string json = Program.Api("GET", "/console/api/models", null);
+            var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            var root = ser.DeserializeObject(json) as Dictionary<string, object>;
+            string defModel = Str(root, "default_model");
+            object[] data = root != null && root.ContainsKey("data") ? root["data"] as object[] : null;
+            var rows = new List<string[]>();
+            foreach (var o in data ?? new object[0])
+            {
+                var m = o as Dictionary<string, object>;
+                if (m == null) continue;
+                string id = Str(m, "id");
+                if (id == "") continue;
+                double mult;
+                double.TryParse(Str(m, "multiplier"), out mult);
+                string multText = Str(m, "free") == "True" ? "免费" : (Str(m, "multiplier") == "" ? "—" : "x" + mult.ToString("0.##"));
+                string badges = "";
+                object bv;
+                if (m.TryGetValue("badges", out bv) && bv is object[])
+                {
+                    var parts = new List<string>();
+                    foreach (var v in (object[])bv) if (v != null && v.ToString() != "") parts.Add(v.ToString());
+                    badges = string.Join("、", parts.ToArray());
+                }
+                double ctx;
+                double.TryParse(Str(m, "context"), out ctx);
+                string ctxText = ctx > 0 ? (ctx / 1000.0).ToString("0.#") + "K" : "—";
+                string rate = "—";
+                object rv;
+                if (m.TryGetValue("rate_limit", out rv) && rv is Dictionary<string, object>)
+                {
+                    double until;
+                    double.TryParse(Str((Dictionary<string, object>)rv, "until"), out until);
+                    rate = "限流中 → " + (until > 0 ? new DateTime(1970, 1, 1).AddMilliseconds(until).ToLocalTime().ToString("HH:mm") : "?") + " 恢复";
+                }
+                rows.Add(new string[] { (id == defModel ? "★ " : "") + id, Str(m, "site"), multText, badges, ctxText, rate });
+            }
+            BeginInvoke((MethodInvoker)delegate
+            {
+                modelsDefaultModel = defModel;
+                modelCur.Text = "当前默认模型：" + (defModel == "" ? "—" : defModel);
+                modelList.BeginUpdate();
+                modelList.Items.Clear();
+                foreach (var r in rows) modelList.Items.Add(new ListViewItem(r));
+                modelList.EndUpdate();
+                if (modelMsg != null) modelMsg.Text = "共 " + rows.Count + " 个模型";
+            });
+        });
     }
 
     Panel BuildUsagePage()
@@ -1052,6 +1160,7 @@ class MainForm : Form
     void ShowPage(string page)
     {
         foreach (var kv in pages) kv.Value.Visible = kv.Key == page;
+        if (page == "models" && modelList != null && modelList.Items.Count == 0) LoadModels();
         foreach (var nb in navButtons) nb.Selected = nb.Text == NavNameOf(page);
         foreach (var nb in navButtons) nb.Invalidate();
     }
@@ -1060,6 +1169,7 @@ class MainForm : Form
     {
         if (page == "accounts") return "账号管理";
         if (page == "tasks") return "任务中心";
+        if (page == "models") return "模型";
         if (page == "usage") return "用量";
         return "设置";
     }
@@ -1487,8 +1597,8 @@ class MainForm : Form
 
     void Run(Action act)
     {
-        if (busy) return;
-        busy = true;
+        if (actionBusy) return;
+        actionBusy = true;
         new Thread(delegate()
         {
             string error = null;
@@ -1496,21 +1606,47 @@ class MainForm : Form
             catch (Exception ex) { error = ex.Message; }
             BeginInvoke((MethodInvoker)delegate
             {
-                busy = false;
+                actionBusy = false;
                 if (error != null) MessageBox.Show(error, Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 RefreshAll();
             });
         }).Start();
     }
 
+    void SetTaskStatus(string text, Color c)
+    {
+        if (taskRunStatus == null) return;
+        BeginInvoke((MethodInvoker)delegate { taskRunStatus.Text = text; taskRunStatus.ForeColor = c; });
+    }
+
+    /** 带状态行反馈的动作（0.3.59）：执行中/完成/失败都在任务页标题右侧可见——
+        旧版点按钮毫无反馈，加上 60s 轮询与按钮共用互斥标志，轮询期间点击被静默吞掉。 */
+    void RunWithStatus(string label, Action act)
+    {
+        SetTaskStatus(label + " 执行中…（上游任务可能要几十秒，完成后「最近记录」会更新）", InkText);
+        Run(delegate
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            try { act(); }
+            catch (Exception ex)
+            {
+                SetTaskStatus(label + " 失败：" + ex.Message, Danger);
+                throw; // Run 接住后弹错误框
+            }
+            sw.Stop();
+            SetTaskStatus(label + " 完成 ✓（耗时 " + ((int)sw.Elapsed.TotalSeconds) + " 秒，明细见「最近记录」）", Accent);
+        });
+    }
+
     void RunTask(string kind)
     {
-        Run(delegate { Program.Api("POST", "/console/api/tasks/run", "{\"kind\":\"" + kind + "\"}"); });
+        string kindName = kind == "report" ? "活跃上报" : kind == "checkin" ? "签到" : kind == "growth" ? "成长任务" : kind == "travel" ? "猫猫旅行" : "连登管家";
+        RunWithStatus(kindName, delegate { Program.Api("POST", "/console/api/tasks/run", "{\"kind\":\"" + kind + "\"}"); });
     }
 
     void RunPlayAll()
     {
-        Run(delegate
+        RunWithStatus("一键代打", delegate
         {
             string outText = Program.Api("POST", "/console/api/task-center/play-all", "{}");
             string msg = ExtractString(outText, "text");
