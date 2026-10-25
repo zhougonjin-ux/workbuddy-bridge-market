@@ -507,8 +507,13 @@ export async function openServerConversation(cfg, site, accountId, expertId = ''
       if (chunk.done) break;
       buffer += decoder.decode(chunk.value, { stream: true });
       const match = SERVER_ID_PATTERN.exec(buffer);
-      if (match !== null) return { conversationId, requestId: match[1] };
+      // 0.3.61：扫到 id 就地返回前必须显式关流——否则 SSE 连接挂到上游超时（每任务泄一条）
+      if (match !== null) {
+        try { await reader.cancel(); } catch { /* 已断 */ }
+        return { conversationId, requestId: match[1] };
+      }
     }
+    try { await reader.cancel(); } catch { /* 已断 */ }
     return null;
   } catch {
     return null;
@@ -690,10 +695,12 @@ export async function sendEventChainsForTasks(cfg, site, accountId, tasks, { wai
       notes.push(`${t.title}：链构造失败（${String(e.message || e).slice(0, 80)}）`);
       continue;
     }
+    let sentHere = 0; // 0.3.61：完成判定用本任务计数——原先用全局 sent，先成功的任务会把后续全失败的任务也报成完成
     for (const chain of chains) {
       try {
         await sendChain(cfg, site, accountId, chain);
         sent++;
+        sentHere++;
         sentAnything = true;
       } catch (e) {
         notes.push(`${t.title}：事件上报失败（${String(e.message || e).slice(0, 80)}）`);
@@ -701,7 +708,7 @@ export async function sendEventChainsForTasks(cfg, site, accountId, tasks, { wai
       }
       await sleep(CHAIN_DELAY_MS);
     }
-    if (sent > 0) done.push(t.title);
+    if (sentHere > 0) done.push(t.title);
     // 专家族内部已带间隔；任务与任务之间也稍歇
     await sleep(CHAIN_DELAY_MS);
   }

@@ -593,6 +593,8 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
         `[${site}] ${model} 的工具定义约 ${附属} tokens，已占满上下文上限 ${已知上限}，`
         + `压缩 messages 无法解决（请精简客户端启用的工具 / MCP 数量）`,
       );
+      // 0.3.61：body 已被读成 text，必须还原成 _text 包装，否则下面错误分支再读 res.text() 只得空串
+      res = { status: res.status, _text: text, headers: res.headers };
       break;
     }
 
@@ -602,7 +604,10 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
       minKeepMessages: cfg.context?.minKeepMessages ?? 4,
       safetyRatio: 1,
     });
-    if (!更小.stats.applied) break; // 压不动了，别再试
+    if (!更小.stats.applied) {
+      res = { status: res.status, _text: text, headers: res.headers }; // 同上：还原已消费的 body
+      break; // 压不动了，别再试
+    }
     当前payload = { ...当前payload, messages: 更小.messages };
     压缩重试次数++;
     warn(

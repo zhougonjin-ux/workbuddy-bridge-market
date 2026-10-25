@@ -561,8 +561,8 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     if (typeof cfg.pool.switchSiteOnExhausted !== 'boolean') {
       cfg.pool.switchSiteOnExhausted = defaults.pool.switchSiteOnExhausted;
     }
-    if (!['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first'].includes(cfg.pool.policy)) {
-      fix(`pool.policy 必须是 expiry-first/balance-first/round-robin/pinned/free-first 之一（当前 ${JSON.stringify(cfg.pool.policy)}），已回退为 ${defaults.pool.policy}`);
+    if (!['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first', 'sticky', 'balanced'].includes(cfg.pool.policy)) {
+      fix(`pool.policy 必须是 expiry-first/balance-first/round-robin/pinned/free-first/sticky/balanced 之一（当前 ${JSON.stringify(cfg.pool.policy)}），已回退为 ${defaults.pool.policy}`);
       cfg.pool.policy = defaults.pool.policy;
     }
     if (cfg.pool.pinnedAccountId !== undefined && cfg.pool.pinnedAccountId !== null && !isStr(cfg.pool.pinnedAccountId)) {

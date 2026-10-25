@@ -825,3 +825,4 @@ process.on('SIGINT', () => {
   });
 });
 process.on('unhandledRejection', (e) => error('未处理的 Promise 异常：', e));
+process.on('uncaughtException', (e) => error('未处理的同步异常（进程保活）：', e)); // 0.3.61：会话依赖本服务，崩了断线；记录但绝不退出

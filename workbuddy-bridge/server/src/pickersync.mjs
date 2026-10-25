@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { getConfigDir } from './config.mjs';
+import { getConfigDir, primaryKey } from './config.mjs';
 
 export const PROVIDER_ID = 'workbuddy-bridge';
 export const PROVIDER_NAME = 'WorkBuddy';
@@ -239,7 +239,7 @@ export async function triggerProviderConfigSyncNow() {
   try {
     const r = await runProviderConfigSync({
       port: currentCfg.port,
-      apiKey: currentCfg.apiKey,
+      apiKey: primaryKey(currentCfg),
       fallbackModels: (currentCfg.models || []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
     });
     if (r.result === 'written') {
@@ -262,7 +262,7 @@ export function startProviderConfigSync(cfg, onError) {
     try {
       const r = await runProviderConfigSync({
         port: cfg.port,
-        apiKey: cfg.apiKey,
+        apiKey: primaryKey(cfg),
         fallbackModels: (cfg.models || []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
       });
       if (r.result === 'written') {

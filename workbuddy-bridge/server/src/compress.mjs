@@ -499,7 +499,6 @@ export function fitMessages(messages, {
       // 内容不是字符串（多模态数组）等情况压不动，别把它算进 truncated
       if (截断后.content === 当前[i].content) continue;
       当前[i] = 截断后;
-      当前[i]._proxy_truncated = true;
       stats.truncated++;
     }
   }

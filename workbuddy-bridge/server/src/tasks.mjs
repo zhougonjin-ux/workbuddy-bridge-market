@@ -17,7 +17,7 @@ import { siteKeys, getConfigDir } from './config.mjs';
 import { listAccounts, getAccount, setAccountLabel, updateCreditDetail, markExhausted } from './pool.mjs';
 import { queryCredit, openChat, aggregateFrames, upstreamErrorMessage, reportChatActivity } from './upstream.mjs';
 import { billingHeaders } from './headers.mjs';
-import { ensureToken } from './auth.mjs';
+import { ensureToken, isLoggedIn } from './auth.mjs';
 import { sendEventChainsForTasks, isEventChainTask } from './taskevents.mjs';
 import { log, warn } from './log.mjs';
 import { recordEvent } from './events.mjs';
@@ -458,6 +458,9 @@ export async function growthScanAccount(cfg, site, accountId, { cap = null } = {
     try {
       await acceptTasks(cfg, site, auth, siteCfg, toAccept);
       accepted = toAccept.length;
+      // 0.3.61：报名成功后重拉一次——旧快照 acceptStatus 还是 not_accepted，
+      // 代打/事件链都过滤未报名任务，不重拉的话本轮刚报的要等次日才打
+      tasks = await listGrowthTasks(cfg, site, accountId);
     } catch (e) {
       warn(`[${site}] 任务报名失败（${toAccept.join(',')}）：`, e.message);
     }
@@ -892,7 +895,7 @@ export async function checkVoucherExpiry(cfg, now = new Date()) {
   if (!s.voucherAlerted) s.voucherAlerted = {}; // uid → 上次提醒的券批指纹（同批只提醒一次）
   let alerted = 0;
   for (const sk of siteKeys(cfg)) {
-    if (!cfg.sites[sk]?.logged_in) continue;
+    if (!isLoggedIn(sk)) continue; // 0.3.61：logged_in 字段不存在，原写法恒 false 致两功能静默失效
     for (const a of listAccounts(sk)) {
       if (a.enabled === false || !a.accessToken) continue;
       const uid = a.uid || a.id;

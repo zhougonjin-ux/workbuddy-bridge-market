@@ -27,7 +27,7 @@ export async function aggregateCatalogFor(cfg, name, { force = false } = {}) {
   if (!force && hit && Date.now() - hit.at < 10 * 60_000) return hit.models;
   try {
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(new Error('timeout')), 15_000);
+    const timer = setTimeout(() => ac.abort(new Error('timeout')), 15_000).unref?.();
     const res = await fetch(p.baseUrl.replace(/\/+$/, '') + '/models', {
       headers: { Authorization: 'Bearer ' + p.apiKeys[0] },
       signal: ac.signal,

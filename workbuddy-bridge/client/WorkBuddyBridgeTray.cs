@@ -39,8 +39,8 @@ static class Program
         using (Mutex mutex = new Mutex(true, "WorkBuddyBridgeTray", out createdNew))
         {
             if (!createdNew) { ShowMain(); return; }
-            LoadConfig();
             serverDir = ResolveServerDir();
+            LoadConfig(); // 必须在 ResolveServerDir 之后：pluginVersion 从 serverDir/package.json 读
             if (serverDir == null)
             {
                 MessageBox.Show("没有找到服务目录（server\\server.mjs）。\n\n请运行 WorkBuddyBridgeSetup.exe 完成安装，\n或在弹出窗口中选择 server 目录。",
@@ -85,11 +85,11 @@ static class Program
         var web = new ToolStripMenuItem("网页控制台");
         web.Click += delegate { OpenConsole(); };
         var start = new ToolStripMenuItem("启动服务");
-        start.Click += delegate { RunBlocking(delegate { if (!Health()) StartService(); }); };
+        start.Click += delegate { new Thread(delegate() { Program.RunBlocking(delegate { if (!Program.Health()) Program.StartService(); }); }).Start(); };
         var stop = new ToolStripMenuItem("停止服务");
-        stop.Click += delegate { RunBlocking(delegate { if (Health()) StopService(); }); };
+        stop.Click += delegate { new Thread(delegate() { Program.RunBlocking(delegate { if (Program.Health()) Program.StopService(); }); }).Start(); };
         var restart = new ToolStripMenuItem("重启服务");
-        restart.Click += delegate { RunBlocking(RestartService); };
+        restart.Click += delegate { new Thread(delegate() { Program.RunBlocking(Program.RestartService); }).Start(); };
         var installPlugin = new ToolStripMenuItem("给智能体安装插件…");
         installPlugin.Click += delegate { InstallPluginToZcode(); };
         var quit = new ToolStripMenuItem("退出");
@@ -350,7 +350,9 @@ class MainForm : Form
     readonly Label navVersion = new Label();
     NotifyIcon tray;
     bool busy;
-    DateTime acctMsgUntil = DateTime.MinValue; // 账号页提示占线至：60s 轮询在此前不得覆盖状态行          // 轮询互斥（RefreshAll 专用）
+    DateTime acctMsgUntil = DateTime.MinValue; // 账号页提示占线至：60s 轮询在此前不得覆盖状态行
+    bool modelsReloadQueued; // 模型页加载被 actionBusy 吞掉时排队，Run 收尾补跑
+    bool settingsDirty, fillingSettings; // 设置页 dirty 守卫：用户改过未保存前，60s 轮询不回填          // 轮询互斥（RefreshAll 专用）
     bool actionBusy;    // 按钮动作互斥——与轮询分离：轮询进行中点击不再被静默吞掉（0.3.59）
     Label taskRunStatus;   // 任务页按钮的执行反馈（旧版点按钮零反馈，用户以为没点上）
     ListView modelList; Label modelCur; Label modelMsg; string modelsDefaultModel = "";
@@ -896,18 +898,26 @@ class MainForm : Form
         if (id.StartsWith("★ ")) id = id.Substring(2);
         string picked = id;
         if (modelMsg != null) modelMsg.Text = "设置默认：" + picked + " …";
+        // 重载必须走 after（UI 线程、actionBusy 已清）——绝不能在 Run 体内直接调 LoadModels：
+        // 工作线程跨线程改控件抛异常，且嵌套 Run 被 actionBusy 门静默吞掉（0.3.60 双击失败根因）
         Run(delegate
         {
             Program.Api("POST", "/console/api/default-model", "{\"model\":\"" + J(picked) + "\"}");
-            BeginInvoke((MethodInvoker)delegate { if (modelMsg != null) modelMsg.Text = "默认模型 → " + picked; });
+        }, delegate
+        {
             LoadModels();
+            if (modelMsg != null) { modelMsg.Text = "默认模型 → " + picked + " ✓"; modelMsg.ForeColor = Accent; }
         });
     }
 
     void LoadModels()
     {
-        if (modelMsg != null) modelMsg.Text = "加载中…";
-        Run(delegate
+        if (modelMsg != null)
+        {
+            modelMsg.ForeColor = SubText;
+            modelMsg.Text = "加载中…";
+        }
+        bool started = Run(delegate
         {
             string json = Program.Api("GET", "/console/api/models", null);
             var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
@@ -956,6 +966,11 @@ class MainForm : Form
                 if (modelMsg != null) modelMsg.Text = "共 " + rows.Count + " 个模型";
             });
         });
+        if (!started)
+        {
+            modelsReloadQueued = true; // 忙碌期被吞：Run 收尾自动补跑
+            if (modelMsg != null) modelMsg.Text = "加载中…（等待当前操作完成）";
+        }
     }
 
     Panel BuildUsagePage()
@@ -1123,7 +1138,7 @@ class MainForm : Form
                     + ",\"dailyCredits\":" + ParseNum(budgetDailyBox.Text, 100)
                     + ",\"warnPercent\":" + ParseNum(budgetWarnBox.Text, 80)
                     + ",\"mode\":\"" + mode + "\"}");
-            });
+            }, delegate { settingsDirty = false; cfgStatus.Text = "预算配置已保存（" + DateTime.Now.ToString("HH:mm:ss") + "）"; });
         };
         page.Controls.Add(budgetCaption);
         page.Controls.Add(budgetEnabledCheck);
@@ -1156,7 +1171,7 @@ class MainForm : Form
                     + ",\"report\":" + Bool(reportCheck.Checked)
                     + ",\"reportTimes\":\"" + J(reportTimesBox.Text)
                     + "\",\"checkinTimes\":\"" + J(checkinTimesBox.Text) + "\"}");
-            });
+            }, delegate { settingsDirty = false; cfgStatus.Text = "任务配置已保存（" + DateTime.Now.ToString("HH:mm:ss") + "）"; });
         };
         page.Controls.Add(taskCaption);
         page.Controls.Add(taskEnabledCheck);
@@ -1167,6 +1182,18 @@ class MainForm : Form
         page.Controls.Add(reportTimesBox);
         page.Controls.Add(checkinCap);
         page.Controls.Add(checkinTimesBox);
+        // dirty 钩子：用户动过设置控件后，60s 轮询不再回填（保存成功才解除）
+        EventHandler dirtyHook = delegate { if (!fillingSettings) settingsDirty = true; };
+        budgetEnabledCheck.CheckedChanged += dirtyHook;
+        budgetDailyBox.TextChanged += dirtyHook;
+        budgetWarnBox.TextChanged += dirtyHook;
+        budgetModeCombo.SelectedIndexChanged += dirtyHook;
+        taskEnabledCheck.CheckedChanged += dirtyHook;
+        checkinCheck.CheckedChanged += dirtyHook;
+        growthCheck.CheckedChanged += dirtyHook;
+        reportCheck.CheckedChanged += dirtyHook;
+        reportTimesBox.TextChanged += dirtyHook;
+        checkinTimesBox.TextChanged += dirtyHook;
         page.Controls.Add(taskSave);
 
         var svcCaption = new Label { Text = "服务管控", Location = new Point(32, 352), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
@@ -1174,10 +1201,11 @@ class MainForm : Form
         serviceStatus.Size = new Size(700, 20);
         serviceStatus.ForeColor = SubText;
         var svcBtns = new FlowLayoutPanel { Location = new Point(32, 406), Size = new Size(860, 42) };
-        AddBtn(svcBtns, "启动服务", delegate { Program.RunBlocking(delegate { if (!Program.Health()) Program.StartService(); }); });
-        AddBtn(svcBtns, "停止服务", delegate { Program.RunBlocking(delegate { if (Program.Health()) Program.StopService(); }); });
-        AddBtn(svcBtns, "重启服务", delegate { Program.RunBlocking(Program.RestartService); });
-        AddBtn(svcBtns, "给智能体安装插件", delegate { Program.InstallPluginToZcode(); });
+        // 服务启停走 Run（后台线程）：StartService 最多等 15s、RestartService 20s+，同步跑会把窗口冻死
+        AddBtn(svcBtns, "启动服务", delegate { serviceStatus.Text = "启动中…"; Run(delegate { Program.RunBlocking(delegate { if (!Program.Health()) Program.StartService(); }); }); });
+        AddBtn(svcBtns, "停止服务", delegate { serviceStatus.Text = "停止中…"; Run(delegate { Program.RunBlocking(delegate { if (Program.Health()) Program.StopService(); }); }); });
+        AddBtn(svcBtns, "重启服务", delegate { serviceStatus.Text = "重启中…"; Run(delegate { Program.RunBlocking(Program.RestartService); }); });
+        AddBtn(svcBtns, "给智能体安装插件", delegate { new Thread(delegate() { Program.InstallPluginToZcode(); }).Start(); });
         page.Controls.Add(svcCaption);
         page.Controls.Add(serviceStatus);
         page.Controls.Add(svcBtns);
@@ -1418,27 +1446,35 @@ class MainForm : Form
                 topModels.EndUpdate();
 
                 SyncPolicyCombo(curPolicy);
-                if (bridgeBudget != null)
+                if (!settingsDirty)
                 {
-                    // 默认不开启；数字框始终预填（字段缺失/为 0 时用服务端默认 100/80）
-                    budgetEnabledCheck.Checked = Str(bridgeBudget, "enabled") == "True";
-                    string dc = NumS(bridgeBudget, "dailyCredits"); if (dc == "0") dc = "100";
-                    string wp = NumS(bridgeBudget, "warnPercent"); if (wp == "0") wp = "80";
-                    budgetDailyBox.Text = dc;
-                    budgetWarnBox.Text = wp;
-                    string mode = Str(bridgeBudget, "mode");
-                    budgetModeCombo.SelectedIndex = mode == "free" ? 1 : mode == "pause" ? 2 : 0;
-                }
-                if (bridgeTasks != null)
-                {
-                    taskEnabledCheck.Checked = Str(bridgeTasks, "enabled") == "True";
-                    checkinCheck.Checked = Str(bridgeTasks, "checkin") == "True";
-                    growthCheck.Checked = Str(bridgeTasks, "growth") == "True";
-                    reportCheck.Checked = Str(bridgeTasks, "report") == "True";
-                    // 时点为空=未配置（服务端回退小时数组），输入框按服务端默认预填：上报 08:00、签到 09:00/21:00
-                    reportTimesBox.Text = TimesOf(bridgeTasks, "reportTimes", "08:00");
-                    checkinTimesBox.Text = TimesOf(bridgeTasks, "checkinTimes", "09:00,21:00");
-                    cfgStatus.Text = "任务配置已同步（" + DateTime.Now.ToString("HH:mm:ss") + "）";
+                    fillingSettings = true;
+                    try
+                    {
+                        if (bridgeBudget != null)
+                        {
+                            // 默认不开启；数字框始终预填（字段缺失/为 0 时用服务端默认 100/80）
+                            budgetEnabledCheck.Checked = Str(bridgeBudget, "enabled") == "True";
+                            string dc = NumS(bridgeBudget, "dailyCredits"); if (dc == "0") dc = "100";
+                            string wp = NumS(bridgeBudget, "warnPercent"); if (wp == "0") wp = "80";
+                            if (!budgetDailyBox.Focused) budgetDailyBox.Text = dc;
+                            if (!budgetWarnBox.Focused) budgetWarnBox.Text = wp;
+                            string mode = Str(bridgeBudget, "mode");
+                            budgetModeCombo.SelectedIndex = mode == "free" ? 1 : mode == "pause" ? 2 : 0;
+                        }
+                        if (bridgeTasks != null)
+                        {
+                            taskEnabledCheck.Checked = Str(bridgeTasks, "enabled") == "True";
+                            checkinCheck.Checked = Str(bridgeTasks, "checkin") == "True";
+                            growthCheck.Checked = Str(bridgeTasks, "growth") == "True";
+                            reportCheck.Checked = Str(bridgeTasks, "report") == "True";
+                            // 时点为空=未配置（服务端回退小时数组），输入框按服务端默认预填：上报 08:00、签到 09:00/21:00
+                            if (!reportTimesBox.Focused) reportTimesBox.Text = TimesOf(bridgeTasks, "reportTimes", "08:00");
+                            if (!checkinTimesBox.Focused) checkinTimesBox.Text = TimesOf(bridgeTasks, "checkinTimes", "09:00,21:00");
+                            cfgStatus.Text = "任务配置已同步（" + DateTime.Now.ToString("HH:mm:ss") + "）";
+                        }
+                    }
+                    finally { fillingSettings = false; }
                 }
             });
         }).Start();
@@ -1605,9 +1641,15 @@ class MainForm : Form
             string v = ShowInput("保留积分下限（余额低于它不派活）", min, "如 200；留空清除");
             if (v == null) return;
             string trimmed = v.Trim();
+            double minVal = 0;
+            if (trimmed != "" && !double.TryParse(trimmed, out minVal))
+            {
+                MessageBox.Show("保留线必须是数字，如 200", Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
             Run(delegate
             {
-                Program.Api("POST", "/console/api/pool/account", "{\"site\":\"" + J(site) + "\",\"id\":\"" + J(id) + "\",\"minRemain\":" + (trimmed == "" ? "null" : trimmed) + "}");
+                Program.Api("POST", "/console/api/pool/account", "{\"site\":\"" + J(site) + "\",\"id\":\"" + J(id) + "\",\"minRemain\":" + (trimmed == "" ? "null" : minVal.ToString()) + "}");
             });
         };
         card.Controls.Add(pinBtn);
@@ -1645,9 +1687,11 @@ class MainForm : Form
         return form.ShowDialog() == DialogResult.OK ? box.Text : null;
     }
 
-    void Run(Action act)
+    /** 后台动作统一出口：actionBusy 防重入；完成（或失败弹框、RefreshAll）后在 UI 线程执行 after。
+        返回 false = 当时正忙被跳过（调用方据此给提示或排队重试）。 */
+    bool Run(Action act, Action after = null)
     {
-        if (actionBusy) return;
+        if (actionBusy) return false;
         actionBusy = true;
         new Thread(delegate()
         {
@@ -1659,8 +1703,16 @@ class MainForm : Form
                 actionBusy = false;
                 if (error != null) MessageBox.Show(error, Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 RefreshAll();
+                if (after != null) after();
+                // 模型页重载若在忙碌期被吞（切页/点刷新撞上长任务），这里补跑
+                if (modelsReloadQueued)
+                {
+                    modelsReloadQueued = false;
+                    LoadModels();
+                }
             });
         }).Start();
+        return true;
     }
 
     void SetTaskStatus(string text, Color c)
@@ -1744,7 +1796,21 @@ class MainForm : Form
         });
     }
 
-    static string J(string s) { return (s ?? "").Replace("\"", "\\\""); }
+    static string J(string s)
+    {
+        // JSON 字符串转义：只处理引号会把换行/反斜杠漏进请求体，服务端 400
+        var sb = new System.Text.StringBuilder();
+        foreach (char c in s ?? "")
+        {
+            if (c == '"') sb.Append("\\\"");
+            else if (c == '\\') sb.Append("\\\\");
+            else if (c == '\n') sb.Append("\\n");
+            else if (c == '\r') sb.Append("\\r");
+            else if (c == '\t') sb.Append("\\t");
+            else sb.Append(c);
+        }
+        return sb.ToString();
+    }
 
     static double ParseNum(string s, double fallback)
     {
