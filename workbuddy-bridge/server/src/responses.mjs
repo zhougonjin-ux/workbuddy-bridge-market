@@ -319,6 +319,7 @@ export async function handleResponses(ctx) {
       tools: agg.toolCallList.length,
       account: up.accountId,
       upstreamCredit: Number.isFinite(agg.usage?.credit) ? agg.usage.credit : null,
+      cacheHitTokens: agg.usage?.prompt_cache_hit_tokens ?? agg.usage?.cached_tokens ?? 0,
     });
 
     return sendJson(
@@ -659,6 +660,7 @@ export async function handleResponses(ctx) {
       tools: toolItems.size,
       account: up.accountId,
       upstreamCredit: Number.isFinite(upstreamUsage?.credit) ? upstreamUsage.credit : null,
+      cacheHitTokens: upstreamUsage?.prompt_cache_hit_tokens ?? upstreamUsage?.cached_tokens ?? 0,
     });
   }
 }

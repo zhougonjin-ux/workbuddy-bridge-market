@@ -206,6 +206,7 @@ export async function handleMessages(ctx) {
       tools: agg.toolCallList.length,
       account: up.accountId,
       upstreamCredit: Number.isFinite(agg.usage?.credit) ? agg.usage.credit : null,
+      cacheHitTokens: agg.usage?.prompt_cache_hit_tokens ?? agg.usage?.cached_tokens ?? 0,
     });
     return sendJson(res, 200, {
       id: newId('msg'),
@@ -358,6 +359,7 @@ export async function handleMessages(ctx) {
       tools: toolBlocks.size,
       account: up.accountId,
       upstreamCredit: Number.isFinite(usage?.credit) ? usage.credit : null,
+      cacheHitTokens: usage?.prompt_cache_hit_tokens ?? usage?.cached_tokens ?? 0,
     });
   }
 }

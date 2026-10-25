@@ -2017,6 +2017,7 @@ async function loadUsage() {
         <div class="kpi"><b>${(today.promptTokens ?? 0).toLocaleString()}</b><span>输入 tokens</span></div>
         <div class="kpi"><b>${(today.completionTokens ?? 0).toLocaleString()}</b><span>输出 tokens</span></div>
         <div class="kpi"><b>${todaySpeed}</b><span title="今日输出 tokens ÷ 上游总耗时，粗粒度均值（含排队/网络）">平均输出速度</span></div>
+        <div class="kpi"><b>${(today.cacheHitTokens || 0).toLocaleString()}</b><span title="上游 prompt 缓存命中的输入 tokens（命中部分资费更低或不计费）；命中率 ${(today.promptTokens > 0 ? (today.cacheHitTokens / today.promptTokens * 100).toFixed(1) : 0)}%">缓存命中 tok</span></div>
         <div class="kpi"><b class="warn">${fmtCredit(today.credit ?? 0)}</b><span>消耗积分</span></div>
       </div>
       <h2>最近 7 天 <span class="sub">柱高 = 调用次数，标注 = 消耗积分</span></h2>

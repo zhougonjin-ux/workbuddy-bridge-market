@@ -263,6 +263,7 @@ export async function handleChatCompletions(ctx) {
         tools,
         account: up.accountId,
         upstreamCredit: sawError ? null : (Number.isFinite(upstreamUsage?.credit) ? upstreamUsage.credit : null),
+        cacheHitTokens: upstreamUsage?.prompt_cache_hit_tokens ?? upstreamUsage?.cached_tokens ?? 0,
       });
     }
     return;
@@ -369,6 +370,7 @@ export async function handleChatCompletions(ctx) {
     tools: agg.toolCallList.length,
     account: up.accountId,
     upstreamCredit: Number.isFinite(usage.credit) ? usage.credit : null,
+    cacheHitTokens: usage.prompt_cache_hit_tokens ?? usage.cached_tokens ?? 0,
   });
 
   sendJson(res, 200, {

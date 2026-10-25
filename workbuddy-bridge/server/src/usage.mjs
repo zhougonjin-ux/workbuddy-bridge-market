@@ -120,7 +120,7 @@ export function reloadUsage() {
 
 function dayOf(key = todayKey()) {
   ensureLoaded();
-  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0, hours: {}, models: {}, accounts: {} };
+  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0, cacheHitTokens: 0, hours: {}, models: {}, accounts: {} };
   // 老数据（在 accounts 维度上线前落的盘）就地补，不动已有字段
   if (!data.days[key].accounts) data.days[key].accounts = {};
   return data.days[key];
@@ -135,7 +135,7 @@ export function recordRecovered() {
   scheduleSave();
 }
 
-export function recordUsage({ site, model, mode, status, promptTokens = 0, completionTokens = 0, credit = 0, ms = 0, tools = 0, account = null, upstreamCredit = null }) {
+export function recordUsage({ site, model, mode, status, promptTokens = 0, completionTokens = 0, credit = 0, ms = 0, tools = 0, account = null, upstreamCredit = null, cacheHitTokens = 0 }) {
   const day = dayOf();
   const ok = status >= 200 && status < 400;
   day.calls += 1;
@@ -143,6 +143,9 @@ export function recordUsage({ site, model, mode, status, promptTokens = 0, compl
   day.promptTokens += promptTokens || 0;
   day.completionTokens += completionTokens || 0;
   day.credit += credit || 0;
+  // 缓存命中（0.3.55，借鉴 dsh 数据看板）：上游 usage 的 prompt_cache_hit_tokens——
+  // 这些输入 tokens 走了上游 prompt 缓存，是真实省下的部分；旧数据无此字段就地补
+  day.cacheHitTokens = (day.cacheHitTokens || 0) + cacheHitTokens;
   day.ms = (day.ms || 0) + (ms || 0); // 供「平均输出速度」= Σcompletion / Σms 计算
   // 小时分布（T7）：本地小时为键，控制台「今日小时分布」柱状图用。
   // 旧版本落盘的 day 可能没有 hours 字段，这里就地补。
@@ -157,13 +160,14 @@ export function recordUsage({ site, model, mode, status, promptTokens = 0, compl
   h.credit += credit || 0;
   h.ms += ms || 0;
   const key = `${site}/${model}`;
-  if (!day.models[key]) day.models[key] = { site, model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, tools: 0 };
+  if (!day.models[key]) day.models[key] = { site, model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, tools: 0, cacheHitTokens: 0 };
   const m = day.models[key];
   m.calls += 1;
   if (!ok) m.errors += 1;
   m.promptTokens += promptTokens || 0;
   m.completionTokens += completionTokens || 0;
   m.credit += credit || 0;
+  m.cacheHitTokens = (m.cacheHitTokens || 0) + cacheHitTokens;
   m.ms += ms || 0;
   m.tools += tools || 0;
   // 观测成本（0.3.33）：记**最近一次**的实际计费与时间。不能用日均值当观测信号——
@@ -226,7 +230,7 @@ export function usageSnapshot(days = 7) {
   }
   const keys = Object.keys(data.days).sort().slice(-days);
   const recent = keys.map((k) => ({ date: k, ...data.days[k], models: undefined }));
-  const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0 };
+  const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0, cacheHitTokens: 0 };
   const byModel = new Map();
   for (const k of Object.keys(data.days)) {
     const d = data.days[k];
@@ -237,14 +241,16 @@ export function usageSnapshot(days = 7) {
     totals.credit += d.credit;
     totals.ms += d.ms || 0;
     totals.recovered += d.recovered || 0;
+    totals.cacheHitTokens += d.cacheHitTokens || 0;
     for (const [mid, m] of Object.entries(d.models || {})) {
-      const cur = byModel.get(mid) || { id: mid, site: m.site, model: m.model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0 };
+      const cur = byModel.get(mid) || { id: mid, site: m.site, model: m.model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, cacheHitTokens: 0 };
       cur.calls += m.calls;
       cur.errors += m.errors;
       cur.promptTokens += m.promptTokens;
       cur.completionTokens += m.completionTokens;
       cur.credit += m.credit;
       cur.ms += m.ms || 0;
+      cur.cacheHitTokens += m.cacheHitTokens || 0;
       byModel.set(mid, cur);
     }
   }
