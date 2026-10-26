@@ -45,6 +45,9 @@ function loadState() {
   if (!state.growth) state.growth = {};   // uid → { date, ok, accepted, claimed, msg }
   if (!state.travel) state.travel = {};   // uid → { date, ok, action, msg }
   if (!state.streak) state.streak = {};   // T50 连登管家：uid → { date, ok, days, redeemed, draws, msg, ... }
+  if (!state.report) state.report = {};   // 0.3.47 活跃上报：旧 tasks-state.json 没有这个键，
+  // doneToday('report', uid) 读 s['report'][uid] 会直接 TypeError（2026-10-26 升级当天实测），
+  // 每天活跃上报时点必炸一次并中断本轮剩余账号
   if (!state.history) state.history = []; // 最近 200 条运行记录
   if (!state.checkinDays) state.checkinDays = {}; // T15 签到日历：'YYYY-MM-DD' → [uid,...]
   if (!state.gainedTotal) state.gainedTotal = { credit: 0, checkins: 0, claims: 0, travels: 0 }; // T15 累计白嫖
@@ -121,7 +124,8 @@ function record(kind, uid, entry) {
 /** 该账号今天这一类任务是否已经跑成功过。 */
 function doneToday(kind, uid) {
   const s = loadState();
-  const e = s[kind][uid];
+  const e = s[kind]?.[uid]; // 兜底：kind 键缺失（旧状态文件/新 kind 上线）时按「今天没跑过」处理，
+  // 而不是抛 TypeError 中断整轮任务——loadState 只初始化已知 kind，未来再加新 kind 也不会重演
   return Boolean(e && e.date === todayKey() && e.ok);
 }
 
