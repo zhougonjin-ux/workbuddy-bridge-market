@@ -395,6 +395,31 @@ export async function handleConsoleApi(ctx) {
         }
       }
     }
+    // CodeArts（0.3.66 补丁）：billingBase 留空避开了通用计费路径，账号卡余额在这里补——
+    // 华为云 snap-manager 的积分是账户级（不分账号维度端点），查一次填给第一个可用账号；
+    // 单账号是常态（同账号重复登录会被身份查重合并），多账号时其余账号沿用池内缓存值。
+    if (site === 'codearts' && withCredit) {
+      const { listAccounts } = await import('./pool.mjs');
+      const { codeartsCredOf } = await import('./codearts-upstream.mjs');
+      const { codeartsFetchCredits } = await import('./codearts.mjs');
+      const poolAccounts = listAccounts('codearts').filter((a) => a.enabled !== false && codeartsCredOf(a));
+      let filled = false;
+      for (const a of accounts) {
+        if (filled) break;
+        const pooled = poolAccounts.find((x) => x.id === a.id);
+        if (!pooled || !codeartsCredOf(pooled)) continue;
+        try {
+          const cr = await codeartsFetchCredits(codeartsCredOf(pooled));
+          a.credit = cr.total;
+          a.credit_detail = cr.packages.map((pkg) => ({ package: pkg.name, remain: pkg.remain, total: pkg.amount, used: pkg.used }));
+          if (typeof cr.total === 'number') recordBalance(`codearts/${a.label}`, cr.total);
+          updateCreditDetail(site, a.id, { remain: cr.total, detail: a.credit_detail });
+          filled = true;
+        } catch (e) {
+          a.credit_error = String(e.message || e).slice(0, 160);
+        }
+      }
+    }
     return sendJson(res, 200, { site, accounts: attachBurnoutToAccounts(cfg, site, accounts, recentDailyCreditAvg(7)), supports_credit: supportsCreditQuery(cfg, site) });
   }
 
