@@ -2,6 +2,7 @@
 //（返回 { ok, status, site, accountId, payload, frames, close } / { ok:false, status, text }），
 // 但走华为云 AK/SK 签名而不是 Bearer token，401/403 触发 STS 刷新而非 refreshToken。
 // 账号轮换复用 openChatRotating 的语义（本模块只做单次 openChat；轮换在上层）。
+import { createHash } from 'node:crypto';
 import { log, warn } from './log.mjs';
 import { recordEvent } from './events.mjs';
 import { markSuccess, updateTokens, listAccounts, getAccount } from './pool.mjs';
@@ -13,6 +14,101 @@ import {
 } from './codearts.mjs';
 
 const MAX_OUTPUT_TOKENS = 65_536; // 上游实测：65536 可用，131072 触发空流被拒（上游注释实证）
+
+/** 华为上游对 function.name 的硬限制（实测报错 InferHub.001001017.413：maximum is 64）。 */
+export const MAX_TOOL_NAME_LEN = 64;
+
+/**
+ * ZCode 的 MCP 工具名普遍超长，例如
+ *   mcp__plugin_workbuddy-bridge_workbuddy-bridge__wb_refresh_credits（70 字符）
+ * 直接发给 CodeArts 会被整条请求拒绝（用户看到的就是「模型不通 / reason=unknown」）。
+ *
+ * 这里在发上游前把超长名字压成 `t_<工具名>_<hash6>`，并保留 短名→原名 映射；
+ * 回包的 tool_calls.function.name 再还原成原名——客户端完全无感。
+ * 只改 tools 定义、tool_choice，以及 messages 里历史 tool_calls 的 name。
+ */
+export function compactToolNames(body) {
+  const origByShort = new Map();
+  const shortByOrig = new Map();
+  const used = new Set();
+  const shorten = (name) => {
+    if (typeof name !== 'string' || name.length <= MAX_TOOL_NAME_LEN) return name;
+    if (shortByOrig.has(name)) return shortByOrig.get(name);
+    const tail = (name.split('__').pop() || 'tool').replace(/[^A-Za-z0-9_-]/g, '_') || 'tool';
+    const hash = createHash('sha1').update(name).digest('hex').slice(0, 6);
+    let short = `t_${tail.slice(-44)}_${hash}`;
+    if (short.length > MAX_TOOL_NAME_LEN) short = `t_${tail.slice(-40)}_${hash}`;
+    let n = 0;
+    while (used.has(short)) {
+      n += 1;
+      short = `t_${tail.slice(-38)}_${hash}${n}`;
+      if (short.length > MAX_TOOL_NAME_LEN) short = `t_${hash}${n}`;
+    }
+    used.add(short);
+    shortByOrig.set(name, short);
+    origByShort.set(short, name);
+    return short;
+  };
+
+  const out = { ...body };
+  if (Array.isArray(body?.tools)) {
+    out.tools = body.tools.map((t) => (t?.function
+      ? { ...t, function: { ...t.function, name: shorten(t.function.name) } }
+      : t));
+  }
+  if (body?.tool_choice?.function?.name) {
+    out.tool_choice = {
+      ...body.tool_choice,
+      function: { ...body.tool_choice.function, name: shorten(body.tool_choice.function.name) },
+    };
+  }
+  if (Array.isArray(body?.messages)) {
+    out.messages = body.messages.map((m) => {
+      let msg = m;
+      if (Array.isArray(m?.tool_calls)) {
+        msg = {
+          ...msg,
+          tool_calls: m.tool_calls.map((tc) => (tc?.function?.name
+            ? { ...tc, function: { ...tc.function, name: shorten(tc.function.name) } }
+            : tc)),
+        };
+      }
+      if (m?.role === 'tool' && typeof m.name === 'string') {
+        msg = { ...msg, name: shorten(m.name) };
+      }
+      return msg;
+    });
+  }
+  return { body: out, origByShort };
+}
+
+/** 把上游回包里的短工具名还原成原名（流式逐帧做，聚合走同一 generator）。 */
+export function restoreToolNames(frames, origByShort) {
+  if (!origByShort || origByShort.size === 0) return frames;
+  return (async function* restore() {
+    for await (const raw of frames) {
+      let out = raw;
+      try {
+        const obj = JSON.parse(raw);
+        let changed = false;
+        for (const ch of obj?.choices || []) {
+          const lists = [ch?.delta?.tool_calls, ch?.message?.tool_calls].filter(Array.isArray);
+          for (const list of lists) {
+            for (const tc of list) {
+              const n = tc?.function?.name;
+              if (n && origByShort.has(n)) {
+                tc.function.name = origByShort.get(n);
+                changed = true;
+              }
+            }
+          }
+        }
+        if (changed) out = JSON.stringify(obj);
+      } catch { /* 错误信封/非 JSON：原样透传 */ }
+      yield out;
+    }
+  })();
+}
 
 function clampMaxTokens(v) {
   if (v === undefined || !Number.isFinite(v)) return undefined;
@@ -126,12 +222,14 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
 
   let cred = codeartsCredOf(account);
   const model = codeartsNormalizeModelId(String(body?.model || ''));
+  // 超长 MCP 工具名会被华为上游整条拒绝（maximum is 64）：发前压缩、回包还原。
+  const { body: safeBody, origByShort } = compactToolNames(body);
   // benefit 头判定：远端集合优先（目录拉取时已标注），回落静态兜底
   const cat = caCatalogCache.models.find((m) => m.id === model);
   const isBenefit = cat ? cat.benefit === 'yes' : ['glm-5.3-flash', 'deepseek-v4.1-flash'].includes(model);
 
   const payload = {
-    ...body,
+    ...safeBody,
     model,
     stream: true,
     prompt_cache_key: crypto.randomUUID(),
@@ -140,8 +238,15 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
     tool_stream: true,
     max_tokens: clampMaxTokens(body?.max_tokens) ?? MAX_OUTPUT_TOKENS,
   };
-  if (body?.reasoningEffort === 'off') payload.thinking = { type: 'disabled' };
+  if (safeBody?.reasoningEffort === 'off') payload.thinking = { type: 'disabled' };
   delete payload.reasoningEffort;
+  // 华为上游不接受对象形式的 tool_choice（{type:'function',...} → InferHub.001001005.400
+  // "The request param is invalid"）。降级成 required：语义最接近「必须调工具」，
+  // 且实测 none/auto/required 三种字符串形态都可用。
+  if (payload.tool_choice && typeof payload.tool_choice === 'object') {
+    warn('[codearts] 上游不支持对象形式 tool_choice，已降级为 required');
+    payload.tool_choice = 'required';
+  }
 
   const url = `${CODEARTS_CHAT_BASE}/chat/completions`;
   const bodyText = JSON.stringify(payload);
@@ -207,7 +312,7 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
       site,
       accountId: account.id,
       payload,
-      frames: readCodeArtsSSE(res.body, signal),
+      frames: restoreToolNames(readCodeArtsSSE(res.body, signal), origByShort),
       close: () => {
         // readCodeArtsSSE 的 reader 已经锁住 res.body，并在 finally 里 cancel 过。
         // 这里再 body.cancel() 会返回一个 rejected Promise（ERR_INVALID_STATE:

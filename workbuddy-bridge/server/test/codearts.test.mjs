@@ -115,3 +115,54 @@ test('凭据缺失时目录返回空且两来源都算失败（残缺不缓存�
   assert.equal(out.gatewayOk, false);
   assert.equal(out.builtinOk, false);
 });
+
+/* ---------------- 超长 MCP 工具名压缩（0.3.69） ---------------- */
+// 事故：ZCode 的 MCP 工具名是 mcp__plugin_workbuddy-bridge_workbuddy-bridge__wb_refresh_credits
+//（70 字符），华为上游限制 function.name ≤ 64，整条请求被拒 → 用户看到「模型不通」。
+
+const { compactToolNames, restoreToolNames, MAX_TOOL_NAME_LEN } = await import('../src/codearts-upstream.mjs');
+const LONG_TOOL = 'mcp__plugin_workbuddy-bridge_workbuddy-bridge__wb_refresh_credits';
+
+test('compactToolNames：压缩 >64 的 MCP 工具名，短名 ≤64 且可还原', () => {
+  assert.ok(LONG_TOOL.length > MAX_TOOL_NAME_LEN);
+  const input = {
+    tools: [{ type: 'function', function: { name: LONG_TOOL, parameters: { type: 'object', properties: {} } } }],
+    messages: [
+      { role: 'assistant', content: null, tool_calls: [{ id: 'c1', type: 'function', function: { name: LONG_TOOL, arguments: '{}' } }] },
+      { role: 'tool', tool_call_id: 'c1', name: LONG_TOOL, content: 'ok' },
+    ],
+  };
+  const { body, origByShort } = compactToolNames(input);
+  const short = body.tools[0].function.name;
+  assert.ok(short.length <= MAX_TOOL_NAME_LEN, `短名仍然超长：${short}`);
+  assert.notEqual(short, LONG_TOOL);
+  assert.equal(origByShort.get(short), LONG_TOOL);
+  assert.equal(body.messages[0].tool_calls[0].function.name, short);
+  assert.equal(body.messages[1].name, short);
+  assert.equal(input.tools[0].function.name, LONG_TOOL, '不得修改入参');
+});
+
+test('compactToolNames：短名唯一，≤64 的名字原样保留', () => {
+  const shortName = 'mcp__plugin_x__wb_status';
+  const otherLong = 'mcp__plugin_other-plugin-aaaaaaaa_other-plugin-aaaaaaaa__wb_refresh_credits';
+  const { body, origByShort } = compactToolNames({
+    tools: [{ function: { name: shortName } }, { function: { name: LONG_TOOL } }, { function: { name: otherLong } }],
+  });
+  assert.equal(body.tools[0].function.name, shortName);
+  assert.notEqual(body.tools[1].function.name, body.tools[2].function.name, '不同原名不能压成同一个短名');
+  assert.equal(origByShort.size, 2);
+});
+
+test('restoreToolNames：流式回包中的短名还原为原名，非工具帧原样透传', async () => {
+  const { origByShort } = compactToolNames({ tools: [{ function: { name: LONG_TOOL } }] });
+  const short = [...origByShort.keys()][0];
+  const frames = (async function* () {
+    yield JSON.stringify({ choices: [{ delta: { content: 'hi' } }] });
+    yield JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { name: short, arguments: '{}' } }] } }] });
+    yield JSON.stringify({ code: 'X', msg: 'err' });
+  })();
+  const out = [];
+  for await (const f of restoreToolNames(frames, origByShort)) out.push(JSON.parse(f));
+  assert.equal(out[1].choices[0].delta.tool_calls[0].function.name, LONG_TOOL);
+  assert.equal(out[2].code, 'X');
+});
