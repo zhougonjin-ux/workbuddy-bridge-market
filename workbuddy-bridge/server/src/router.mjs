@@ -136,7 +136,10 @@ export async function getCatalog(cfg, site, { force = false } = {}) {
       const list = remote.map((m) => ({
         id: m.id,
         name: m.name,
-        ...(m.rateLabel ? { credits: m.rateLabel } : {}),
+        // 华为的倍率展示串是「0.18x」（x 在尾），parseMultiplier 只认「x0.18」
+        // （x 在头）——不归一化就解析成 Infinity，选择器后缀回退成腾讯同名模型的
+        // x0.11（张冠李戴）。转成 x0.18 形态，选择器显示 CodeArts 自己的倍率。
+        ...(m.rateLabel ? { credits: 'x' + String(m.rateLabel).replace(/x\s*$/i, '') + ' credits' } : {}),
       }));
       const models = 过滤ca(list);
       if (!models.size) throw new Error('远端目录为空');
