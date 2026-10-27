@@ -146,6 +146,7 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
   const url = `${CODEARTS_CHAT_BASE}/chat/completions`;
   const bodyText = JSON.stringify(payload);
   let authRefreshed = false;
+  let queueAttempts = 0; // TM.00001041 排队重试计数（10s × 180 = 30 分钟上限）
 
   for (;;) {
     const extra = isBenefit ? { maas_type: 'benefit' } : undefined;
@@ -182,6 +183,20 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
 
     if (res.status >= 400) {
       const text = await res.text().catch(() => '');
+      // TM.00001041「并发会话数已达上限(N)」= 账号级排队信号（上游实测语义：每账号
+      // 最多 3 个并发会话）。移植上游参考实现：等 10 秒直接重发 chat（不轮询状态
+      // 端点），上限 30 分钟；排队期间换其它账号接手由外层 openChatRotating 语义
+      // 处理——这里只对本账号重试，超限原样返回（轮换层会标记失败换号）。
+      if (res.status === 400 && /TM\.00001041/.test(text)) {
+        queueAttempts += 1;
+        if (queueAttempts > 180) {
+          return { ok: false, status: 400, text: '[codearts] 排队等待超时（30 分钟）——账号并发会话一直占满', site, accountId: account.id };
+        }
+        if (queueAttempts === 1) warn(`[codearts] 账号 ${account.label || account.id} 并发会话占满，10 秒后重试（最多等 30 分钟）`);
+        await new Promise((r) => setTimeout(r, 10_000));
+        if (signal?.aborted) return { ok: false, status: 499, text: '[codearts] 客户端已取消（排队等待中）', site, accountId: account.id };
+        continue;
+      }
       return { ok: false, status: res.status, text: `[codearts] HTTP ${res.status}：${text.slice(0, 400)}`, site, accountId: account.id };
     }
 
