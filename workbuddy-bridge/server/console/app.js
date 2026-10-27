@@ -2319,11 +2319,21 @@ function loadAggregate() {
 /* ---------- 扫码登录页（0.3.64，形态对齐 dsh-xdpool「扫码登录」）----------
  * 厂商卡 = 支持网页/扫码设备授权登录的站点：登一次，免费模型就进同一个选择器。
  * 每卡带「已添加 N 个账号」徽章与「添加账号」按钮（复用账号页的登录弹窗，预选站点）；
- * 另有一张「本机导入」卡（CodeBuddy CLI 明文登录态一键入池，无需扫码）。 */
+ * 另有一张「本机导入」卡（CodeBuddy CLI 明文登录态一键入池，无需扫码）。
+ * LOGIN_PENDING（0.3.65）= dsh-xdpool 支持网页/扫码登录的其它厂商目录：本插件只代理
+ * WorkBuddy / CodeBuddy 账号体系，这几家没有对应端点适配，仅作目录展示（未接入置灰）。 */
 const LOGIN_VENDORS = [
   { site: 'cn-cli', name: 'WorkBuddy 国内版', vendor: '腾讯', color: '#3b82f6', desc: '与 CodeBuddy 共用端点：DeepSeek · Kimi · GLM 免费线，每日赠送积分' },
   { site: 'intl-cli', name: 'WorkBuddy 国际版', vendor: '腾讯', color: '#10b981', desc: 'codebuddy.ai 独立端点与账号体系：GPT · Claude · Gemini 阵容，积分与国内版不互通' },
   { site: 'intl-work', name: 'WorkBuddy 国际工作版', vendor: '腾讯', color: '#f59e0b', desc: 'workbuddy.ai 工作台端点：独立账号体系，与国内/国际 CLI 互不相通' },
+];
+const LOGIN_PENDING = [
+  { name: 'CodeArts', vendor: '华为云', color: '#e11d48', desc: '已开通免费体验套餐，自动续期不收费；新人积分 + DeepSeek · GLM · openPangu 每日免费额度' },
+  { name: 'LobsterAI', vendor: '有道', color: '#f97316', desc: '每日签到领积分，积分换模型调用额度' },
+  { name: 'Qoder 国际版', vendor: '阿里云', color: '#6366f1', desc: '每日 100 Credits，加密推理端点' },
+  { name: 'Qoder 国内版', vendor: '阿里云', color: '#8b5cf6', desc: '每日 100 Credits，国内端点与模型池' },
+  { name: 'TRAE', vendor: '字节跳动', color: '#14b8a6', desc: '手机号注册即送免费额度，按天重置' },
+  { name: 'Cline', vendor: 'Cline Bot', color: '#5b21b6', desc: '绑定 GitHub 账号后送美元计价的免费额度；后端没有每日签到接口' },
 ];
 
 async function loadLogin() {
@@ -2349,7 +2359,7 @@ async function loadLogin() {
       <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
         <b style="font-size:13.5px">微信扫码 / 设备授权登录</b>
         <span class="badge ${connected ? 'ok' : ''}">已连接 ${connected} 个</span>
-        <span class="muted" style="font-size:12.5px;flex:1;min-width:260px">扫码后账号进账号池，多账号自动轮换；免费模型清单在「模型」页，调度策略在「账号」页顶部可切。</span>
+        <span class="muted" style="font-size:12.5px;flex:1;min-width:260px">扫码后账号进账号池，多账号自动轮换；免费模型清单在「模型」页，调度策略在「账号」页顶部可切。灰卡是 dsh-xdpool 支持扫码登录的其它厂商目录——本插件暂未适配（没有对应端点，登录了也出不了模型），仅作展示。</span>
       </div>
       <div class="row" style="align-items:center;gap:8px;margin-top:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel2)">
         <span class="badge ${tasksOn ? 'ok' : 'warn'}">${tasksOn ? '✓' : '○'} 自动领取每日积分</span>
@@ -2362,6 +2372,20 @@ async function loadLogin() {
     <div id="loginCards"></div>`;
   $('#lgGoTasks').onclick = () => showView('tasks');
   const cards = $('#loginCards');
+  const pendingCard = (v) => `<div class="card" style="margin-bottom:12px;border-left:3px solid ${v.color};opacity:.72">
+      <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="width:34px;height:34px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:12px;background:${v.color}">${esc(v.name.slice(0, 2))}</span>
+        <b style="font-size:14px">${esc(v.name)}</b>
+        <span class="badge">${esc(v.vendor)}</span>
+        <span class="spacer" style="flex:1"></span>
+        <span class="badge" title="本插件只代理 WorkBuddy / CodeBuddy 账号体系，该厂商还没有端点适配">未接入</span>
+      </div>
+      <div class="muted" style="font-size:12.5px;margin:6px 0 10px">${esc(v.desc)}</div>
+      <div class="row" style="gap:8px">
+        <button class="btn mini" disabled title="需要先实现该厂商的登录与模型端点适配才能接进池子">暂未接入</button>
+        <span class="muted" style="font-size:12px;align-self:center">目录来自 dsh-xdpool · 接入适配见其仓库实现</span>
+      </div>
+    </div>`;
   cards.innerHTML = LOGIN_VENDORS.map((v) => {
     const s = bySite[v.site] || {};
     const n = s.account_count || 0;
@@ -2379,7 +2403,7 @@ async function loadLogin() {
         ${n > 0 ? `<span class="muted" style="font-size:12px;align-self:center">${s.logged_in ? '登录态正常' : '登录态已失效——重新添加或删除后重扫'}</span>` : ''}
       </div>
     </div>`;
-  }).join('') + `
+  }).join('') + LOGIN_PENDING.map(pendingCard).join('') + `
     <div class="card" style="border-left:3px solid #8b5cf6">
       <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
         <span style="width:34px;height:34px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:13px;background:#8b5cf6">导入</span>

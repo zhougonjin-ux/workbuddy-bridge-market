@@ -421,6 +421,23 @@ class MainForm : Form
     };
     static readonly Color[] LoginColors = { Color.FromArgb(59, 130, 246), Color.FromArgb(16, 185, 129), Color.FromArgb(245, 158, 11) };
 
+    // dsh-xdpool 支持网页/扫码登录的其它厂商目录（0.3.65）：本插件只代理 WorkBuddy/CodeBuddy
+    // 账号体系，这几家没有端点适配，仅作目录展示（未接入置灰，按钮不可点）。
+    static readonly string[] PendingNames = { "CodeArts", "LobsterAI", "Qoder 国际版", "Qoder 国内版", "TRAE", "Cline" };
+    static readonly string[] PendingVendors = { "华为云", "有道", "阿里云", "阿里云", "字节跳动", "Cline Bot" };
+    static readonly string[] PendingDescs = {
+        "已开通免费体验套餐，自动续期不收费；新人积分 + DeepSeek · GLM · openPangu 每日免费额度",
+        "每日签到领积分，积分换模型调用额度",
+        "每日 100 Credits，加密推理端点",
+        "每日 100 Credits，国内端点与模型池",
+        "手机号注册即送免费额度，按天重置",
+        "绑定 GitHub 账号后送美元计价的免费额度；后端没有每日签到接口",
+    };
+    static readonly Color[] PendingColors = {
+        Color.FromArgb(225, 29, 72), Color.FromArgb(249, 115, 22), Color.FromArgb(99, 102, 241),
+        Color.FromArgb(139, 92, 246), Color.FromArgb(20, 184, 166), Color.FromArgb(91, 33, 182),
+    };
+
     // 数据看板页（0.3.64）：轮次/调用/失败/token/速度/缓存命中 + 最近调用
     readonly Label dashTokens = new Label();
     readonly Label dashTokensSub = new Label();
@@ -1257,9 +1274,9 @@ class MainForm : Form
      *  客户端不画二维码（省第三方依赖）：/login/start 拿到授权链接后直接开浏览器，3 秒轮询授权结果。 */
     Panel BuildLoginPage()
     {
-        var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill };
+        var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
         page.Controls.Add(PageTitle("扫码登录"));
-        page.Controls.Add(PageSub("登一次，它们的免费模型就出现在同一个选择器里。", 60));
+        page.Controls.Add(PageSub("登一次，它们的免费模型就出现在同一个选择器里。灰卡 = 暂未接入的厂商目录。", 60));
 
         loginBanner.Location = new Point(32, 92);
         loginBanner.Size = new Size(900, 26);
@@ -1299,6 +1316,28 @@ class MainForm : Form
             page.Controls.Add(card);
             loginCountLabels[site] = count;
             loginAddButtons[site] = add;
+            y += 116;
+        }
+
+        // dsh-xdpool 支持扫码登录的其它厂商目录：未接入置灰（0.3.65）
+        for (int i = 0; i < PendingNames.Length; i++)
+        {
+            var card = new Panel { Location = new Point(32, y), Size = new Size(900, 104), BackColor = CardBack };
+            var chip = new Label { Text = PendingNames[i].Substring(0, 2), Location = new Point(16, 14), Size = new Size(34, 34), ForeColor = Color.White, Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold), TextAlign = ContentAlignment.MiddleCenter, BackColor = PendingColors[i] };
+            var name = new Label { Text = PendingNames[i] + " · " + PendingVendors[i], Location = new Point(60, 14), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold) };
+            var badge = new Label { Text = "未接入", Location = new Point(790, 18), Size = new Size(94, 20), ForeColor = SubText, TextAlign = ContentAlignment.MiddleRight };
+            var desc = new Label { Text = PendingDescs[i], Location = new Point(60, 44), Size = new Size(800, 30), ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 8.75F) };
+            var add = new Button { Text = "暂未接入", Location = new Point(60, 72), Size = new Size(120, 26), FlatStyle = FlatStyle.Flat, Enabled = false, Font = new Font("Microsoft YaHei UI", 9F) };
+            card.Controls.Add(chip);
+            card.Controls.Add(name);
+            card.Controls.Add(badge);
+            card.Controls.Add(desc);
+            card.Controls.Add(add);
+            card.Paint += delegate (object s, PaintEventArgs e)
+            {
+                using (var pen = new Pen(BorderLine)) e.Graphics.DrawRectangle(pen, 0, 0, card.Width - 1, card.Height - 1);
+            };
+            page.Controls.Add(card);
             y += 116;
         }
 
