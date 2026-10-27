@@ -208,7 +208,17 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
       accountId: account.id,
       payload,
       frames: readCodeArtsSSE(res.body, signal),
-      close: () => { try { res.body?.cancel?.(); } catch { /* 已断 */ } },
+      close: () => {
+        // readCodeArtsSSE 的 reader 已经锁住 res.body，并在 finally 里 cancel 过。
+        // 这里再 body.cancel() 会返回一个 rejected Promise（ERR_INVALID_STATE:
+        // ReadableStream is locked）；外层 try/catch 抓不到异步 rejection，
+        // 于是每次请求结束都冒一条进程级 unhandledRejection（实测 2026-10-27
+        // 15:00 的 502 后面就跟了这条，把真实上游错误盖掉了）。
+        try {
+          const p = res.body?.cancel?.();
+          if (p && typeof p.catch === 'function') p.catch(() => {});
+        } catch { /* 已断 */ }
+      },
     };
   }
 }
@@ -238,6 +248,9 @@ async function* readCodeArtsSSE(stream, signal) {
         try { obj = JSON.parse(payload); } catch { continue; }
         if (typeof obj.error_code === 'string' && obj.error_code) {
           // 内嵌错误 → 错误信封形态（classifyFrame 识别 { code }）
+          // 记录原始码/文案：以前只把信封交给上层，日志里只剩 status=502，
+          // 排障时不知道到底是并发排队、限流还是额度问题。
+          warn(`[codearts] 上游内嵌错误 ${obj.error_code}：${String(obj.error_msg || '').slice(0, 160)}`);
           yield JSON.stringify({ code: obj.error_code, msg: obj.error_msg || obj.error_code });
           return;
         }

@@ -14,6 +14,7 @@
     "check:docs": "node scripts/check-docs.mjs",
     "lint": "node scripts/lint.mjs",
     "coverage": "node scripts/coverage.mjs",
-    "verify": "npm run lint && npm run test && npm run check:market && npm run check:docs"
+    "verify": "npm run lint && npm run test && npm run check:market && npm run check:docs",
+    "sync:install": "node scripts/sync-install.mjs"
   }
 }
