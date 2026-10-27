@@ -20,6 +20,17 @@ import { getConfigDir, primaryKey } from './config.mjs';
 
 export const PROVIDER_ID = 'workbuddy-bridge';
 export const PROVIDER_NAME = 'WorkBuddy';
+/** 华为云 CodeArts 独立供应商条目（0.3.66）：选择器分类里与 WorkBuddy 并列显示。
+ *  同一个代理端点，仅是 ZCode 侧的分组名——模型按平台拆开归组。 */
+export const CODEARTS_PROVIDER_ID = 'workbuddy-bridge-codearts';
+export const CODEARTS_PROVIDER_NAME = 'CodeArts (华为云)';
+/** 模型 id → 所属分组：codearts 站点的模型（裸名华为独有 + codearts/ 前缀变体）。 */
+function codeartsGroupOf(modelId) {
+  const id = String(modelId || '');
+  if (id.startsWith('codearts/')) return true;
+  // 华为独有裸名（目录合并后仍归属 codearts 站点的那批）
+  return /^(GLM-5\.2|openpangu-2\.0-(?:flash|pro)|glm-5\.2-sft-harmony|kimi-k2\.6-vl|kimi-k3)$/.test(id);
+}
 
 /** 生产数据目录（未设 WB_CONFIG_DIR 时用的那个）。 */
 function productionConfigDir() {
@@ -155,43 +166,55 @@ export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
     // 编译规则缺失导致模型回退内置默认行为，直到下次成功同步才自愈
     return 'unchanged';
   }
-  const personalModelIds = modelIds.length > 0
-    ? modelIds
-    : (Array.isArray(previous?.config?.personalModelIds) ? previous.config.personalModelIds : []);
+  // 按平台拆组（0.3.66）：腾讯系归 WorkBuddy，华为系归 CodeArts 独立条目——
+  // ZCode 选择器的供应商分类里两家并列。同一 baseUrl/apiKey，仅分组不同。
+  const wbModels = models.filter((m) => !codeartsGroupOf(m.id));
+  const caModels = models.filter((m) => codeartsGroupOf(m.id));
+  const personalModelIds = wbModels.map((m) => m.id);
   if (personalModelIds.length === 0 && !previous) return 'skipped'; // 首次注册但一个模型都拿不到，等下次
 
-  keptRules.push({
-    providerId: PROVIDER_ID,
-    providerName: PROVIDER_NAME,
+  const buildProviderEntry = (providerId, providerName, list) => ({
+    providerId,
+    providerName,
     enabled: true,
     config: {
       group: 'standard-personal',
       access: { type: 'api-key', apiKey },
       api: { type: 'openai-chat-completions', baseUrl },
-      personalModelIds,
-      modelOrder: personalModelIds,
+      personalModelIds: list.map((m) => m.id),
+      modelOrder: list.map((m) => m.id),
     },
   });
+  keptRules.push(buildProviderEntry(PROVIDER_ID, PROVIDER_NAME, wbModels));
+  // CodeArts 条目：有华为模型才注册；这轮拉不到时保留旧条目（避免分类闪没）
+  const prevCodearts = providerRules.find((r) => r?.providerId === CODEARTS_PROVIDER_ID);
+  const caModelsOrPrev = caModels.length
+    ? caModels
+    : (prevCodearts?.config?.personalModelIds || []).map((id) => ({ id, contextWindow: null, maxOutputTokens: null, supportsImages: false }));
+  if (caModelsOrPrev.length > 0) keptRules.push(buildProviderEntry(CODEARTS_PROVIDER_ID, CODEARTS_PROVIDER_NAME, caModelsOrPrev));
+  else if (prevCodearts) keptRules.push(prevCodearts);
   pcr.providerRules = keptRules;
   cfgRoot.providerConfigRules = pcr;
 
-  // --- modelConfigRules：只替换自己供应商的规则 ---
+  // --- modelConfigRules：只替换自己两个供应商的规则 ---
   const mcr = (cfgRoot.modelConfigRules && typeof cfgRoot.modelConfigRules === 'object' && !Array.isArray(cfgRoot.modelConfigRules))
     ? cfgRoot.modelConfigRules
     : {};
   const manualRules = Array.isArray(mcr.manualProviderModelRules)
-    ? mcr.manualProviderModelRules.filter((r) => r && typeof r === 'object' && r.providerId !== PROVIDER_ID)
+    ? mcr.manualProviderModelRules.filter((r) => r && typeof r === 'object' && r.providerId !== PROVIDER_ID && r.providerId !== CODEARTS_PROVIDER_ID)
     : [];
-  for (const m of models) manualRules.push(buildModelRule(m));
+  for (const m of wbModels) manualRules.push({ ...buildModelRule(m), providerId: PROVIDER_ID });
+  for (const m of caModels) manualRules.push({ ...buildModelRule(m), providerId: CODEARTS_PROVIDER_ID });
   mcr.manualProviderModelRules = manualRules;
   // providerModelRules 是必填键（且不能与 manual 规则同 provider/model 重复）
   if (!Array.isArray(mcr.providerModelRules)) mcr.providerModelRules = [];
-  mcr.providerModelRules = mcr.providerModelRules.filter((r) => r?.providerId !== PROVIDER_ID);
+  mcr.providerModelRules = mcr.providerModelRules.filter((r) => r?.providerId !== PROVIDER_ID && r?.providerId !== CODEARTS_PROVIDER_ID);
   cfgRoot.modelConfigRules = mcr;
 
   // --- providerOrder：不存在就放最前，已存在保持用户排的顺序 ---
   if (!Array.isArray(cfgRoot.providerOrder)) cfgRoot.providerOrder = [];
   if (!cfgRoot.providerOrder.includes(PROVIDER_ID)) cfgRoot.providerOrder.unshift(PROVIDER_ID);
+  if (!cfgRoot.providerOrder.includes(CODEARTS_PROVIDER_ID)) cfgRoot.providerOrder.splice(cfgRoot.providerOrder.indexOf(PROVIDER_ID) + 1, 0, CODEARTS_PROVIDER_ID);
 
   const next = JSON.stringify({ schemaVersion: 1, config: cfgRoot }, null, 2);
   let current = null;
