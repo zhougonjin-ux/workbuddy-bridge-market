@@ -18,6 +18,7 @@ using System.Text;
 using System.Threading;
 using System.Linq;
 using System.Windows.Forms;
+using Microsoft.Win32;
 
 static class Program
 {
@@ -76,22 +77,40 @@ static class Program
         else { mainForm.Show(); mainForm.WindowState = FormWindowState.Normal; mainForm.Activate(); }
     }
 
-    static void BuildTrayMenu()
+    public static void BuildTrayMenu()
     {
         var menu = new ContextMenuStrip();
-        var open = new ToolStripMenuItem("打开控制台窗口");
+        var open = new ToolStripMenuItem("显示窗口");
         open.Font = new Font(open.Font, FontStyle.Bold);
         open.Click += delegate { ShowMain(); };
         var web = new ToolStripMenuItem("网页控制台");
         web.Click += delegate { OpenConsole(); };
+
+        var copyBase = new ToolStripMenuItem("复制 Base URL");
+        copyBase.Click += delegate { CopyText("Base URL", "http://127.0.0.1:" + port + "/v1"); };
+        var copyKey = new ToolStripMenuItem("复制 API Key");
+        copyKey.Click += delegate { CopyText("API Key", apiKey); };
+        var dataDir = new ToolStripMenuItem("打开数据目录");
+        dataDir.Click += delegate { OpenPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zcode", "workbuddy-bridge")); };
+        var logFile = new ToolStripMenuItem("查看服务日志");
+        logFile.Click += delegate { OpenPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zcode", "workbuddy-bridge", "server.log")); };
+
         var start = new ToolStripMenuItem("启动服务");
         start.Click += delegate { new Thread(delegate() { Program.RunBlocking(delegate { if (!Program.Health()) Program.StartService(); }); }).Start(); };
         var stop = new ToolStripMenuItem("停止服务");
         stop.Click += delegate { new Thread(delegate() { Program.RunBlocking(delegate { if (Program.Health()) Program.StopService(); }); }).Start(); };
         var restart = new ToolStripMenuItem("重启服务");
         restart.Click += delegate { new Thread(delegate() { Program.RunBlocking(Program.RestartService); }).Start(); };
+
+        var update = new ToolStripMenuItem("检查插件更新…");
+        update.Click += delegate { CheckUpdateUi(); };
+        var autoRun = new ToolStripMenuItem("开机自启");
+        autoRun.CheckOnClick = true;
+        autoRun.Checked = IsAutoRun();
+        autoRun.Click += delegate { SetAutoRun(autoRun.Checked); };
         var installPlugin = new ToolStripMenuItem("给智能体安装插件…");
         installPlugin.Click += delegate { InstallPluginToZcode(); };
+
         var quit = new ToolStripMenuItem("退出");
         quit.Click += delegate
         {
@@ -99,12 +118,114 @@ static class Program
                 "退出前要一并停止本地代理服务吗？\n（停止后智能体会话暂时无法调用模型）",
                 AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.Yes)
                 StopService();
-            tray.Visible = false;
+            if (tray != null) tray.Visible = false;
             Application.Exit();
         };
-        menu.Items.AddRange(new ToolStripItem[] { open, web, new ToolStripSeparator(), start, stop, restart, installPlugin, new ToolStripSeparator(), quit });
-        tray.ContextMenuStrip = menu;
-        tray.DoubleClick += delegate { ShowMain(); };
+
+        menu.Items.AddRange(new ToolStripItem[] {
+            open, web, new ToolStripSeparator(),
+            copyBase, copyKey, dataDir, logFile, new ToolStripSeparator(),
+            start, stop, restart, new ToolStripSeparator(),
+            update, autoRun, installPlugin, new ToolStripSeparator(), quit,
+        });
+        if (tray != null)
+        {
+            tray.ContextMenuStrip = menu;
+            tray.DoubleClick += delegate { ShowMain(); };
+        }
+    }
+
+    /** 托盘菜单动作：复制到剪贴板并提示（菜单事件在 UI 线程，Clipboard 可用）。 */
+    static void CopyText(string label, string text)
+    {
+        try
+        {
+            Clipboard.SetText(text ?? "");
+            MessageBox.Show(label + " 已复制到剪贴板", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("复制失败：" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    /** 打开文件或目录；不存在时给出可读提示，而不是抛系统异常。 */
+    static void OpenPath(string path)
+    {
+        try
+        {
+            if (!File.Exists(path) && !Directory.Exists(path))
+            {
+                MessageBox.Show("路径不存在：\n" + path, AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+            Process.Start(path);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("打开失败：" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    const string RegRun = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+    const string RegRunName = "WorkBuddyBridgeTray";
+
+    static bool IsAutoRun()
+    {
+        try
+        {
+            using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RegRun, false))
+                return k != null && k.GetValue(RegRunName) != null;
+        }
+        catch { return false; }
+    }
+
+    static void SetAutoRun(bool on)
+    {
+        try
+        {
+            using (RegistryKey k = Registry.CurrentUser.CreateSubKey(RegRun))
+            {
+                if (on) k.SetValue(RegRunName, "\"" + Application.ExecutablePath + "\"");
+                else k.DeleteValue(RegRunName, false);
+            }
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("设置开机自启失败：" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+    }
+
+    /** 检查插件更新：走服务端 /console/api/update-check（多源并发 + 缓存）。 */
+    public static void CheckUpdateUi()
+    {
+        if (!Health())
+        {
+            MessageBox.Show("服务未运行，无法检查更新。先「启动服务」再试。", AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        try
+        {
+            string json = Api("GET", "/console/api/update-check", null);
+            var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            var d = ser.DeserializeObject(json) as Dictionary<string, object>;
+            string local = d != null && d.ContainsKey("local") ? Convert.ToString(d["local"]) : "?";
+            string latest = d != null && d.ContainsKey("latest") ? Convert.ToString(d["latest"]) : "";
+            bool has = d != null && d.ContainsKey("updateAvailable") && d["updateAvailable"] is bool && (bool)d["updateAvailable"];
+            string note = d != null && d.ContainsKey("note") ? Convert.ToString(d["note"]) : "";
+            string msg;
+            if (has)
+                msg = "发现新版本：v" + latest + "（当前 v" + local + "）\n\n更新方式：插件市场 → 刷新市场 → 插件详情 → 更新。";
+            else if (string.IsNullOrEmpty(latest))
+                msg = "暂时检查不了（" + (string.IsNullOrEmpty(note) ? "网络或上游不可达" : note) + "）。\n当前 v" + local + "。";
+            else
+                msg = "已是最新：v" + local + "。";
+            MessageBox.Show(msg, AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+        catch (Exception ex)
+        {
+            MessageBox.Show("检查更新失败：" + ex.Message, AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     static void LoadConfig()
@@ -367,6 +488,8 @@ class MainForm : Form
     readonly System.Windows.Forms.TextBox aggNameBox = new System.Windows.Forms.TextBox();
     readonly System.Windows.Forms.TextBox aggUrlBox = new System.Windows.Forms.TextBox();
     readonly System.Windows.Forms.TextBox aggKeysBox = new System.Windows.Forms.TextBox();
+    TextBox modelSearchBox;
+    readonly List<string[]> modelRows = new List<string[]>();
     List<Dictionary<string, object>> aggProviders = new List<Dictionary<string, object>>();
     List<Dictionary<string, object>> aggPresets = new List<Dictionary<string, object>>();
     readonly System.Windows.Forms.ComboBox aggPresetCombo = new System.Windows.Forms.ComboBox();
@@ -381,6 +504,13 @@ class MainForm : Form
     readonly Label acctStatus = new Label();
     readonly FlowLayoutPanel accountCards = new FlowLayoutPanel();
     readonly Label accountEmpty = new Label();
+    // 批量选择与筛选（0.3.72）：key = site + \0 + id
+    readonly HashSet<string> selectedAccounts = new HashSet<string>();
+    readonly List<string> visibleAccountKeys = new List<string>();
+    ComboBox acctSortCombo;
+    ComboBox acctSiteCombo;
+    TextBox acctSearchBox;
+    Label acctBulkStatus;
 
     // 任务中心页
     readonly Label kpiCredit = new Label();
@@ -490,26 +620,64 @@ class MainForm : Form
         var timer = new System.Windows.Forms.Timer { Interval = 60000 };
         timer.Tick += delegate { if (!busy) RefreshAll(); };
         timer.Start();
-        Load += delegate { RefreshAll(); };
+        Load += delegate { RestoreWindowState(); RefreshAll(); };
+    }
+
+    /** 窗口尺寸/位置记忆：%LOCALAPPDATA%\WorkBuddyBridge\ui.txt（安装目录可写，Program Files 不一定）。 */
+    static string UiStatePath()
+    {
+        return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyBridge", "ui.txt");
+    }
+
+    void RestoreWindowState()
+    {
+        try
+        {
+            string p = UiStatePath();
+            if (!File.Exists(p)) return;
+            string[] parts = File.ReadAllText(p).Split(',');
+            if (parts.Length < 5) return;
+            int x, y, w, h;
+            if (!int.TryParse(parts[0], out x) || !int.TryParse(parts[1], out y)
+                || !int.TryParse(parts[2], out w) || !int.TryParse(parts[3], out h)) return;
+            if (w < 920 || h < 600) return;
+            // 显示器变过（拔掉副屏/改分辨率）时不要恢复到场外，保持居中
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            if (x < wa.Left - 50 || y < wa.Top - 50 || x > wa.Right - 200 || y > wa.Bottom - 100) return;
+            StartPosition = FormStartPosition.Manual;
+            Location = new Point(x, y);
+            ClientSize = new Size(w, h);
+            if (parts[4].Trim() == "1") WindowState = FormWindowState.Maximized;
+        }
+        catch { /* 状态文件坏了就按默认居中打开 */ }
+    }
+
+    void SaveWindowState()
+    {
+        try
+        {
+            string p = UiStatePath();
+            Directory.CreateDirectory(Path.GetDirectoryName(p));
+            bool max = WindowState == FormWindowState.Maximized;
+            Rectangle r = max ? RestoreBounds : Bounds;
+            File.WriteAllText(p, r.X + "," + r.Y + "," + ClientSize.Width + "," + ClientSize.Height + "," + (max ? "1" : "0"));
+        }
+        catch { /* 保存失败不影响关闭 */ }
     }
 
     void BuildTray()
     {
-        tray = new NotifyIcon();
-        tray.Icon = Program.MakeIcon(true);
-        tray.Text = Program.AppName;
-        tray.Visible = true;
-        tray.DoubleClick += delegate { Program.ShowMain(); };
-        var menu = new ContextMenuStrip();
-        var show = new ToolStripMenuItem("显示窗口");
-        show.Font = new Font(show.Font, FontStyle.Bold);
-        show.Click += delegate { Program.ShowMain(); };
-        var web = new ToolStripMenuItem("网页控制台");
-        web.Click += delegate { Program.OpenConsole(); };
-        var quit = new ToolStripMenuItem("退出托盘");
-        quit.Click += delegate { tray.Visible = false; Application.Exit(); };
-        menu.Items.AddRange(new ToolStripItem[] { show, web, new ToolStripSeparator(), quit });
-        tray.ContextMenuStrip = menu;
+        // 复用 Program 的主托盘图标：旧版这里又 new 一个 NotifyIcon 且 Visible=true，
+        // 托盘区会出现两个相同图标；而且这里的简化菜单会覆盖 Program 的启动/停止/重启项。
+        tray = Program.tray;
+        if (tray == null)
+        {
+            tray = new NotifyIcon();
+            tray.Icon = Program.MakeIcon(true);
+            tray.Text = Program.AppName;
+            tray.Visible = true;
+        }
+        Program.BuildTrayMenu();
     }
 
     void BuildSidebar()
@@ -755,12 +923,48 @@ class MainForm : Form
         page.Controls.Add(importBtn);
         page.Controls.Add(refreshBtn);
 
-        acctStatus.Location = new Point(32, 174);
+        // 批量操作行（0.3.72）：全选 + 批量启停/删除/保留线
+        var bulkRow = new FlowLayoutPanel { Location = new Point(32, 164), Size = new Size(900, 32) };
+        var selectAll = new CheckBox { Text = "全选当前", AutoSize = true, Margin = new Padding(0, 7, 8, 0) };
+        selectAll.CheckedChanged += delegate
+        {
+            if (selectAll.Checked) foreach (var k in visibleAccountKeys) selectedAccounts.Add(k);
+            else selectedAccounts.Clear();
+            RebuildCards();
+        };
+        bulkRow.Controls.Add(selectAll);
+        AddBtn(bulkRow, "批量启用", delegate { BulkSetEnabled(true); });
+        AddBtn(bulkRow, "批量禁用", delegate { BulkSetEnabled(false); });
+        AddBtn(bulkRow, "批量设保留线", delegate { BulkSetMin(); });
+        AddBtn(bulkRow, "批量删除", delegate { BulkRemove(); });
+        acctBulkStatus = new Label { AutoSize = true, ForeColor = SubText, Margin = new Padding(8, 8, 0, 0), Text = "" };
+        bulkRow.Controls.Add(acctBulkStatus);
+        page.Controls.Add(bulkRow);
+
+        // 排序 / 站点筛选 / 搜索
+        var filterRow = new FlowLayoutPanel { Location = new Point(32, 200), Size = new Size(900, 30) };
+        acctSortCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Size = new Size(150, 26), Margin = new Padding(0, 2, 8, 0) };
+        acctSortCombo.Items.AddRange(new object[] { "默认顺序", "积分到期优先", "余额从多到少", "异常优先" });
+        acctSortCombo.SelectedIndex = 0;
+        acctSortCombo.SelectedIndexChanged += delegate { RebuildCards(); };
+        acctSiteCombo = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Size = new Size(130, 26), Margin = new Padding(0, 2, 8, 0) };
+        acctSiteCombo.Items.Add("全部站点");
+        acctSiteCombo.SelectedIndex = 0;
+        acctSiteCombo.SelectedIndexChanged += delegate { RebuildCards(); };
+        acctSearchBox = new TextBox { Size = new Size(200, 24), Margin = new Padding(0, 3, 8, 0) };
+        acctSearchBox.TextChanged += delegate { RebuildCards(); };
+        filterRow.Controls.Add(acctSortCombo);
+        filterRow.Controls.Add(acctSiteCombo);
+        filterRow.Controls.Add(new Label { Text = "搜索", AutoSize = true, Margin = new Padding(0, 8, 4, 0) });
+        filterRow.Controls.Add(acctSearchBox);
+        page.Controls.Add(filterRow);
+
+        acctStatus.Location = new Point(32, 238);
         acctStatus.Size = new Size(880, 20);
         acctStatus.ForeColor = SubText;
         page.Controls.Add(acctStatus);
 
-        accountCards.Location = new Point(32, 200);
+        accountCards.Location = new Point(32, 264);
         accountCards.Size = new Size(700, 440);
         accountCards.FlowDirection = FlowDirection.TopDown;
         accountCards.WrapContents = false;
@@ -784,11 +988,11 @@ class MainForm : Form
             alertLabel.Width = w;
             acctStatus.Width = w;
             accountCards.Width = w;
-            accountCards.Height = Math.Max(120, page.ClientSize.Height - 216);
+            accountCards.Height = Math.Max(120, page.ClientSize.Height - 280);
         };
 
         accountEmpty.Text = "还没有账号——点「OAuth 扫码添加」或「导入本机账号」";
-        accountEmpty.Location = new Point(32, 210);
+        accountEmpty.Location = new Point(32, 274);
         accountEmpty.ForeColor = SubText;
         page.Controls.Add(accountEmpty);
         return page;
@@ -934,6 +1138,10 @@ class MainForm : Form
         AddBtn(topRow, "⟳ 刷新列表", delegate { LoadModels(); });
         AddBtn(topRow, "设选中为默认", delegate { SetDefaultModelFromSelection(); });
         AddBtn(topRow, "🔗 聚合渠道", delegate { ShowPage("agg"); });
+        modelSearchBox = new TextBox { Size = new Size(170, 24), Margin = new Padding(8, 6, 4, 0) };
+        modelSearchBox.TextChanged += delegate { RenderModelRows(); };
+        topRow.Controls.Add(new Label { Text = "搜索", AutoSize = true, Margin = new Padding(8, 9, 2, 0) });
+        topRow.Controls.Add(modelSearchBox);
         modelMsg = new Label { AutoSize = true, ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 9F), Text = "", Margin = new Padding(8, 7, 4, 4) };
         topRow.Controls.Add(modelMsg);
         page.Controls.Add(topRow);
@@ -1031,11 +1239,10 @@ class MainForm : Form
             {
                 modelsDefaultModel = defModel;
                 modelCur.Text = "当前默认模型：" + (defModel == "" ? "—" : defModel);
-                modelList.BeginUpdate();
-                modelList.Items.Clear();
-                foreach (var r in rows) modelList.Items.Add(new ListViewItem(r));
-                modelList.EndUpdate();
+                modelRows.Clear();
+                foreach (var r in rows) modelRows.Add(r);
                 if (modelMsg != null) modelMsg.Text = "共 " + rows.Count + " 个模型";
+                RenderModelRows();
             });
         });
         if (!started)
@@ -1043,6 +1250,28 @@ class MainForm : Form
             modelsReloadQueued = true; // 忙碌期被吞：Run 收尾自动补跑
             if (modelMsg != null) modelMsg.Text = "加载中…（等待当前操作完成）";
         }
+    }
+
+    /** 按搜索词重绘模型列表（模型/站点/促销列都参与匹配）。 */
+    void RenderModelRows()
+    {
+        if (modelList == null) return;
+        string q = modelSearchBox != null ? modelSearchBox.Text.Trim().ToLowerInvariant() : "";
+        modelList.BeginUpdate();
+        modelList.Items.Clear();
+        int shown = 0;
+        foreach (var r in modelRows)
+        {
+            if (q != "")
+            {
+                string hay = string.Join(" ", r).ToLowerInvariant();
+                if (!hay.Contains(q)) continue;
+            }
+            modelList.Items.Add(new ListViewItem(r));
+            shown++;
+        }
+        modelList.EndUpdate();
+        if (modelMsg != null && q != "") modelMsg.Text = "筛选到 " + shown + "/" + modelRows.Count + " 个模型";
     }
 
     /** 聚合渠道页（0.3.62）：与 web 控制台同款能力——总开关、渠道增删启停、拉取模型。
@@ -1863,6 +2092,7 @@ class MainForm : Form
         AddBtn(svcBtns, "启动服务", delegate { serviceStatus.Text = "启动中…"; Run(delegate { Program.RunBlocking(delegate { if (!Program.Health()) Program.StartService(); }); }); });
         AddBtn(svcBtns, "停止服务", delegate { serviceStatus.Text = "停止中…"; Run(delegate { Program.RunBlocking(delegate { if (Program.Health()) Program.StopService(); }); }); });
         AddBtn(svcBtns, "重启服务", delegate { serviceStatus.Text = "重启中…"; Run(delegate { Program.RunBlocking(Program.RestartService); }); });
+        AddBtn(svcBtns, "检查更新", delegate { Program.CheckUpdateUi(); });
         AddBtn(svcBtns, "给智能体安装插件", delegate { new Thread(delegate() { Program.InstallPluginToZcode(); }).Start(); });
         page.Controls.Add(svcCaption);
         page.Controls.Add(serviceStatus);
@@ -1919,20 +2149,62 @@ class MainForm : Form
     {
         accountCards.SuspendLayout();
         accountCards.Controls.Clear();
+        visibleAccountKeys.Clear();
         var cardW = Math.Max(500, accountCards.ClientSize.Width - 26); // -26 预留纵滚条宽：出现/消失不再触发卡宽变化（防循环抖动出横滚）
         var alerts = new List<string>();
-        int idx = 0;
-        foreach (var a in lastRows)
+        string siteFilter = acctSiteCombo != null && acctSiteCombo.SelectedIndex > 0 ? Convert.ToString(acctSiteCombo.SelectedItem) : "";
+        string q = acctSearchBox != null ? acctSearchBox.Text.Trim().ToLowerInvariant() : "";
+        var view = new List<int>();
+        for (int i = 0; i < lastRows.Count; i++)
         {
-            string siteLabel = idx < lastSiteLabels.Count ? lastSiteLabels[idx][0] : "";
-            string site = idx < lastSiteLabels.Count ? lastSiteLabels[idx][1] : "cn-cli";
+            string site = i < lastSiteLabels.Count ? lastSiteLabels[i][1] : "";
+            string siteLabel = i < lastSiteLabels.Count ? lastSiteLabels[i][0] : "";
+            var a = lastRows[i];
+            if (siteFilter != "" && site != siteFilter) continue;
+            if (q != "")
+            {
+                string hay = (Str(a, "label") + " " + Str(a, "uid") + " " + Str(a, "id") + " " + siteLabel).ToLowerInvariant();
+                if (!hay.Contains(q)) continue;
+            }
+            view.Add(i);
+        }
+        int sortMode = acctSortCombo != null ? acctSortCombo.SelectedIndex : 0;
+        if (sortMode > 0)
+        {
+            view.Sort(delegate (int i1, int i2)
+            {
+                var a1 = lastRows[i1];
+                var a2 = lastRows[i2];
+                if (sortMode == 1)
+                {
+                    DateTime? t1 = CreditExpTime(a1), t2 = CreditExpTime(a2);
+                    if (t1 == null && t2 == null) return 0;
+                    if (t1 == null) return 1;
+                    if (t2 == null) return -1;
+                    return t1.Value.CompareTo(t2.Value);
+                }
+                if (sortMode == 2) return RemainOf(a2).CompareTo(RemainOf(a1));
+                bool bad1 = Status(a1).IndexOf("🟢") < 0;
+                bool bad2 = Status(a2).IndexOf("🟢") < 0;
+                if (bad1 == bad2) return 0;
+                return bad1 ? -1 : 1;
+            });
+        }
+        foreach (int i in view)
+        {
+            var a = lastRows[i];
+            string siteLabel = i < lastSiteLabels.Count ? lastSiteLabels[i][0] : "";
+            string site = i < lastSiteLabels.Count ? lastSiteLabels[i][1] : "cn-cli";
+            visibleAccountKeys.Add(AcctKey(site, Str(a, "id")));
             var c = MakeAccountCard(a, siteLabel, site, currentPolicy, pinnedId);
             c.Width = cardW;
             accountCards.Controls.Add(c);
             CollectAlert(a, siteLabel, alerts);
-            idx++;
         }
-        accountEmpty.Visible = lastRows.Count == 0;
+        accountEmpty.Visible = view.Count == 0;
+        accountEmpty.Text = view.Count == 0 && lastRows.Count > 0
+            ? "当前筛选没有匹配的账号"
+            : "还没有账号——点「OAuth 扫码添加」或「导入本机账号」";
         if (alerts.Count > 0)
         {
             alertLabel.Visible = true;
@@ -1951,6 +2223,7 @@ class MainForm : Form
         {
             bool up = Program.Health();
             string statusText = "";
+            string serverVersion = "";
             List<Dictionary<string, object>> rows = new List<Dictionary<string, object>>();
             List<string[]> siteLabels = new List<string[]>();
             var siteCounts = new Dictionary<string, int>();      // 扫码登录页：站点 → 账号数（0.3.64）
@@ -1978,6 +2251,7 @@ class MainForm : Form
                     string policyJson = Program.Api("GET", "/console/api/policy", null);
                     var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
                     root = ser.DeserializeObject(bridge) as Dictionary<string, object>;
+                    serverVersion = root != null && root.ContainsKey("version") ? Str(root, "version") : "";
                     curPolicy = ExtractString(policyJson, "policy");
                     var pm = System.Text.RegularExpressions.Regex.Match(policyJson, "\"pinnedAccountId\"\\s*:\\s*\"([^\"]*)\"");
                     pinnedIdNow = pm.Success ? pm.Groups[1].Value : "";
@@ -2074,6 +2348,36 @@ class MainForm : Form
                 lastSiteLabels.Clear();
                 foreach (var a in rowsSnapshot) lastRows.Add(a);
                 foreach (var sl in siteLabelsSnapshot) lastSiteLabels.Add(sl);
+                // 版本与托盘摘要：插件升级后不用重启客户端也能看到新版本
+                double totalRemain = 0;
+                int enabledCount = 0;
+                foreach (var a in rowsSnapshot)
+                {
+                    if (Str(a, "enabled") != "False") enabledCount++;
+                    object rv0;
+                    double rr;
+                    if (a.TryGetValue("creditRemain", out rv0) && rv0 != null && double.TryParse(rv0.ToString(), out rr) && rr > 0) totalRemain += rr;
+                }
+                string verShow = string.IsNullOrEmpty(serverVersion) ? Program.pluginVersion : serverVersion;
+                navVersion.Text = "v" + verShow + " · :" + Program.Port;
+                // 站点筛选下拉：保留用户当前选择，只更新候选项
+                if (acctSiteCombo != null)
+                {
+                    string keepSite = acctSiteCombo.SelectedIndex > 0 ? Convert.ToString(acctSiteCombo.SelectedItem) : "";
+                    acctSiteCombo.Items.Clear();
+                    acctSiteCombo.Items.Add("全部站点");
+                    foreach (var sk in siteCounts.Keys) acctSiteCombo.Items.Add(sk);
+                    int idxSel = 0;
+                    if (keepSite != "")
+                    {
+                        int found = acctSiteCombo.Items.IndexOf(keepSite);
+                        if (found >= 0) idxSel = found;
+                    }
+                    acctSiteCombo.SelectedIndex = idxSel;
+                }
+                string trayTip = "WorkBuddy 积分桥 v" + verShow + " · " + enabledCount + " 账号 · 余额 " + FormatCredit(totalRemain);
+                if (trayTip.Length > 63) trayTip = trayTip.Substring(0, 60) + "…";
+                if (Program.tray != null) Program.tray.Text = trayTip;
                 if (DateTime.Now >= acctMsgUntil) acctStatus.Text = up ? ("状态：" + statusText) : statusText;
                 serviceStatus.Text = "服务：" + (up ? "运行中（端口 " + Program.Port + "）" : "未运行");
                 if (Program.tray != null) Program.tray.Icon = Program.MakeIcon(up);
@@ -2332,6 +2636,117 @@ class MainForm : Form
         return v.ToString("#,0");
     }
 
+    /** 批量操作与筛选共用的账号键：site + NUL + id（label 可重名，id 在站点内唯一）。 */
+    static string AcctKey(string site, string id) { return site + "\u0000" + id; }
+    static string[] SplitAcctKey(string key) { return key.Split('\u0000'); }
+
+    /** 最早一批积分的到期时间；用于排序（无批次返回 null，排最后）。 */
+    static DateTime? CreditExpTime(Dictionary<string, object> a)
+    {
+        object arrObj;
+        var arr = a.TryGetValue("creditDetail", out arrObj) ? arrObj as object[] : null;
+        DateTime? earliest = null;
+        if (arr != null)
+        {
+            foreach (var o in arr)
+            {
+                var b = o as Dictionary<string, object>;
+                if (b == null) continue;
+                object ev;
+                var t = b.TryGetValue("expireAt", out ev) ? EpochToTime(ev) : null;
+                if (t != null && (earliest == null || t.Value < earliest.Value)) earliest = t;
+            }
+        }
+        return earliest;
+    }
+
+    static double RemainOf(Dictionary<string, object> a)
+    {
+        object v;
+        double n;
+        return a.TryGetValue("creditRemain", out v) && v != null && double.TryParse(v.ToString(), out n) ? n : 0;
+    }
+
+    void BulkSetEnabled(bool en)
+    {
+        if (selectedAccounts.Count == 0) { SetAcctStatus("先勾选账号（卡片左侧复选框）", Warn); return; }
+        var keys = new List<string>(selectedAccounts);
+        RunAcctWithStatus(en ? "批量启用" : "批量禁用", delegate
+        {
+            int ok = 0, fail = 0;
+            foreach (var k in keys)
+            {
+                var p = SplitAcctKey(k);
+                if (p.Length < 2) continue;
+                try
+                {
+                    Program.Api("POST", "/console/api/pool/account",
+                        "{\"site\":\"" + J(p[0]) + "\",\"id\":\"" + J(p[1]) + "\",\"enabled\":" + Bool(en) + "}");
+                    ok++;
+                }
+                catch { fail++; }
+            }
+            return (en ? "批量启用" : "批量禁用") + "完成 ✓ " + ok + " 个" + (fail > 0 ? "，失败 " + fail + " 个" : "");
+        });
+    }
+
+    void BulkSetMin()
+    {
+        if (selectedAccounts.Count == 0) { SetAcctStatus("先勾选账号（卡片左侧复选框）", Warn); return; }
+        string v = ShowInput("批量设置保留积分下限", "", "留空 = 清除；如 200。余额低于它的账号暂停派活");
+        if (v == null) return;
+        string trimmed = v.Trim();
+        double minVal = 0;
+        if (trimmed != "" && !double.TryParse(trimmed, out minVal))
+        {
+            MessageBox.Show("保留线必须是数字，如 200", Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        var keys = new List<string>(selectedAccounts);
+        RunAcctWithStatus("批量设保留线", delegate
+        {
+            int ok = 0, fail = 0;
+            foreach (var k in keys)
+            {
+                var p = SplitAcctKey(k);
+                if (p.Length < 2) continue;
+                try
+                {
+                    Program.Api("POST", "/console/api/pool/account",
+                        "{\"site\":\"" + J(p[0]) + "\",\"id\":\"" + J(p[1]) + "\",\"minRemain\":" + (trimmed == "" ? "null" : minVal.ToString()) + "}");
+                    ok++;
+                }
+                catch { fail++; }
+            }
+            return "批量设保留线完成 ✓ " + ok + " 个" + (fail > 0 ? "，失败 " + fail + " 个" : "");
+        });
+    }
+
+    void BulkRemove()
+    {
+        if (selectedAccounts.Count == 0) { SetAcctStatus("先勾选账号（卡片左侧复选框）", Warn); return; }
+        if (MessageBox.Show("确定删除选中的 " + selectedAccounts.Count + " 个账号？\n\n只删本机账号池记录，不影响上游账号；token 可重新导入/登录。",
+            "批量删除", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+        var keys = new List<string>(selectedAccounts);
+        RunAcctWithStatus("批量删除", delegate
+        {
+            int ok = 0, fail = 0;
+            foreach (var k in keys)
+            {
+                var p = SplitAcctKey(k);
+                if (p.Length < 2) continue;
+                try
+                {
+                    Program.Api("POST", "/console/api/pool/account/remove",
+                        "{\"site\":\"" + J(p[0]) + "\",\"id\":\"" + J(p[1]) + "\"}");
+                    ok++;
+                }
+                catch { fail++; }
+            }
+            return "批量删除完成 ✓ " + ok + " 个" + (fail > 0 ? "，失败 " + fail + " 个" : "");
+        });
+    }
+
     Control MakeAccountCard(Dictionary<string, object> a, string siteLabel, string site, string policy, string pinnedAccountId)
     {
         string id = Str(a, "id");
@@ -2347,9 +2762,24 @@ class MainForm : Form
         card.Paint += delegate (object s2, PaintEventArgs e2)
         {
             using (var pen = new Pen(BorderLine)) e2.Graphics.DrawRectangle(pen, 0, 0, card.Width - 1, card.Height - 1);
+            // 左侧状态色条：眼睛不用逐行读文字，扫一眼颜色就知道哪张卡有问题
+            using (var b = new SolidBrush(StatusColor(status))) e2.Graphics.FillRectangle(b, 0, 0, 3, card.Height);
         };
 
-        var avatar = new Panel { Size = new Size(36, 36), Location = new Point(12, 15), BackColor = Accent };
+        string key = AcctKey(site, id);
+        var sel = new CheckBox
+        {
+            Location = new Point(10, 30), Size = new Size(18, 18),
+            Checked = selectedAccounts.Contains(key), Cursor = Cursors.Hand,
+        };
+        sel.CheckedChanged += delegate
+        {
+            if (sel.Checked) selectedAccounts.Add(key);
+            else selectedAccounts.Remove(key);
+        };
+        card.Controls.Add(sel);
+
+        var avatar = new Panel { Size = new Size(36, 36), Location = new Point(32, 15), BackColor = Accent };
         SetRound(avatar, 18);
         var initial = new Label
         {
@@ -2363,24 +2793,24 @@ class MainForm : Form
 
         var name = new Label
         {
-            Text = label, Location = new Point(60, 8),
+            Text = label, Location = new Point(78, 8),
             Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold), ForeColor = InkText, AutoSize = true,
         };
         card.Controls.Add(name);
 
-        var line1Parts = new List<string> { status, "剩 " + remain + " 积分", "最早到期 " + expiry };
-        if (min != "") line1Parts.Add("🛡 ≥ " + min);
+        var line1Parts = new List<string> { status, "剩 " + remain + " 积分", "积分至 " + CreditExp(a) };
+        if (min != "") line1Parts.Add("🛡 保留线 ≥ " + min);
         var line1 = new Label
         {
             Text = string.Join(" · ", line1Parts.ToArray()),
-            Location = new Point(60, 31),
+            Location = new Point(78, 31),
             Font = new Font("Microsoft YaHei UI", 8.5F),
             ForeColor = status.Contains("🔴") ? Danger : SubText,
         };
         // 按钮在右侧 y=27..51，line1 与按钮同行：宽度留出按钮区，超宽省略号
         line1.AutoEllipsis = true;
         line1.AutoSize = false;
-        line1.Width = 700 - 210;
+        line1.Width = 700 - 290;
         card.Controls.Add(line1);
 
         // 站点短名：去掉「（域名）」括注，完整域名进 tooltip
@@ -2390,23 +2820,33 @@ class MainForm : Form
         string fullUid = Str(a, "uid");
         string uidShow = fullUid.Length > 12 ? fullUid.Substring(0, 12) + "…" : fullUid;
         var metaParts = new List<string> { "uid " + uidShow, shortSite };
+        // 令牌到期与积分到期是两件事：旧版把 expiresAt 当「最早到期」显示，容易误判。
+        if (Str(a, "expiresAt") != "") metaParts.Add("令牌至 " + expiry);
         if (lastModel != "") metaParts.Add("上次模型 " + lastModel);
         var meta = new Label
         {
             Text = string.Join(" · ", metaParts.ToArray()),
-            Location = new Point(60, 54),
+            Location = new Point(78, 54),
             Font = new Font("Microsoft YaHei UI", 8F), ForeColor = SubText,
         };
         // meta 在按钮下方（按钮底 51 < meta 顶 54），可占卡内全宽；超宽才省略号兜底
         meta.AutoEllipsis = true;
         meta.AutoSize = false;
-        meta.Width = 700 - 72;
+        meta.Width = 700 - 90;
         string tipText = "uid " + fullUid + "\n" + fullSite + (lastModel != "" ? "\n上次模型 " + lastModel : "");
         cardTips.SetToolTip(meta, tipText);
         cardTips.SetToolTip(name, label + "（uid " + fullUid + "）");
         card.Controls.Add(meta);
 
         // 右侧操作按钮：卡 Resize 时按当前宽度重定位（不用 Anchor——Dock Top 面板宽度动态，显式重定位最稳）
+        var testBtn = new Button
+        {
+            Text = "测连通", Size = new Size(62, 24), Location = new Point(434, 27), Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            FlatStyle = FlatStyle.Flat, BackColor = CardBack, ForeColor = InkText,
+            Font = new Font("Microsoft YaHei UI", 8F), Cursor = Cursors.Hand,
+        };
+        testBtn.FlatAppearance.BorderColor = BorderLine;
+        cardTips.SetToolTip(testBtn, "发一次 1 token 的极小请求，验证这个账号当前是否可用（消耗极少量积分）");
         var pinBtn = new Button
         {
             Text = isPinnedHere ? "解固定" : "固定使用", Size = new Size(62, 24), Location = new Point(500, 27), Anchor = AnchorStyles.Top | AnchorStyles.Right,
@@ -2416,11 +2856,32 @@ class MainForm : Form
         pinBtn.FlatAppearance.BorderColor = BorderLine;
         var minBtn = new Button
         {
-            Text = min != "" ? "改保留" : "设保留", Size = new Size(62, 24), Location = new Point(566, 27), Anchor = AnchorStyles.Top | AnchorStyles.Right,
+            Text = min != "" ? "改保留线" : "设保留线", Size = new Size(62, 24), Location = new Point(566, 27), Anchor = AnchorStyles.Top | AnchorStyles.Right,
             FlatStyle = FlatStyle.Flat, BackColor = CardBack, ForeColor = Accent,
             Font = new Font("Microsoft YaHei UI", 8F), Cursor = Cursors.Hand,
         };
         minBtn.FlatAppearance.BorderColor = Accent;
+        testBtn.Click += delegate
+        {
+            SetAcctStatus("测连通：" + label + " …（1 token 请求）", InkText);
+            bool started = Run(delegate
+            {
+                string json = Program.Api("POST", "/console/api/account/test",
+                    "{\"site\":\"" + J(site) + "\",\"id\":\"" + J(id) + "\"}");
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var d = ser.DeserializeObject(json) as Dictionary<string, object>;
+                bool ok = d != null && d.ContainsKey("ok") && d["ok"] is bool && (bool)d["ok"];
+                string ms = d != null && d.ContainsKey("ms") ? Convert.ToString(d["ms"]) : "?";
+                string err = d != null && d.ContainsKey("error") ? Convert.ToString(d["error"]) : "";
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    SetAcctStatus(ok
+                        ? "测连通 ✓ " + label + " · " + ms + " ms"
+                        : "测连通 ✗ " + label + " · " + (err == "" ? "失败" : err), ok ? Accent : Danger);
+                });
+            });
+            if (!started) SetAcctStatus("有操作正在进行，稍后再测", Warn);
+        };
         pinBtn.Click += delegate
         {
             Run(delegate
@@ -2446,14 +2907,16 @@ class MainForm : Form
                 Program.Api("POST", "/console/api/pool/account", "{\"site\":\"" + J(site) + "\",\"id\":\"" + J(id) + "\",\"minRemain\":" + (trimmed == "" ? "null" : minVal.ToString()) + "}");
             });
         };
+        card.Controls.Add(testBtn);
         card.Controls.Add(pinBtn);
         card.Controls.Add(minBtn);
         card.Resize += delegate
         {
-            pinBtn.Location = new Point(card.Width - 132, 27);
-            minBtn.Location = new Point(card.Width - 66, 27);
-            meta.Width = Math.Max(180, card.Width - 72);
-            line1.Width = Math.Max(180, card.Width - 210);
+            testBtn.Location = new Point(card.Width - 202, 27);
+            pinBtn.Location = new Point(card.Width - 136, 27);
+            minBtn.Location = new Point(card.Width - 70, 27);
+            meta.Width = Math.Max(180, card.Width - 90);
+            line1.Width = Math.Max(180, card.Width - 290);
         };
         return card;
     }    static string Bool(bool b) { return b ? "true" : "false"; }
@@ -2639,10 +3102,49 @@ class MainForm : Form
     static string Rem(Dictionary<string, object> a)
     {
         var v = a.ContainsKey("creditRemain") ? a["creditRemain"] : null;
-        if (v is int) return ((int)v).ToString();
-        if (v is double) return ((double)v).ToString("0.##");
-        if (v is decimal) return ((decimal)v).ToString("0.##");
-        return v == null ? "—" : v.ToString();
+        if (v == null) return "—";
+        double n;
+        return double.TryParse(v.ToString(), out n) ? FormatCredit(n) : v.ToString();
+    }
+
+    /** 积分/余额展示：≥1 万用「万」，其余千分位，最多 2 位小数。 */
+    static string FormatCredit(double n)
+    {
+        if (Math.Abs(n) >= 10000) return (n / 10000.0).ToString("0.##") + " 万";
+        return n.ToString("#,##0.##");
+    }
+
+    /** 最早一批积分的到期时间（creditDetail[].expireAt）。旧版这里误用了 token 的 expiresAt。 */
+    static string CreditExp(Dictionary<string, object> a)
+    {
+        object arrObj;
+        var arr = a.TryGetValue("creditDetail", out arrObj) ? arrObj as object[] : null;
+        DateTime? earliest = null;
+        if (arr != null)
+        {
+            foreach (var o in arr)
+            {
+                var b = o as Dictionary<string, object>;
+                if (b == null) continue;
+                object ev;
+                var t = b.TryGetValue("expireAt", out ev) ? EpochToTime(ev) : null;
+                if (t == null) continue;
+                if (earliest == null || t.Value < earliest.Value) earliest = t;
+            }
+        }
+        if (earliest == null) return "—";
+        int days = (int)Math.Ceiling((earliest.Value - DateTime.Now).TotalDays);
+        string when = earliest.Value.ToString("MM-dd");
+        if (days < 0) return when + "（已过期）";
+        return when + "（" + days + " 天）";
+    }
+
+    /** 卡片左侧状态色条：故障红、冷却/保留线/禁用橙、正常绿。 */
+    static Color StatusColor(string status)
+    {
+        if (status.Contains("🔴") || status.Contains("额度耗尽")) return Danger;
+        if (status.Contains("冷却") || status.Contains("保留线") || status.Contains("已禁用")) return Warn;
+        return Accent;
     }
 
     static DateTime? EpochToTime(object v)
@@ -2700,6 +3202,7 @@ class MainForm : Form
     {
         if (e.CloseReason == CloseReason.UserClosing)
         {
+            SaveWindowState();
             e.Cancel = true;
             Hide();
             return;

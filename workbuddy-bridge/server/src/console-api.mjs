@@ -18,7 +18,7 @@ import {
   updateCreditDetail,
 } from './pool.mjs';
 import { getCatalog, mergedModels } from './router.mjs';
-import { queryCredit, supportsCreditQuery } from './upstream.mjs';
+import { queryCredit, supportsCreditQuery, openChat, aggregateFrames } from './upstream.mjs';
 import { probeModel, runHealthScan, healthStatus, reloadHealthState } from './health.mjs';
 import { startLogin, pollLogin } from './device-login.mjs';
 import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel, usageCsv, reloadUsage } from './usage.mjs';
@@ -39,6 +39,7 @@ import { burnoutReport, predictAccount } from './burnout.mjs';
 import { recentDailyCreditAvg } from './usage.mjs';
 import { checkForUpdate } from './updatecheck.mjs';
 import { onboardingStatus } from './onboarding.mjs';
+import { codeartsOpenChat, codeartsCatalog } from './codearts-upstream.mjs';
 import { runDiagnostics, startDoctorLoop } from './doctor.mjs';
 import { flushLearned } from './compress.mjs';
 import { flushEvents } from './events.mjs';
@@ -445,6 +446,7 @@ export async function handleConsoleApi(ctx) {
     // （接入页复制的是 apiKey，不是账号 token），直接抹掉不影响任何功能。
     // /backup 保留明文：导出的用途本就是把账号整套搬走。
     const b = bridgeStatus(cfg, { redact: true });
+    b.version = pkgVersion(); // 客户端侧栏/托盘据此显示版本，插件升级后自动跟上
     b.budget = budgetCheckAndAnnounce(cfg); // T13：预警条数据源 + 每天一次的预算提醒
     // T63：按账号预算（每 20s 轮询下发 + 超限每天提醒一次）
     const bAccs = [];
@@ -1087,6 +1089,59 @@ export async function handleConsoleApi(ctx) {
       'Cache-Control': 'no-store',
     });
     return res.end(csv);
+  }
+
+  // ---- 单账号连通性测试（客户端账号卡「测试」按钮）----
+  // 只发 1 token 的极小请求，验证该账号本身是否可用；返回延迟/错误码。
+  // 会消耗极少量积分（1 token 级别），客户端按钮文案要标明。
+  if (p === '/account/test' && method === 'POST') {
+    const body = ctx.body || {};
+    const site = String(body.site || cfg.defaultSite);
+    const id = String(body.id || '');
+    if (!cfg.sites[site]) return sendJson(res, 400, { ok: false, error: `未知站点 ${site}` });
+    if (!getAccount(site, id)) return sendJson(res, 404, { ok: false, error: `账号不存在：${id}` });
+    // 测试模型：CodeArts 的 benefit 免费模型可能因额度/下线返回 "benefit not found"，
+    // 优先用目录里第一个可用模型（目录有 2h 缓存），其次退回 1017 / 默认模型。
+    let model = String(body.model || '');
+    if (!model && site === 'codearts') {
+      try {
+        const cat = await codeartsCatalog(cfg);
+        // 优先非 benefit 模型：benefit 免费额度耗尽/下线时上游报 "benefit not found"，
+        // 测连通要测的是账号本身，不应该被免费池状态误判。
+        const pick = cat.find((m) => m.benefit !== 'yes') || cat[0];
+        if (pick) model = String(pick.id || '');
+      } catch { /* 目录拉取失败用下面的兜底 */ }
+      if (!model) model = 'deepseek-v4.1-flash-1017';
+    }
+    if (!model) model = String(cfg.defaultModel || '');
+    const t0 = Date.now();
+    let up = null;
+    try {
+      const chatBody = { model, messages: [{ role: 'user', content: 'ping' }], max_tokens: 1, stream: true };
+      const signal = AbortSignal.timeout(45_000);
+      up = site === 'codearts'
+        ? await codeartsOpenChat(cfg, chatBody, { signal, accountId: id })
+        : await openChat(cfg, site, chatBody, { signal, accountId: id });
+      if (!up.ok) {
+        return sendJson(res, 200, {
+          ok: false, site, id, model, ms: Date.now() - t0,
+          status: up.status || 0, error: String(up.text || '').slice(0, 300),
+        });
+      }
+      const agg = await aggregateFrames(up.frames);
+      return sendJson(res, 200, {
+        ok: true, site, id, model, ms: Date.now() - t0,
+        chars: (agg.content || '').length,
+        frames: agg.frames || 0,
+      });
+    } catch (e) {
+      return sendJson(res, 200, {
+        ok: false, site, id, model, ms: Date.now() - t0,
+        status: e.status || 500, error: String(e.message || e).slice(0, 300),
+      });
+    } finally {
+      try { up?.close?.(); } catch { /* 已断 */ }
+    }
   }
 
   // ---- 模型探测（顺序执行，避免打爆上游） ----

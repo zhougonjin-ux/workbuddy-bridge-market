@@ -44,8 +44,10 @@ static class SetupProgram
         if (uninstall) { RunUninstall(); return; }
         Application.EnableVisualStyles();
         sourceDir = AppDomain.CurrentDomain.BaseDirectory;
-        version = ReadOwnVersion();
         serverDir = DetectServerDir();
+        // 版本必须依赖 serverDir：优先读实际插件的 package.json，而不是安装目录里
+        // 上一次安装留下的 version.txt（旧文件会把 0.3.66 一直带下去）。
+        version = ReadOwnVersion();
         if (silent)
         {
             // 静默安装（agent/测试自动化）：默认目录、桌面快捷方式、不写开机自启，全程无窗。
@@ -76,10 +78,19 @@ static class SetupProgram
         Application.Run(new WizardForm());
     }
 
-    /** 版本号读取顺序：version.txt（build.cmd 生成）→ ../server/package.json（便携/开发结构）→ 0.0.0。
+    /** 版本号读取顺序：实际服务目录 package.json → 安装目录 version.txt → 便携 ../server/package.json → 0.0.0。
      *  不硬编码：版本唯一事实源是 workbuddy-bridge/server/package.json。 */
     static string ReadOwnVersion()
     {
+        try
+        {
+            if (serverDir != null)
+            {
+                string v = ReadVersionFromPackage(Path.Combine(serverDir, "package.json"));
+                if (v != null) return v;
+            }
+        }
+        catch { }
         try
         {
             string marker = Path.Combine(sourceDir, "version.txt");
@@ -92,23 +103,27 @@ static class SetupProgram
         catch { }
         try
         {
-            string pkg = Path.GetFullPath(Path.Combine(sourceDir, "..", "server", "package.json"));
-            if (File.Exists(pkg))
-            {
-                string text = File.ReadAllText(pkg);
-                string key = "\"version\"";
-                int i = text.IndexOf(key);
-                if (i >= 0)
-                {
-                    int c = text.IndexOf(':', i + key.Length);
-                    int q1 = c >= 0 ? text.IndexOf('"', c + 1) : -1;
-                    int q2 = q1 >= 0 ? text.IndexOf('"', q1 + 1) : -1;
-                    if (q1 >= 0 && q2 > q1) return text.Substring(q1 + 1, q2 - q1 - 1).Trim();
-                }
-            }
+            string v = ReadVersionFromPackage(Path.GetFullPath(Path.Combine(sourceDir, "..", "server", "package.json")));
+            if (v != null) return v;
         }
         catch { }
         return "0.0.0";
+    }
+
+    /** 从 package.json 里取 "version" 字段（C# 5，不引 JSON 库）。 */
+    static string ReadVersionFromPackage(string pkg)
+    {
+        if (!File.Exists(pkg)) return null;
+        string text = File.ReadAllText(pkg);
+        string key = "\"version\"";
+        int i = text.IndexOf(key);
+        if (i < 0) return null;
+        int c = text.IndexOf(':', i + key.Length);
+        int q1 = c >= 0 ? text.IndexOf('"', c + 1) : -1;
+        int q2 = q1 >= 0 ? text.IndexOf('"', q1 + 1) : -1;
+        if (q1 < 0 || q2 <= q1) return null;
+        string v = text.Substring(q1 + 1, q2 - q1 - 1).Trim();
+        return v.Length > 0 ? v : null;
     }
 
     /** 服务目录探测：ZCode 插件缓存里内容版本最高的 server → 本包便携结构 ../server → null（向导里手选）。
