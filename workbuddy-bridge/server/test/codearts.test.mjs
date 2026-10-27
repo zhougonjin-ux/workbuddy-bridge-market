@@ -50,9 +50,12 @@ test('PKCE + DPoP：challenge 是 verifier 的 S256；DPoP JWS 三段且头部�
 
 import crypto2 from 'node:crypto';
 
-test('模型 id 归一化与窗口表：-0731 去后缀、benefit 模型不被误改、窗口查不到用兜底', () => {
-  assert.equal(codeartsNormalizeModelId('deepseek-v4-flash-0731'), 'deepseek-v4-flash');
-  assert.equal(codeartsNormalizeModelId('glm-5.3-flash'), 'glm-5.3-flash'); // flash 不是日期后缀
+test('模型 id 不做后缀剥离（0.3.66 补丁7）：原名透传，窗口表与兜底不变', () => {
+  // -1017 是独立 SKU（chat 端点原名 200 + 官方 UI 单列），「何时剥后缀」无静态判据
+  // → 唯一安全做法是不剥：目录里有什么就展示什么，请求原样透传
+  assert.equal(codeartsNormalizeModelId('deepseek-v4-flash-0731'), 'deepseek-v4-flash-0731');
+  assert.equal(codeartsNormalizeModelId('deepseek-v4.1-flash-1017'), 'deepseek-v4.1-flash-1017');
+  assert.equal(codeartsNormalizeModelId('glm-5.3-flash'), 'glm-5.3-flash');
   assert.equal(codeartsNormalizeModelId('GLM-5.2'), 'GLM-5.2');
   assert.equal(codeartsContextWindow('GLM-5.2'), 1_048_576);
   assert.equal(codeartsContextWindow('openpangu-2.0-pro'), 524_288);
@@ -98,7 +101,7 @@ test('目录拉取：benefit 模型标记 + 常规模型合并 + VL 过滤（fet
   assert.equal(out.builtinOk, true);
   const ids = out.models.map((m) => m.id);
   assert.ok(ids.includes('glm-5.3-flash'));
-  assert.ok(ids.includes('deepseek-v4-flash')); // 已去后缀
+  assert.ok(ids.includes('deepseek-v4-flash-0731')); // 原名透传（补丁7：不再剥后缀）
   assert.ok(!ids.includes('Qwen3-VL-235B')); // VL 过滤
   const glm = out.models.find((m) => m.id === 'glm-5.3-flash');
   assert.equal(glm.benefit, 'yes'); // benefit 标记 → chat 带 maas_type

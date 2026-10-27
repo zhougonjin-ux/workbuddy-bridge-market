@@ -342,12 +342,18 @@ export const CODEARTS_OPS_CONFIRM_PATH = '/v1/ops/confirm';
 /** benefit（免费额度）模型兜底集合：chat 时必须带 maas_type: benefit。 */
 export const CODEARTS_BENEFIT_FALLBACK = ['glm-5.3-flash', 'deepseek-v4.1-flash'];
 
-/** 去掉末尾日期后缀：deepseek-v4-flash-0731 → deepseek-v4-flash（chat 只认无后缀 id）。 */
+/**
+ * 历史说明（0.3.66 补丁7）：不再对目录 id 做任何后缀剥离。
+ *
+ * 早期版本剥 `-NNNN` 日期后缀（deepseek-v4-flash-0731 → deepseek-v4-flash），
+ * 依据是当时实测「chat 端点只认无后缀 id」。但 10 月华为新增了
+ * `deepseek-v4.1-flash-1017`：实测 chat 端点**带后缀直接 200**，且官方 UI
+ * 把它单列成独立 SKU（特性：许愿式编程一键直达），剥掉它用户就选不到。
+ * 两种形态并存 → 「什么时候该剥」没有了可静态判定的依据，唯一安全做法是
+ * **不剥**：目录里有什么就展示什么、请求原样透传（chat 端点对裸名与后缀名
+ * 实测都 200）。裸名可用性由目录自身决定——目录里没有裸名就不会出现在选择器。
+ */
 export function codeartsNormalizeModelId(id) {
-  if (id.length > 5) {
-    const suffix = id.slice(-5);
-    if (suffix.startsWith('-') && /^\d{4}$/.test(suffix.slice(1))) return id.slice(0, -5);
-  }
   return id;
 }
 
