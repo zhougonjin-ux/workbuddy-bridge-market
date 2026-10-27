@@ -2178,7 +2178,7 @@ class MainForm : Form
                     // 大数以「万 token」展示（1380px 卡宽放不下 8 位完整数字，截断比换行更难读）
                     double tokens = ToD(dashToday, "tokens");
                     dashTokens.Text = reported
-                        ? (tokens >= 100000 ? (tokens / 10000.0).ToString("0.##") + " 万" : tokens.ToString("#,0"))
+                        ? Wan(tokens)
                         : (callsN > 0 ? "未上报" : "—");
                     dashTokensSub.Text = reported
                         ? "输入 " + Wan(promptT) + " · 输出 " + Wan(completionT)
@@ -2324,10 +2324,12 @@ class MainForm : Form
         return double.TryParse(d[key].ToString(), out v) ? v : 0;
     }
 
-    /** 大数转「N.NN 万」（≥10 万才转，否则原样）；Token 卡副标题用。 */
+    /** 大数转中文单位：≥1 亿用「亿」，≥10 万用「万」，否则原样（Token 卡主/副标题共用）。 */
     static string Wan(double v)
     {
-        return v >= 100000 ? (v / 10000.0).ToString("0.##") + " 万" : v.ToString("#,0");
+        if (v >= 100000000) return (v / 100000000.0).ToString("0.##") + " 亿";
+        if (v >= 100000) return (v / 10000.0).ToString("0.##") + " 万";
+        return v.ToString("#,0");
     }
 
     Control MakeAccountCard(Dictionary<string, object> a, string siteLabel, string site, string policy, string pinnedAccountId)
