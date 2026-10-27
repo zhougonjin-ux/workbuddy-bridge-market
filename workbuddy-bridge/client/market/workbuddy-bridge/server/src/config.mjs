@@ -111,6 +111,28 @@ export const SITE_PRESETS = {
       { id: 'hy3', name: 'Hy3' },
     ],
   },
+  // 华为云 CodeArts（0.3.66）：登录/对话/积分协议移植自 MIT 开源 dsh-codearts-auth。
+  // 该站点不走 /v2/plugin/* 与 Bearer token：凭据是华为 STS 的 AK/SK/ST（JSON 串存
+  // 账号池 accessToken 字段），对话走 SDK-HMAC-SHA256 签名（codearts-upstream.mjs）。
+  // apiBase 仅作占位（refreshToken 等通用路径不会对它发请求）。
+  codearts: {
+    label: 'CodeArts（华为云）',
+    enabled: true,
+    apiBase: 'https://snap-access.cn-north-4.myhuaweicloud.com',
+    billingBase: '',
+    origin: 'https://codearts.huaweicloud.com',
+    userAgent: 'codearts-agent',
+    product: 'CodeArts',
+    codearts: true, // 站点协议标记：openai.mjs / console-api.mjs 据此走 CodeArts 分支
+    seedModels: [
+      { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash（免费额度）', contextWindow: 1048576 },
+      { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash（免费额度）', contextWindow: 1048576 },
+      { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', contextWindow: 1048576 },
+      { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', contextWindow: 1048576 },
+      { id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 1048576 },
+      { id: 'openpangu-2.0-pro', name: 'openPangu-2.0-Pro', contextWindow: 524288 },
+    ],
+  },
   'intl-work': {
     label: '国际版 WorkBuddy（workbuddy.ai）',
     enabled: true,
@@ -174,6 +196,12 @@ export function defaultConfig() {
     sites: structuredClone(SITE_PRESETS),
     // 模型 → 站点 的显式路由（可选），例如 { "claude-4.5": "intl-cli" }
     modelRoutes: {},
+    // 模型链（0.3.56，可选）：模型层失败（限流/额度/模型不存在）时按序换下一个模型，
+    // 例如 { "glm-5.3-flash": ["glm-5.2", "hy3"] }
+    modelChains: {},
+    // 聚合渠道泳道（0.3.58，可选）：用户自有 key 的 OpenAI 兼容 provider，
+    // 模型 ID 形如 agg:<name>/<model>
+    aggregate: { providers: [] },
     timeouts: {
       headerMs: 90000, // 上游首字节（响应头）超时
       idleMs: 300000, // 流中空闲超时
@@ -226,7 +254,7 @@ export function defaultConfig() {
       growthHours: [1, 13],   // 成长任务扫描时点
       checkinTimes: [],       // 精确时点 ["HH:MM"]；非空时优先于 checkinHours
       growthTimes: [],        // 同上，精确到分钟
-      reportTimes: ['10:00'], // 活跃上报时点（借鉴 dsh：先于任务落地）
+      reportTimes: ['08:00'], // 活跃上报时点（借鉴 dsh：先于任务落地）
       travelTimes: ['09:00', '15:00', '21:00'], // 猫猫旅行巡逻时点（状态机幂等，一天可多次）
       listTimes: ['09:00', '15:00', '21:00'],  // 控制台任务中心列表的每日自动刷新时点（预取缓存）
       doctorTimes: ['10:00'], // 每日自动体检时点：有 fail 项推通知，全绿只记时间线；空数组=关闭
@@ -309,6 +337,12 @@ export function defaultConfig() {
     // 服务端校验通过才发会话 token（token 只存内存，重启后重新输一次）。
     // null/空串 = 不启用（默认，保持原有「本机即信任」行为）。
     consolePin: null,
+    // 模型端点（/v1/*）的跨域来源白名单。
+    // 默认 [] = 只允许「本机同端口页面」；ZCode 等桌面客户端不带 Origin，不受影响。
+    // 风险背景：以前统一 ACAO:*，本机任意网页（含恶意 npm 包的本地 UI）只要拿到
+    // apiKey 就能借刀消耗积分。浏览器里的客户端（LobeChat 等）把源加进来即可；
+    // 设 ["*"] 可恢复旧的完全开放行为（不推荐）。
+    corsAllowOrigins: [],
     models: DEFAULT_MODELS,
     modelAliases: {},
   };
@@ -456,6 +490,35 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     fix('modelRoutes 必须是对象，已回退为 {}');
     cfg.modelRoutes = {};
   }
+  if (!isPlainObject(cfg.modelChains)) {
+    fix('modelChains 必须是对象（模型 → 候选数组），已回退为 {}');
+    cfg.modelChains = {};
+  }
+  // 聚合渠道（0.3.58）：providers 必须是数组；name 只允许 [A-Za-z0-9_-]（进模型 ID）、
+  // baseUrl 必须 http(s)、apiKeys 非空字符串数组；重名以后者为准（去重）
+  if (!isPlainObject(cfg.aggregate) || !Array.isArray(cfg.aggregate.providers)) {
+    fix('aggregate.providers 必须是数组，已回退为 []');
+    cfg.aggregate = { providers: [] };
+  } else if (cfg.aggregate.enabled !== undefined && typeof cfg.aggregate.enabled !== 'boolean') {
+    fix('aggregate.enabled 必须是布尔值，已回退为 true');
+    cfg.aggregate.enabled = true;
+  } else {
+    const seenNames = new Set();
+    const clean = [];
+    for (const p of cfg.aggregate.providers) {
+      if (!isPlainObject(p)) { fix('aggregate.providers 里有非对象项，已移除'); continue; }
+      const name = String(p.name ?? '').trim();
+      if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) { fix(`聚合渠道名 "${p.name}" 非法（只允许字母数字_-，≤32 字符），已移除`); continue; }
+      if (seenNames.has(name)) { fix(`聚合渠道 ${name} 重名，保留后一条`); }
+      const baseUrl = String(p.baseUrl ?? '').trim().replace(/\/+$/, '');
+      if (!/^https?:\/\/.+/.test(baseUrl)) { fix(`聚合渠道 ${name} 的 baseUrl 非法，已移除`); continue; }
+      const apiKeys = (Array.isArray(p.apiKeys) ? p.apiKeys : []).map((k) => String(k ?? '').trim()).filter(Boolean);
+      if (!apiKeys.length) { fix(`聚合渠道 ${name} 没有可用 key，已移除`); continue; }
+      seenNames.add(name);
+      clean.push({ name, baseUrl, apiKeys, enabled: p.enabled !== false });
+    }
+    cfg.aggregate.providers = clean;
+  }
   if (!isPlainObject(cfg.modelAliases)) {
     fix('modelAliases 必须是对象，已回退为 {}');
     cfg.modelAliases = {};
@@ -529,8 +592,8 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     if (typeof cfg.pool.switchSiteOnExhausted !== 'boolean') {
       cfg.pool.switchSiteOnExhausted = defaults.pool.switchSiteOnExhausted;
     }
-    if (!['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first'].includes(cfg.pool.policy)) {
-      fix(`pool.policy 必须是 expiry-first/balance-first/round-robin/pinned/free-first 之一（当前 ${JSON.stringify(cfg.pool.policy)}），已回退为 ${defaults.pool.policy}`);
+    if (!['expiry-first', 'balance-first', 'round-robin', 'pinned', 'free-first', 'sticky', 'balanced'].includes(cfg.pool.policy)) {
+      fix(`pool.policy 必须是 expiry-first/balance-first/round-robin/pinned/free-first/sticky/balanced 之一（当前 ${JSON.stringify(cfg.pool.policy)}），已回退为 ${defaults.pool.policy}`);
       cfg.pool.policy = defaults.pool.policy;
     }
     if (cfg.pool.pinnedAccountId !== undefined && cfg.pool.pinnedAccountId !== null && !isStr(cfg.pool.pinnedAccountId)) {
@@ -780,6 +843,20 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     }
   }
 
+  // ---- 模型端点跨域白名单：只接受字符串（含 "*"），其余剔除 ----
+  if (!Array.isArray(cfg.corsAllowOrigins)) {
+    fix('corsAllowOrigins 必须是数组，已回退为空（只允许本机同端口页面）');
+    cfg.corsAllowOrigins = [];
+  } else {
+    const list = cfg.corsAllowOrigins
+      .filter((x) => typeof x === 'string' && x.trim())
+      .map((x) => x.trim());
+    if (list.length !== cfg.corsAllowOrigins.length) {
+      fix('corsAllowOrigins 里存在非字符串项，已剔除');
+    }
+    cfg.corsAllowOrigins = list;
+  }
+
   // ---- 控制台访问 PIN（T23）：4-12 位数字；空值 = 关闭。写错类型回退关闭而不是锁死控制台 ----
   {
     const pin = cfg.consolePin;
@@ -875,6 +952,21 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
     if (!isStr(site) || !cfg.sites[site]) {
       fix(`modelRoutes.${model} 指向不存在的站点 "${site}"，已移除该路由`);
       delete cfg.modelRoutes[model];
+    }
+  }
+  // 模型链（0.3.56）：值必须是「非空字符串组成的数组」；含自身的链会打转，剔除自身项
+  for (const [model, list] of Object.entries(cfg.modelChains || {})) {
+    if (!Array.isArray(list) || list.length === 0) {
+      fix(`modelChains.${model} 必须是非空数组，已移除该链`);
+      delete cfg.modelChains[model];
+      continue;
+    }
+    const clean = [...new Set(list.map((x) => String(x ?? '').trim()))].filter((x) => x && x !== model).slice(0, 6);
+    if (clean.length === 0) {
+      fix(`modelChains.${model} 剔除空项/自身后没有有效候选，已移除该链`);
+      delete cfg.modelChains[model];
+    } else if (clean.length !== list.length) {
+      cfg.modelChains[model] = clean;
     }
   }
 

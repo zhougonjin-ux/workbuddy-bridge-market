@@ -15,7 +15,7 @@ import { handleResponses } from './src/responses.mjs';
 import { handleMessages, handleCountTokens } from './src/anthropic.mjs';
 import { queryCredit, supportsCreditQuery } from './src/upstream.mjs';
 import { handleConsoleApi } from './src/console-api.mjs';
-import { flushUsage } from './src/usage.mjs';
+import { flushUsage, recordRound, recordRoundFailure } from './src/usage.mjs';
 import { flushLearned } from './src/compress.mjs';
 import { flushEvents, recordEvent } from './src/events.mjs';
 import { flushPool } from './src/pool.mjs';
@@ -30,6 +30,12 @@ import { startBackupLoop, stopBackupLoop } from './src/backup.mjs';
 import { startDoctorLoop, stopDoctorLoop } from './src/doctor.mjs';
 import { importLocalAccounts, startLocalImportWatch, stopLocalImportWatch } from './src/localimport.mjs';
 import { startProviderConfigSync, stopProviderConfigSync, triggerProviderConfigSyncNow } from './src/pickersync.mjs';
+import { assertNodeVersion } from './src/runtime.mjs';
+import { isModelPath, hasSegments } from './src/pathmatch.mjs';
+
+// 版本守卫放在最前：Node 18 及以下会以「fetch 未定义」之类的形式炸在后面，
+// 用户根本联想不到是版本问题。
+assertNodeVersion();
 
 // 配置读不出来时要给出可读提示，而不是抛一串裸栈。
 // 尤其是 JSON 语法错误——用户手改 config.json 很容易漏个逗号。
@@ -200,6 +206,23 @@ function consoleOriginAllowed(req) {
   }
 }
 
+/**
+ * 模型端点（/v1/*）的跨域来源是否允许。
+ *
+ * 无 Origin：ZCode 桌面客户端 / curl / MCP —— 永远放行（它们不受 CORS 约束）。
+ * 有 Origin：本机同端口页面（控制台）或显式白名单；`corsAllowOrigins: ["*"]` 恢复旧行为。
+ * 为什么收紧：以前统一 ACAO:*，本机任意网页只要拿到 apiKey 就能借刀消耗积分。
+ */
+function corsAllowed(origin) {
+  if (!origin) return true;
+  const list = Array.isArray(cfg.corsAllowOrigins) ? cfg.corsAllowOrigins : [];
+  if (list.includes('*')) return true;
+  try {
+    if (isLocalServicePort(new URL(origin))) return true;
+  } catch { /* 非法 Origin 按不允许处理 */ }
+  return list.includes(origin);
+}
+
 /** 汇总各站点登录状态。 */
 function siteState(cfgIn) {
   return siteKeys(cfgIn).map((site) => {
@@ -245,39 +268,16 @@ let activeRequests = 0;
 /**
  * 判定一个路径是不是「模型调用」——只有这类请求算活跃请求（掐断它 = 用户会话断线）。
  *
- * 覆盖：OpenAI 兼容（/v1/*）、根路径的协议端点（Anthropic 与 responses 在根路径）、
- * 以及 GET /v1/models（客户端启动时拉模型列表，掐断等于会话连不上）。
- * 其余（/health、/console/**、/admin/**、/status 等后台与发现类接口）都不计入。
- *
- * 用「路径分段里出现连续匹配」而不是整串正则，与下方协议分派的 hasSeg 同一套口径 ——
- * 否则 TraeWork 那种 `/v1/messages/chat/completions` 的拼接写法会被漏判成非模型请求。
+ * 实现已抽到 src/pathmatch.mjs：主路由的协议分派要用同一套「连续路径段」口径，
+ * 两处各写一份必然漂移（TraeWork 会拼 /v1/messages/chat/completions）。
  */
-function isModelPath(pathname) {
-  if (pathname === '/health' || pathname === '/healthz') return false;
-  if (pathname.startsWith('/console') || pathname.startsWith('/admin')) return false;
-  if (pathname === '/status') return false;
-  const segs = pathname.split('/').filter(Boolean);
-  const hasSeg = (...want) => {
-    for (let i = 0; i + want.length <= segs.length; i++) {
-      let ok = true;
-      for (let j = 0; j < want.length; j++) {
-        if (segs[i + j] !== want[j]) { ok = false; break; }
-      }
-      if (ok) return true;
-    }
-    return false;
-  };
-  return (
-    hasSeg('models') ||
-    hasSeg('chat', 'completions') ||
-    hasSeg('completions') ||
-    hasSeg('messages') ||
-    hasSeg('responses') ||
-    hasSeg('embeddings')
-  );
-}
 
 const server = http.createServer(async (req, res) => {
+  // 请求 ID：用户报「某次请求失败」时给出这个短号，就能在 server.log 里精确定位。
+  // 响应头对所有请求可见，不额外增加日志量。
+  const rid = crypto.randomBytes(4).toString('hex');
+  res.setHeader('X-WB-Request-Id', rid);
+
   // Host 头含 URL 非法字符（空格、| 等）时 new URL 会抛 TypeError——
   // 包住并直接 400，否则请求处理器整体崩掉、socket 挂起（请求黑洞）。
   let url;
@@ -303,6 +303,13 @@ const server = http.createServer(async (req, res) => {
   if (isModelPath(pathname)) {
     activeRequests++;
     res.on('close', () => { activeRequests--; drainWaiters(); });
+    // 数据看板「轮次」（0.3.64，对齐 dsh-xdpool）：POST 到生成类端点 = 一次提问；
+    // models 列表与 count_tokens 探测不算。轮失败 = 给客户端回了 HTTP ≥400。
+    // SSE 信封错误对客户端仍是 200，不计轮失败（recordUsage 的 errors 已覆盖该口径）。
+    if (req.method === 'POST' && !/(^|\/)count_tokens(\/|$)/.test(pathname)) {
+      try { recordRound(); } catch { /* 统计失败不影响请求 */ }
+      res.on('close', () => { if (res.statusCode >= 400) { try { recordRoundFailure(); } catch { /* 同上 */ } } });
+    }
   }
 
   const isConsolePath = pathname === '/console' || pathname.startsWith('/console/');
@@ -325,10 +332,17 @@ const server = http.createServer(async (req, res) => {
     res.setHeader('X-Frame-Options', 'DENY');
     res.setHeader('Content-Security-Policy', "frame-ancestors 'none'");
   } else {
-    // 对话接口需要跨域（浏览器内的客户端），保持原有宽松策略
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Headers', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    // 对话接口的跨域：默认只对本机同端口页面 + 白名单放行。
+    // 不白名单时「不发 ACAO 头」——浏览器读不到响应，但非浏览器客户端（无 Origin）不受影响。
+    const origin = req.headers.origin;
+    if (origin) {
+      res.setHeader('Vary', 'Origin');
+      if (corsAllowed(origin)) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+        res.setHeader('Access-Control-Allow-Headers', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+      }
+    }
   }
   if (req.method === 'OPTIONS') {
     res.writeHead(204);
@@ -500,7 +514,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (!authorized(req)) {
-      warn(`未授权的请求被拒绝：${req.method} ${pathname} key=${clientKey(req).slice(0, 6)}…`);
+      warn(`[${rid}] 未授权的请求被拒绝：${req.method} ${pathname} key=${clientKey(req).slice(0, 6)}…`);
       return sendError(res, 401, 'API Key 不正确：请在请求头携带 Authorization: Bearer <config.json 里的 apiKey>', 'invalid_api_key');
     }
 
@@ -627,17 +641,9 @@ const server = http.createServer(async (req, res) => {
     //
     // 注：GET /v1/models 已在上面「免鉴权发现类接口」处提前处理，此处不再重复判断。
     const segs = pathname.split('/').filter(Boolean);
-    const hasSeg = (...want) => {
-      // 在 segments 里找连续匹配 want 的位置
-      for (let i = 0; i + want.length <= segs.length; i++) {
-        let ok = true;
-        for (let j = 0; j < want.length; j++) {
-          if (segs[i + j] !== want[j]) { ok = false; break; }
-        }
-        if (ok) return true;
-      }
-      return false;
-    };
+    // 与 isModelPath 共用 pathmatch.mjs 的同一实现：这里曾经各写一份，口径一漂移
+    // 就会出现「模型请求被当成后台请求」（重启时掐断会话）这类事故。
+    const hasSeg = (...want) => hasSegments(segs, ...want);
     const isCountTokens =
       req.method === 'POST' && (hasSeg('count_tokens') || hasSeg('count-tokens'));
     const isChat = req.method === 'POST' && hasSeg('chat', 'completions');
@@ -673,7 +679,7 @@ const server = http.createServer(async (req, res) => {
       return out;
     }
 
-    warn(`收到未知路径请求：${req.method} ${pathname}（可选路径见 GET /）`);
+    warn(`[${rid}] 收到未知路径请求：${req.method} ${pathname}（可选路径见 GET /）`);
     return sendError(
       res,
       404,
@@ -690,9 +696,9 @@ const server = http.createServer(async (req, res) => {
       // 这既不是服务故障，也没人在等结果。之前按 status>=500 记成
       // ERROR「处理失败」，会把人引向错误方向（看起来像程序坏了）。
       // 客户端超时/取消时这条很常见，降级为 WARN 并写清真实原因。
-      warn(`${req.method} ${pathname} 客户端已断开，上游请求已中止（不是服务故障）`);
+      warn(`[${rid}] ${req.method} ${pathname} 客户端已断开，上游请求已中止（不是服务故障）`);
     } else if (status >= 500) {
-      error(`${req.method} ${pathname} 处理失败：`, e.stack || e.message);
+      error(`[${rid}] ${req.method} ${pathname} 处理失败：`, e.stack || e.message);
     }
     // 响应已断开就别再写了（对端已销毁，写入没有意义）
     // e.type 一并带出去：T37 的预算拦截要靠它让客户端认出「预算超限」而不是
@@ -825,3 +831,4 @@ process.on('SIGINT', () => {
   });
 });
 process.on('unhandledRejection', (e) => error('未处理的 Promise 异常：', e));
+process.on('uncaughtException', (e) => error('未处理的同步异常（进程保活）：', e)); // 0.3.61：会话依赖本服务，崩了断线；记录但绝不退出

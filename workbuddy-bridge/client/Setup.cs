@@ -1,4 +1,8 @@
-// WorkBuddy 积分桥 · 安装/卸载向导（0.3.45）
+// WorkBuddy 积分桥 · 安装/卸载向导
+//
+// 版本号不再硬编码：构建时由 build.cmd 从 server/package.json 生成 version.txt，
+// 运行时读它；开发/便携结构下回落到 ../server/package.json。
+// （历史事故：这里曾写死 0.3.45，而插件已到 0.3.66，用户以为没更新。）
 //
 // 双模式：默认 = 安装向导；`--uninstall` = 卸载（控制面板「应用和功能」的
 // UninstallString 也指向本 exe 加该参数）。
@@ -22,7 +26,7 @@ static class SetupProgram
     const string RegRun = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
     const string ExeName = "WorkBuddyBridgeTray.exe";
 
-    static string version = "0.3.45";
+    static string version = "0.0.0";
     static string sourceDir;   // Setup.exe 所在目录（托盘 exe 的来源）
     static string serverDir;   // 探测到的服务目录
     static string installDir;  // 目标安装目录
@@ -31,7 +35,6 @@ static class SetupProgram
     static CheckBox autoRunCheck;
     static Button goButton;
     static Label logLabel;
-    static Panel pagePanel;
 
     [STAThread]
     static void Main(string[] args)
@@ -73,15 +76,39 @@ static class SetupProgram
         Application.Run(new WizardForm());
     }
 
+    /** 版本号读取顺序：version.txt（build.cmd 生成）→ ../server/package.json（便携/开发结构）→ 0.0.0。
+     *  不硬编码：版本唯一事实源是 workbuddy-bridge/server/package.json。 */
     static string ReadOwnVersion()
     {
         try
         {
             string marker = Path.Combine(sourceDir, "version.txt");
-            if (File.Exists(marker)) return File.ReadAllText(marker).Trim();
+            if (File.Exists(marker))
+            {
+                string v = File.ReadAllText(marker).Trim();
+                if (v.Length > 0) return v;
+            }
         }
         catch { }
-        return "0.3.45";
+        try
+        {
+            string pkg = Path.GetFullPath(Path.Combine(sourceDir, "..", "server", "package.json"));
+            if (File.Exists(pkg))
+            {
+                string text = File.ReadAllText(pkg);
+                string key = "\"version\"";
+                int i = text.IndexOf(key);
+                if (i >= 0)
+                {
+                    int c = text.IndexOf(':', i + key.Length);
+                    int q1 = c >= 0 ? text.IndexOf('"', c + 1) : -1;
+                    int q2 = q1 >= 0 ? text.IndexOf('"', q1 + 1) : -1;
+                    if (q1 >= 0 && q2 > q1) return text.Substring(q1 + 1, q2 - q1 - 1).Trim();
+                }
+            }
+        }
+        catch { }
+        return "0.0.0";
     }
 
     /** 服务目录探测：ZCode 插件缓存里内容版本最高的 server → 本包便携结构 ../server → null（向导里手选）。

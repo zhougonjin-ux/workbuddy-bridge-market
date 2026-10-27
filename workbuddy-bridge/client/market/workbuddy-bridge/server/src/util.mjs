@@ -17,7 +17,9 @@ export function writeJsonFileAtomic(file, data, { mode } = {}) {
   // 并发写同一文件会互相截断，交错内容被 rename 成正式文件——账号池会整站损坏。
   // 唯一名 + 同目录 rename 原子替换，把「跨进程并发写」也变成安全的。
   const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  const opts = mode ? { encoding: 'utf8', mode } : 'utf8';
+  // 默认 0600：config.json / 账号池 / 凭证里都是上游 token 与 apiKey。
+  // Windows 上 chmod 位基本不生效（用户目录 ACL 已限制到本人），但 Unix 侧不该裸奔。
+  const opts = { encoding: 'utf8', mode: mode ?? 0o600 };
   try {
     fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', opts);
     fs.renameSync(tmp, file);
@@ -176,4 +178,31 @@ export async function withRetryOnce(fn, { backoffMs = 1500 } = {}) {
     if (backoffMs > 0) await new Promise((r) => setTimeout(r, backoffMs));
     return fn();
   }
+}
+
+/**
+ * 有限并发 map：保持结果顺序，最多 limit 个任务同时进行。
+ *
+ * 用途：积分明细刷新、任务巡检这类「N 个账号逐个打上游」的循环。
+ * 全串行时 10 个账号首轮要 40s+，控制台长时间显示「—」；全并发又会打爆
+ * 上游最紧的计费端点。3 左右是实测比较稳的档位（由调用方决定）。
+ *
+ * 注意：fn 抛错会让正在跑的任务全部中断（Promise.all 语义）。批量任务里
+ * 应自行 try/catch 并把失败结果放进返回值——调用方要的是「每个账号的结果」，
+ * 不是「第一个异常」。
+ */
+export async function mapLimit(items, limit, fn) {
+  const list = Array.isArray(items) ? items : [];
+  const width = Math.max(1, Math.min(Math.floor(Number(limit) || 1), list.length || 1));
+  const out = new Array(list.length);
+  let next = 0;
+  const worker = async () => {
+    while (true) {
+      const i = next++;
+      if (i >= list.length) return;
+      out[i] = await fn(list[i], i);
+    }
+  };
+  await Promise.all(Array.from({ length: width }, worker));
+  return out;
 }

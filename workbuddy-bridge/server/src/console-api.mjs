@@ -38,6 +38,7 @@ import { weeklyTick } from './weekly.mjs';
 import { burnoutReport, predictAccount } from './burnout.mjs';
 import { recentDailyCreditAvg } from './usage.mjs';
 import { checkForUpdate } from './updatecheck.mjs';
+import { onboardingStatus } from './onboarding.mjs';
 import { runDiagnostics, startDoctorLoop } from './doctor.mjs';
 import { flushLearned } from './compress.mjs';
 import { flushEvents } from './events.mjs';
@@ -433,6 +434,11 @@ export async function handleConsoleApi(ctx) {
     const r = setPolicy(cfg, { policy: body.policy, pinnedAccountId: body.pinnedAccountId });
     return sendJson(res, r.ok ? 200 : 400, r);
   }
+  // ---- 首次使用向导：逻辑在 src/onboarding.mjs（纯函数可单测，只读不改配置）----
+  if (p === '/onboarding' && method === 'GET') {
+    return sendJson(res, 200, onboardingStatus(cfg));
+  }
+
   if (p === '/bridge' && method === 'GET') {
     // B3：轮询通道（20s 一次）同样脱敏。此前只有 SSE 通道 redact，这个接口每 20 秒
     // 把两个账号的 accessToken/refreshToken 明文发给浏览器——前端对这两个字段零消费
@@ -487,6 +493,18 @@ export async function handleConsoleApi(ctx) {
   if (p === '/tasks/config' && method === 'POST') {
     const body = ctx.body || {};
     const enabledBefore = cfg.tasks.enabled !== false;
+    // 合规确认（一次性）：自动签到/代打走非官方接口，README 已声明 ToS/封号风险，
+    // 但控制台里点一下就开始跑、没有任何提示 —— 这里把决策显式交给用户。
+    // 只在「从关到开」时要求确认；老用户改时点/开关分类不会被拦。
+    const enabling = body.enabled === true && !enabledBefore;
+    if (enabling && cfg.tasks.riskAccepted !== true && body.riskAccepted !== true) {
+      return sendJson(res, 409, {
+        ok: false,
+        code: 'risk_required',
+        error: 'RISK_REQUIRED 自动任务会用非官方接口代替你签到/领奖/代打，可能违反 WorkBuddy 服务条款并带来封号风险。确认后才会开启。',
+      });
+    }
+    if (body.riskAccepted === true) cfg.tasks.riskAccepted = true;
     const parseTimes = (v) => String(v ?? '')
       .split(/[,，;；\s]+/)
       .map((s) => s.trim())

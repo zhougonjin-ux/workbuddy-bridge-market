@@ -8,6 +8,10 @@
 import { loadConfig, primaryKey } from '../server/src/config.mjs';
 import { readFileSync } from 'node:fs';
 import { ensureProxyRunning } from '../server/src/autostart.mjs';
+import { assertNodeVersion } from '../server/src/runtime.mjs';
+
+// 版本不符时给 ZCode 的用户一条明确提示（走 stderr，stdout 只留协议帧）。
+assertNodeVersion();
 
 // 版本号以 server/package.json 为唯一事实源（serverInfo 版本号会报告给客户端）。
 // 曾硬编码 '0.1.0' 而 server 已是 0.3.2，两端版本号对不上。
@@ -91,13 +95,21 @@ const fmtDate = (t) => {
   return `${d.toLocaleDateString()}（${days <= 0 ? '已到期' : `${days} 天后`}）`;
 };
 
-function renderBridge(b, { planOnly = false } = {}) {
+/**
+ * 桥接状态排版。
+ *
+ * 默认只给「账号级」汇总：模型上下文比控制台屏幕宝贵得多，10 个账号 × 3 个
+ * 积分批次就是 30+ 行；需要核对每一批到期时间时再传 detail:true。
+ */
+function renderBridge(b, { planOnly = false, detail = false, site = null } = {}) {
   const lines = [];
   if (!planOnly) {
     lines.push(`调度策略：${b.policy}${b.policy === 'pinned' ? `（固定账号 ${b.pinnedAccountId || '未设置'}）` : ''}`);
     lines.push(`积分明细刷新：每 ${b.creditRefreshMinutes} 分钟 | 自动任务：${b.tasks?.enabled === false ? '关' : `开（签到 ${b.tasks?.checkin !== false ? '开' : '关'} / 成长任务 ${b.tasks?.growth !== false ? '开' : '关'}）`}`);
   }
-  for (const s of b.sites || []) {
+  const sites = (b.sites || []).filter((s) => !site || s.site === site);
+  if (!sites.length) return `没有匹配的站点${site ? `：${site}` : ''}（wb_models 可看站点列表）。`;
+  for (const s of sites) {
     lines.push('');
     lines.push(`■ ${s.site}  ${s.label}`);
     if (!s.accounts.length) {
@@ -109,10 +121,20 @@ function renderBridge(b, { planOnly = false } = {}) {
       const mark = row.exhausted ? ' [额度耗尽]' : a.enabled === false ? ' [已禁用]' : '';
       lines.push(`  · ${row.label}${mark}`);
       lines.push(`      余额：${row.remain === null ? '未知（还没刷新过）' : row.remain}   最早到期：${fmtDate(row.earliestExpiry)}`);
-      for (const bt of row.batches || []) {
-        lines.push(`      - ${bt.package || '积分包'}：余 ${bt.remain}，${bt.expireAt ? '到期 ' + fmtDate(bt.expireAt) : '无到期信息'}`);
+      const batches = row.batches || [];
+      if (detail) {
+        for (const bt of batches) {
+          lines.push(`      - ${bt.package || '积分包'}：余 ${bt.remain}，${bt.expireAt ? '到期 ' + fmtDate(bt.expireAt) : '无到期信息'}`);
+        }
+      } else if (batches.length) {
+        lines.push(`      · ${batches.length} 个积分批次（加 detail:true 查看每批到期时间）`);
       }
     }
+  }
+  // 兜底截断：上游或配置异常导致账号/批次爆炸时，别把整段上下文塞满
+  const MAX_LINES = 120;
+  if (lines.length > MAX_LINES) {
+    return `${lines.slice(0, MAX_LINES).join('\n')}\n… 已截断 ${lines.length - MAX_LINES} 行（用 site 过滤或 detail:false 看摘要）`;
   }
   return lines.join('\n');
 }
@@ -139,15 +161,34 @@ function renderTasks(t) {
 const TOOLS = [
   {
     name: 'wb_status',
-    description: '查看 WorkBuddy 桥接状态：所有账号的积分余额、每批积分的到期时间、当前调度策略。查询积分/到期情况时用它。',
-    inputSchema: { type: 'object', properties: {} },
-    run: async (cfg) => renderBridge(await callLocal(cfg, '/admin/bridge')),
+    description: '查看 WorkBuddy 桥接状态：账号级积分余额、最早到期时间、当前调度策略。默认是摘要；要逐批核对到期时间时传 detail:true。查询积分/到期情况时用它。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        detail: { type: 'boolean', description: 'true=展开每个积分批次的余额与到期时间（默认只看账号级汇总，输出更短）' },
+        site: { type: 'string', description: '只看某个站点（如 cn-cli / codearts），默认全部' },
+      },
+    },
+    run: async (cfg, args) => renderBridge(await callLocal(cfg, '/admin/bridge'), {
+      detail: args?.detail === true,
+      site: args?.site ? String(args.site) : null,
+    }),
   },
   {
     name: 'wb_credit_plan',
-    description: '查看积分建议消耗顺序（按最早到期时间排序的账号/积分包列表）。只关心先用哪个积分时用它。',
-    inputSchema: { type: 'object', properties: {} },
-    run: async (cfg) => renderBridge(await callLocal(cfg, '/admin/bridge'), { planOnly: true }),
+    description: '查看积分建议消耗顺序（按最早到期时间排序的账号/积分包列表）。只关心先用哪个积分时用它；detail:true 展开每批明细。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        detail: { type: 'boolean', description: 'true=展开每个积分批次' },
+        site: { type: 'string', description: '只看某个站点，默认全部' },
+      },
+    },
+    run: async (cfg, args) => renderBridge(await callLocal(cfg, '/admin/bridge'), {
+      planOnly: true,
+      detail: args?.detail === true,
+      site: args?.site ? String(args.site) : null,
+    }),
   },
   {
     name: 'wb_switch',

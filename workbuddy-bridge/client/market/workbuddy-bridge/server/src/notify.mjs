@@ -1,14 +1,16 @@
 // 通知（T11 桌面气泡 + T33 外部通道）：签到失败 / 猫猫归来 / 账号登录态失效 /
 // 预算预警这类「不看控制台就错过」的事，弹一个系统 toast，并可同时推到手机。
 //
-// 桌面气泡实现：零依赖，走 Windows 自带的 PowerShell + System.Windows.Forms.NotifyIcon
-// 气泡通知（Win10/11 均可用，无需 BurntToast 模块）。要点：
+// 桌面气泡实现：零依赖。Windows 走自带的 PowerShell + NotifyIcon；macOS 走
+// osascript（display notification）；Linux 走 notify-send（libnotify）。
+// 要点：
 //   - spawn 分离进程（detached + unref），通知的生命周期不占本服务，也不阻塞调用方；
 //   - 参数经 stdin 传 JSON（命令行传中文在 cmd/chcp 65001 之外的终端会乱码）；
 //   - 全程吞错：通知是锦上添花，绝不能绊倒任务主流程；
 //   - 节流：同一 key（如 "account-401-acc_x"）5 分钟内只弹一次，防止上游持续 401
 //     时每 30 秒积分刷新都弹一遍。
-// 非 Windows 平台静默跳过；notify.enabled=false（config）关闭桌面气泡。
+// 其他平台静默跳过；notify.enabled=false（config）关闭桌面气泡。
+// 点击气泡直达控制台仅 Windows 支持（macOS/Linux 的通知中心没有等价回调）。
 //
 // T33 外部通道：同一条通知并行分发到 config.notify.channels 里的
 // webhook / bark / serverchan，用途是「人不在电脑前也能收」（配合 T38 手机端控制台）。
@@ -19,6 +21,12 @@ import { log, warn } from './log.mjs';
 const THROTTLE_MS = 5 * 60_000;
 const lastFired = new Map(); // key → 时间戳
 let psBusy = false;          // 上一条通知还没吐完时丢弃新的（气泡本来就最多同屏几条）
+const DESKTOP_PLATFORMS = new Set(['win32', 'darwin', 'linux']);
+
+/** 平台是否支持桌面气泡（外部通道不受此限制）。 */
+export function desktopNotifySupported(platform = process.platform) {
+  return DESKTOP_PLATFORMS.has(platform);
+}
 
 /** 纯函数便于单测：节流判断 + 过期键清理。 */
 export function shouldNotify(key, now = Date.now(), store = lastFired) {
@@ -37,8 +45,7 @@ export function rollbackNotify(key, store = lastFired) {
   store.delete(key);
 }
 
-function firePS(title, text, url = '') {
-  if (process.platform !== 'win32') return false;
+function fireWindows(title, text, url = '') {
   if (psBusy) return false;
   psBusy = true;
   try {
@@ -76,6 +83,53 @@ $n.Dispose()
   }
 }
 
+/** macOS：osascript 一行 AppleScript。文本里的双引号/反斜杠必须转义，否则脚本语法错误。 */
+function fireDarwin(title, text) {
+  if (psBusy) return false;
+  psBusy = true;
+  const esc = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  try {
+    const script = `display notification "${esc(text)}" with title "${esc(title)}"`;
+    const child = spawn('osascript', ['-e', script], { detached: true, stdio: 'ignore' });
+    child.on('error', () => { psBusy = false; });
+    child.on('exit', () => { psBusy = false; });
+    child.unref?.();
+    return true;
+  } catch (e) {
+    psBusy = false;
+    warn('桌面通知发送失败：', e.message);
+    return false;
+  }
+}
+
+/** Linux：notify-send（libnotify）。桌面环境没装就静默失败，外部通道仍可用。 */
+function fireLinux(title, text) {
+  if (psBusy) return false;
+  psBusy = true;
+  try {
+    const child = spawn('notify-send', ['-a', 'WorkBuddy Bridge', '-t', '8000', String(title), String(text)], {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.on('error', () => { psBusy = false; });
+    child.on('exit', () => { psBusy = false; });
+    child.unref?.();
+    return true;
+  } catch (e) {
+    psBusy = false;
+    warn('桌面通知发送失败：', e.message);
+    return false;
+  }
+}
+
+/** 按平台分派；不支持的平台直接返回 false（调用方会回滚节流窗口）。 */
+function fireDesktop(title, text, url = '') {
+  if (process.platform === 'win32') return fireWindows(title, text, url);
+  if (process.platform === 'darwin') return fireDarwin(title, text);
+  if (process.platform === 'linux') return fireLinux(title, text);
+  return false;
+}
+
 /**
  * 发一条通知：桌面气泡（T11）+ 外部通道（T33）并行。
  * key 相同的 5 分钟内只发一次（两个通道各自独立节流）；
@@ -86,12 +140,12 @@ $n.Dispose()
  * 放在后面会被 `process.platform !== 'win32'` 提前 return 吃掉。
  * 反过来节流也不能共用 key——气泡用裸 key，通道用 `ch-<type>-` 前缀，各走各的表。
  */
-export function notify(cfg, title, text, { key = null, force = false, _fire = firePS } = {}) {
+export function notify(cfg, title, text, { key = null, force = false, _fire = fireDesktop } = {}) {
   if (cfg?.notify?.enabled === false) return false;
   // 通道投递是 fire-and-forget，异常已在内部吞掉
   try { notifyChannels(cfg, title, text, { key, force }); } catch { /* 旁观者不绊倒主流程 */ }
   try {
-    if (process.platform !== 'win32') return false;
+    if (!desktopNotifySupported()) return false;
     if (!force && key && !shouldNotify(key)) return false;
     // T68 气泡点击直达控制台：URL 由 cfg 现算，调用方零改动；port 缺省回落 8788，
     // host 不参与构造——本机浏览器访问 127.0.0.1 永远可达（host 可能是 0.0.0.0）

@@ -1,0 +1,9 @@
+# 依赖（本项目运行时零依赖，仅防误提交）
+node_modules/
+
+# 构建/诊断临时文件
+.tmp-*
+*.log
+
+# 桌面客户端构建产物：版本号由 build.cmd 从 server/package.json 生成，不入库
+workbuddy-bridge/client/version.txt

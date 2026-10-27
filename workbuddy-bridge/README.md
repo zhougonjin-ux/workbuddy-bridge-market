@@ -16,8 +16,9 @@
 
 ## 0. 前置条件
 
-- **Node.js 18 或更高版本（硬前置）** —— 代理服务、MCP 服务器、启动钩子全部以 `node` 命令拉起，
+- **Node.js 20 或更高版本（硬前置）** —— 代理服务、MCP 服务器、启动钩子全部以 `node` 命令拉起，
   ZCode 桌面端**不自带 Node**，没装的话插件装了也起不来。先确认 `node -v` 有输出。
+  （Node 18 已于 2025-04 结束维护，服务启动时会直接提示升级，而不是抛一串 API 报错。）
 - ZCode 桌面端。
 - 一个 WorkBuddy / CodeBuddy **国内版**账号（`cn-cli` 站点）。
 
@@ -61,6 +62,18 @@ Git LFS 等特殊情况才回退到 `git clone`）。
   第 4 步要用它。
 - 端口默认 `8788`，被占用时改数据目录 `config.json` 里的 `port`（会话钩子会读它）。
 - 关闭自动拉起：在数据目录放 `autostart.json` 内容 `{"enabled": false}`
+- **不知道下一步？** 控制台首页顶部有一条「开始使用」清单：Node 版本、账号、选择器接入、
+  API Key 四项自动检测，缺哪项点「去处理」直接跳到对应页；全部完成后自动隐藏。
+
+### 平台支持
+
+| 能力 | Windows | macOS | Linux |
+|---|---|---|---|
+| 代理 / 控制台 / MCP / 扫码登录 | ✅ | ✅ | ✅ |
+| 桌面气泡通知 | ✅ | ✅（osascript） | ✅（notify-send，需 libnotify） |
+| 点击气泡打开控制台 | ✅ | — | — |
+| 开机自启 | ✅（计划任务） | 手动 launchd | 手动 systemd --user |
+| 托盘客户端 / 安装器 | ✅ | — | — |
 
 ## 3. 添加 WorkBuddy 账号（多账户）
 
@@ -114,6 +127,16 @@ ZCode 自带 OpenAI 兼容探活的（`GET /v1/models`）无需鉴权也能同�
 **`/wbp-startup install`** 注册登录自启（Windows 计划任务，免管理员），之后代理常驻、
 ZCode 会话钩子检测到存活不会重复拉起。`/wbp-startup remove` 卸载，`/wbp-startup status` 查看状态。
 
+## 4.6 安全边界（默认值，可按需放宽）
+
+- 只监听 `127.0.0.1`；控制台要求同端口来源（防 DNS rebinding、防任意网页读走页面内 token）。
+- 模型接口跨域默认只允许「本机同端口页面 + 白名单」。ZCode 等桌面客户端**不带 Origin**，
+  不受影响；浏览器里的客户端（LobeChat 等）把源加进 `config.json → corsAllowOrigins`
+  （如 `["http://localhost:3210"]`），或设 `["*"]` 恢复旧的完全开放行为。
+- 配置/账号池文件默认 `0600`（Unix）；Windows 依赖用户目录 ACL。
+- 控制台可设 PIN（`consolePin`），连续失败 20 次后拒绝尝试（重启服务重置）。
+- 每个响应头带 `X-WB-Request-Id`：报障时提供这个短号，就能在 `server.log` 里精确定位。
+
 ## 5. 积分到期优先调度（核心）
 
 - 后台每 30 分钟（`creditRefreshMinutes` 可调）刷新每个账号的积分批次明细，
@@ -127,6 +150,8 @@ ZCode 会话钩子检测到存活不会重复拉起。`/wbp-startup remove` 卸�
 | `round-robin` | 最久未用的先用（原上游代理默认） |
 | `free-first` | 优先走 0 倍率（免费）模型，没有免费模型时回落到原行为 |
 | `pinned` | 固定用 `pool.pinnedAccountId` 指定的账号，不可用时回落 expiry-first |
+| `sticky` | 同一对话（按首条 user 消息识别）钉死同一账号，保住上游 prompt cache；30 分钟无活动自动解除 |
+| `balanced` | 按「闲置时长」加权随机，长期把消耗均摊到各账号 |
 
 - 所有策略下：额度耗尽（429/余额 0）与连续失败的账号都会被自动跳过并冷却，对话不中断。
 - **边界**：单个账号内部先扣哪批积分由腾讯服务端决定，无法干预；本插件控制的是
@@ -164,7 +189,10 @@ ZCode 会话钩子检测到存活不会重复拉起。`/wbp-startup remove` 卸�
 - **每日数据备份**、**每周用量周报**（可配通知推送）。
 - 时点到了但当时机器没开机？下次启动会**自动补跑**当天错过的任务（体检同样补跑）。
 - 首次触发带随机延迟（`tasks.jitterMinutes`，默认 30 分钟内）避开整点高峰。
-- 通知走 Windows 气泡（仅 Windows，**点击气泡直达控制台**）或 Webhook / Bark / Server酱 / 飞书 / 钉钉 / Telegram。
+- **首次开启自动任务会弹一次风险确认**（ToS / 封号），确认结果记在 `config.json → tasks.riskAccepted`；
+  只想当纯代理用就保持 `tasks.enabled: false`，不跑任何自动化。
+- 通知走系统桌面气泡（Windows / macOS / Linux；**点击气泡直达控制台仅 Windows**）
+  或 Webhook / Bark / Server酱 / 飞书 / 钉钉 / Telegram。
 - 总开关：`config.json → tasks.enabled`；分类开关 `tasks.checkin` / `tasks.growth`。
 - 手动执行：`wb_tasks_run` 工具、`/console` 按钮；查状态：`wb_tasks_status` 或 `/console`。
 
@@ -189,7 +217,7 @@ MCP 服务器 `workbuddy-bridge`（装好插件自动连接）提供 13 个工�
 `wb_tasks_status` · `wb_task_play`（成长任务单任务代打/领奖）· `wb_travel_patrol`（猫猫旅行巡逻）·
 `wb_recent_requests`（最近请求明细与速度）
 
-斜杠命令：`/wbp`（会话内总览面板，免浏览器）· `/wbp-start` · `/wbp-status` · `/wbp-switch` · `/wbp-login` · `/wbp-import` · `/wbp-console`（客户端内置浏览器打开管理台）· `/wbp-doctor`（自检诊断）· `/wbp-startup`（开机自启）
+斜杠命令（`commands/` 目录，共 11 个）：`/wbp`（会话内总览面板，免浏览器）· `/wbp-start` · `/wbp-status` · `/wbp-switch` · `/wbp-login` · `/wbp-import` · `/wbp-console`（客户端内置浏览器打开管理台）· `/wbp-doctor`（自检诊断）· `/wbp-startup`（开机自启）· `/wbp-tray`（桌面托盘客户端）· `/wbp-build`（构建桌面客户端）
 
 管理 API（本机 + apiKey）：`GET /admin/bridge` · `POST /admin/policy` ·
 `POST /admin/credit/refresh` · `GET /admin/tasks` · `POST /admin/tasks/run`
@@ -198,8 +226,16 @@ MCP 服务器 `workbuddy-bridge`（装好插件自动连接）提供 13 个工�
 
 ```bash
 cd <插件目录>/server
-npm test        # 单元测试（178 项）
+npm test        # 单元测试（当前 257 项；数量以实际输出为准，不在文档里写死）
 npm run smoke   # 冒烟测试（自带临时目录隔离）
+```
+
+仓库根目录还有一组零依赖校验（CI 全跑）：
+
+```bash
+npm run lint       # 全部 .js/.mjs 语法检查（含控制台前端）
+npm run coverage   # 覆盖率（Node 内置；当前约 55% 行 / 71% 分支）
+npm run verify     # 语法 + 单测 + 发布物一致性 + 文档清单一致性
 ```
 
 > ⚠️ **只跑 `npm test` / `npm run smoke`，不要裸跑 `node --test`**（会连 `*.smoke.mjs`
@@ -211,7 +247,24 @@ npm run smoke   # 冒烟测试（自带临时目录隔离）
 
 - 代理核心移植自开源项目 [workbuddy-openai-proxy](https://github.com/yuan240324/workbuddy-openai-proxy)
   （MIT License，见 `server/LICENSE.third-party`），在其账号池基础上新增：
-  积分到期解析（`src/expiry.mjs`）、四种调度策略、积分明细后台刷新、自动签到/成长任务
+  积分到期解析（`src/expiry.mjs`）、七种调度策略、积分明细后台刷新、自动签到/成长任务
   （`src/tasks.mjs`，端点口径参考 [workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)）、
   `/admin/*` 管理面与 ZCode 插件集成。
 - 仅限本机使用：默认只监听 `127.0.0.1`，API Key 存于数据目录，绝不外发。
+
+## 11. 维护与发布（给贡献者）
+
+**版本号只有一个事实源**：`workbuddy-bridge/server/package.json` 的 `version`。
+`plugin.json`、两份 `marketplace.json`、安装器 `version.txt` 都以它为准，不要再手改。
+
+```bash
+# 仓库根目录（workbuddy-bridge-market）
+npm run build:market   # 重建离线市场副本 + 市场清单 + 根 README
+npm run check:market   # 只校验（CI 用）：副本/清单/README 与源码不一致则退出码 1
+npm run verify         # 单元测试 + 发布物一致性，发布前跑这一个就够
+npm run test           # 等价于 workbuddy-bridge/server 下的 npm test
+```
+
+改完源码**不要手工复制** `client/market`，也不要单独编辑根 `README.md`
+（它是 `workbuddy-bridge/README.md` 的副本，由构建脚本覆盖）。这两处曾是
+「源码 0.3.66、离线副本 0.3.46、安装器 0.3.45」的事故来源。

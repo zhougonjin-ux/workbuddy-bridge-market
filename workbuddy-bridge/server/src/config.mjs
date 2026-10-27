@@ -337,6 +337,12 @@ export function defaultConfig() {
     // 服务端校验通过才发会话 token（token 只存内存，重启后重新输一次）。
     // null/空串 = 不启用（默认，保持原有「本机即信任」行为）。
     consolePin: null,
+    // 模型端点（/v1/*）的跨域来源白名单。
+    // 默认 [] = 只允许「本机同端口页面」；ZCode 等桌面客户端不带 Origin，不受影响。
+    // 风险背景：以前统一 ACAO:*，本机任意网页（含恶意 npm 包的本地 UI）只要拿到
+    // apiKey 就能借刀消耗积分。浏览器里的客户端（LobeChat 等）把源加进来即可；
+    // 设 ["*"] 可恢复旧的完全开放行为（不推荐）。
+    corsAllowOrigins: [],
     models: DEFAULT_MODELS,
     modelAliases: {},
   };
@@ -835,6 +841,20 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
         cfg.rateLimit[k] = defaults.rateLimit[k];
       }
     }
+  }
+
+  // ---- 模型端点跨域白名单：只接受字符串（含 "*"），其余剔除 ----
+  if (!Array.isArray(cfg.corsAllowOrigins)) {
+    fix('corsAllowOrigins 必须是数组，已回退为空（只允许本机同端口页面）');
+    cfg.corsAllowOrigins = [];
+  } else {
+    const list = cfg.corsAllowOrigins
+      .filter((x) => typeof x === 'string' && x.trim())
+      .map((x) => x.trim());
+    if (list.length !== cfg.corsAllowOrigins.length) {
+      fix('corsAllowOrigins 里存在非字符串项，已剔除');
+    }
+    cfg.corsAllowOrigins = list;
   }
 
   // ---- 控制台访问 PIN（T23）：4-12 位数字；空值 = 关闭。写错类型回退关闭而不是锁死控制台 ----

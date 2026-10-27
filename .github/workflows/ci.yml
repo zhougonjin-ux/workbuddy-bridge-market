@@ -1,0 +1,32 @@
+name: CI
+
+# 只做两件事，但都是「用户会真实踩到」的：
+#   1) 单元测试全绿
+#   2) 发布物与源码一致（离线市场副本 / 市场清单 / 根 README）
+# 历史事故：client/market 停在 0.3.46、安装器停在 0.3.45，而源码已 0.3.66。
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 语法检查
+        run: npm run lint
+
+      - name: 单元测试
+        run: npm test
+
+      - name: 发布物一致性
+        run: npm run check:market
+
+      - name: 文档清单一致性
+        run: npm run check:docs

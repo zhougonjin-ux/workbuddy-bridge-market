@@ -5,8 +5,9 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getAuth, ensureToken } from './auth.mjs';
-import { markSuccess, markFailure, isQuotaError, isRateLimitError, usableCount, listModelCooldownAccounts, stickyKeyOf } from './pool.mjs';
+import { ensureToken } from './auth.mjs';
+import { markSuccess, markFailure, isQuotaError, isRateLimitError, usableCount, listModelCooldownAccounts, stickyKeyOf, listAccounts } from './pool.mjs';
+import { recordRecovered, recordUpstreamCall } from './usage.mjs';
 import {
   fitMessages,
   estimateMessages,
@@ -285,9 +286,23 @@ export function dumpRejectedBody(status, text, payload) {
     fs.mkdirSync(dir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const file = path.join(dir, `rejected-${stamp}.json`);
+    // 2026-10-25 审查（P3）：对话 payload 常含密钥等敏感内容，留存目录又没有清理入口。
+    // 改为留存「每条消息的长度指纹 + 首尾样本」——定位指纹黑名单要的是「长什么样」，
+    // 不是全文；sha 供多份留存之间比对是否同一会话。
+    const redactMessages = (msgs) => (Array.isArray(msgs)
+      ? msgs.map((m) => {
+        const c = typeof m?.content === 'string' ? m.content : JSON.stringify(m?.content ?? '');
+        return {
+          role: m?.role, len: c.length,
+          sha: crypto.createHash('sha256').update(c).digest('hex').slice(0, 12),
+          head: c.slice(0, 120), tail: c.slice(-120),
+        };
+      })
+      : msgs);
+    const safePayload = { ...payload, messages: redactMessages(payload?.messages) };
     fs.writeFileSync(
       file,
-      JSON.stringify({ at: new Date().toISOString(), status, upstream: String(text || '').slice(0, 500), payload }, null, 2),
+      JSON.stringify({ at: new Date().toISOString(), status, upstream: String(text || '').slice(0, 500), payload: safePayload }, null, 2),
     );
     // 只留最近 5 份
     const olds = fs.readdirSync(dir).filter((f) => f.startsWith('rejected-') && f.endsWith('.json')).sort();
@@ -323,8 +338,7 @@ export async function reportChatActivity(cfg, site, {
     return false;
   }
   try {
-    await ensureToken(cfg, site, { accountId });
-    const auth = getAuth(site);
+    const { auth } = await ensureToken(cfg, site, { accountId });
     const now = Date.now();
     const stamp = `wb-night-${now}`;
     const event = {
@@ -408,8 +422,7 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
   // policy=sticky 时同一对话钉死同一账号，保住上游按账号隔离的 prompt cache。
   // 非 sticky 策略下 ensureToken 忽略该键，算它只花一次 hash。
   const stickyKey = stickyKeyOf(body?.messages);
-  const { accountId: usedAccount } = await ensureToken(cfg, site, { exclude, accountId, stickyKey });
-  const auth = getAuth(site);
+  const { accountId: usedAccount, auth } = await ensureToken(cfg, site, { exclude, accountId, stickyKey });
   const model = String(body?.model || '');
   const payload = prepareBody(cfg, body);
   const fit = applyContextFit(cfg, payload, { site });
@@ -441,7 +454,10 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
     }
   }
 
-  const ac = new AbortController();
+  // ac 允许「重建」：header 超时/传输中断把当前 controller 打死后，重试轮需要一只新的
+  // （原先一只 controller 用到底，第一次 abort 之后所有重试立即失败、重试形同虚设）。
+  // onOuterAbort 闭包读的是 let 绑定，永远 abort 最新一代——外部 signal 只挂一次监听。
+  let ac = new AbortController();
   const onOuterAbort = () => ac.abort(new Error('client closed'));
   if (signal) {
     if (signal.aborted) onOuterAbort();
@@ -449,8 +465,21 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
   }
 
   let settled = false;
-  let headerTimer = setTimeout(() => ac.abort(new Error('upstream header timeout')), cfg.timeouts.headerMs);
+  let headerTimer = null; // 每次真正发起 fetch 前在 startAttempt 里重设
   let idleTimer = null;
+  /** 每轮真实请求开始前调用：重建已死的 controller、按「本轮」重起 header 预算。
+   *  原先 headerTimer 只在入口设一次，压缩重试轮共享首轮预算——第一轮慢了，后面几轮
+   *  压缩重试只剩残渣预算，白做压缩最后 504（0.3.53 P2 修复）。排队（限流冷静窗）
+   *  的时间不计入预算。 */
+  const startAttempt = () => {
+    if (signal?.aborted) {
+      if (!ac.signal.aborted) ac.abort(new Error('client closed'));
+      return;
+    }
+    if (ac.signal.aborted) ac = new AbortController();
+    clearTimeout(headerTimer);
+    headerTimer = setTimeout(() => ac.abort(new Error('upstream header timeout')), cfg.timeouts.headerMs);
+  };
   const cleanup = () => {
     if (settled) return;
     settled = true;
@@ -487,6 +516,7 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
           const waited = await waitForUpstreamSlot(signal);
           if (waited > 0) warn(`[${site}] 上游限流冷静窗：本请求排队等待 ${waited}ms 后放行`);
         }
+        startAttempt(); // 本轮自己的 controller + header 预算
         res = await fetch(siteCfg.apiBase + '/v2/chat/completions', {
           method: 'POST',
           headers: chatHeaders(siteCfg, auth),
@@ -563,6 +593,8 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
         `[${site}] ${model} 的工具定义约 ${附属} tokens，已占满上下文上限 ${已知上限}，`
         + `压缩 messages 无法解决（请精简客户端启用的工具 / MCP 数量）`,
       );
+      // 0.3.61：body 已被读成 text，必须还原成 _text 包装，否则下面错误分支再读 res.text() 只得空串
+      res = { status: res.status, _text: text, headers: res.headers };
       break;
     }
 
@@ -572,7 +604,10 @@ export async function openChat(cfg, site, body, { signal, exclude = [], accountI
       minKeepMessages: cfg.context?.minKeepMessages ?? 4,
       safetyRatio: 1,
     });
-    if (!更小.stats.applied) break; // 压不动了，别再试
+    if (!更小.stats.applied) {
+      res = { status: res.status, _text: text, headers: res.headers }; // 同上：还原已消费的 body
+      break; // 压不动了，别再试
+    }
     当前payload = { ...当前payload, messages: 更小.messages };
     压缩重试次数++;
     warn(
@@ -836,8 +871,7 @@ function fetchWithTimeout(url, { timeoutMs, ...init } = {}) {
  */
 export async function fetchModelsRaw(cfg, site) {
   const siteCfg = cfg.sites[site];
-  await ensureToken(cfg, site);
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site);
   const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
   let res, text;
   try {
@@ -871,8 +905,7 @@ export async function fetchModelsRaw(cfg, site) {
  */
 export async function fetchV3ConfigRaw(cfg, site) {
   const siteCfg = cfg.sites[site];
-  await ensureToken(cfg, site);
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site);
   const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
   let res, text;
   try {
@@ -923,8 +956,7 @@ export function parseBadges(tags) {
  *  minimax-m2.7 只从 v3 下发。v3 探测失败/结构异常不拖累主目录（静默降级）。 */
 export async function fetchModels(cfg, site) {
   const siteCfg = cfg.sites[site];
-  await ensureToken(cfg, site);
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site);
   const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
   // v3/config 只做补缺：非 200 / 解析失败 / agents 空都当「没有增量」处理。
   let v3 = null;
@@ -1043,8 +1075,7 @@ export async function fetchCreditRaw(cfg, site, accountId = null) {
   if (!supportsCreditQuery(cfg, site)) {
     throw new UpstreamError(`[${site}] 该站点不支持额度查询（未配置 billingBase）`, { status: 501, site });
   }
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
+  const { auth } = await ensureToken(cfg, site, { accountId });
   const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
   let res, text;
   try {
@@ -1074,19 +1105,10 @@ export async function queryCredit(cfg, site, accountId = null) {
       { status: 501, site },
     );
   }
-  await ensureToken(cfg, site, { accountId });
-  const auth = getAuth(site);
-  const now = new Date();
-  const end = new Date(now.getTime() + 365 * 101 * 24 * 3600 * 1000);
-  const fmt = (d) => d.toISOString().slice(0, 19).replace('T', ' ');
-  const body = {
-    PageNumber: 1,
-    PageSize: 100,
-    ProductCode: 'p_tcaca',
-    Status: [0, 3],
-    PackageEndTimeRangeBegin: fmt(now),
-    PackageEndTimeRangeEnd: fmt(end),
-  };
+  const { auth } = await ensureToken(cfg, site, { accountId });
+  // 请求体与协议自检探针（fetchCreditRaw → creditQueryBody）共用同一份构造：
+  // 两处各写一份迟早漂移，漂移了 protocol.mjs 的对账就会误报（0.3.53 P3 修复）
+  const body = creditQueryBody();
   const timeoutMs = cfg.timeouts?.metaMs ?? 30000;
   let res, text;
   try {
@@ -1155,8 +1177,13 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
     const exclude = 模型冷却中.length && usableCount(site, undefined, [...tried, ...模型冷却中]) > 0
       ? [...tried, ...模型冷却中]
       : tried;
+    try { recordUpstreamCall(); } catch { /* 统计失败不影响请求 */ } // 数据看板「上游调用」：换号/降级会把一次提问变成几次
     up = await openChat(cfg, site, body, { signal, exclude });
-    if (up.ok) return { up, tried };
+    if (up.ok) {
+      // 换号救回（0.3.51）：前一个账号失败、这个账号成功——当日统计 +1
+      if (i > 0) { try { recordRecovered(); } catch { /* 统计失败不影响请求 */ } }
+      return { up, tried };
+    }
     if (!up.accountId) return { up, tried }; // 兼容模式（单账号），没有可换的
     if (tried.includes(up.accountId)) return { up, tried }; // 池里只剩它，别死循环
 
@@ -1165,6 +1192,7 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
       warn(`[${site}] 上游 401，强制刷新账号 ${up.accountId} 的 token 后重试`);
       try {
         await ensureToken(cfg, site, { force: true, accountId: up.accountId });
+        try { recordUpstreamCall(); } catch { /* 统计失败不影响请求 */ }
         const retry = await openChat(cfg, site, body, { signal, accountId: up.accountId });
         if (retry.ok) return { up: retry, tried };
         up = retry;
@@ -1184,7 +1212,17 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
     tried.push(up.accountId);
 
     const 还有号 = usableCount(site, undefined, tried) > 0;
-    if (!还有号) return { up, tried };
+    if (!还有号) {
+      // 积分限额提示（0.3.51）：所有账号都轮完仍失败——把账号池状态附在错误里，
+      // 用户一眼看到「是账号额度问题」而不是笼统的 HTTP 402。
+      try {
+        const accounts = listAccounts(site);
+        const exhausted = accounts.filter((x) => x.exhaustedAt).length;
+        const cooling = accounts.filter((x) => x.cooldownUntil && x.cooldownUntil > Date.now()).length;
+        up.text += "\n[账号池] " + site + " 共 " + accounts.length + " 个账号：额度耗尽 " + exhausted + "、限流冷却 " + cooling + "——签到或等额度重置后自动恢复";
+      } catch (e) { warn('[账号池] 摘要生成失败：', e.message || String(e)); }
+      return { up, tried };
+    }
     const 原因 = isRateLimitError(up.status, up.text)
       ? '触发限流'
       : isQuotaError(up.status, up.text) ? '额度不足' : `HTTP ${up.status}`;

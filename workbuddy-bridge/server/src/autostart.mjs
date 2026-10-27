@@ -45,7 +45,21 @@ export function autostartDisabled() {
   }
 }
 
-/** 探测代理是否存活（默认 1.5 秒超时，健康检查必须快）。 */
+const MAX_LOG_BYTES = 5 * 1024 * 1024;
+
+/** server.log 超过阈值时改名成 .1（覆盖上一份），任何失败都静默跳过。 */
+function rotateLogIfLarge(file) {
+  try {
+    if (fs.statSync(file).size < MAX_LOG_BYTES) return;
+    try { fs.rmSync(file + '.1', { force: true }); } catch { /* 旧文件被占用就放弃本轮 */ }
+    fs.renameSync(file, file + '.1');
+  } catch {
+    /* 文件不存在 / 无权限：继续追加即可 */
+  }
+}
+
+/**
+ * 探测代理是否存活（默认 1.5 秒超时，健康检查必须快）。 */
 export async function isProxyAlive(port, timeoutMs = 1500) {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(timeoutMs) });
@@ -58,13 +72,17 @@ export async function isProxyAlive(port, timeoutMs = 1500) {
 /**
  * 分离进程拉起代理（不随宿主退出），返回是否成功发起。
  * 子进程输出落到数据目录 server.log（带来源标注）：拉起失败时可以查原因，不再静默消失。
+ * 超过 5 MB 时轮转为 server.log.1（只保留一份）：常驻服务每天重启会无限追加，
+ * 半年后 server.log 能到几十 MB，控制台「日志」页反而更难用。
  */
 export function spawnProxy(source = 'unknown') {
   if (!fs.existsSync(SERVER_ENTRY)) return false;
   let stdio = 'ignore';
   try {
     fs.mkdirSync(dataDir(), { recursive: true });
-    stdio = fs.openSync(path.join(dataDir(), 'server.log'), 'a');
+    const logFile = path.join(dataDir(), 'server.log');
+    rotateLogIfLarge(logFile);
+    stdio = fs.openSync(logFile, 'a');
     fs.writeSync(stdio, `\n===== 自动拉起（${source}，${new Date().toLocaleString()}） =====\n`);
   } catch {
     /* 打不开日志文件就退回 ignore */

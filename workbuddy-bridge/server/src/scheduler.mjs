@@ -13,6 +13,7 @@ import { suggestedPlan } from './expiry.mjs';
 import { log, warn } from './log.mjs';
 import { recordEvent } from './events.mjs';
 import { notify } from './notify.mjs';
+import { mapLimit } from './util.mjs';
 
 const timers = { credit: null, soon: null, boot: null };
 let creditLoopStopped = true;
@@ -48,10 +49,11 @@ export function scheduleCreditRefreshSoon(cfg, delayMs = 4000) {
 const balanceNotifyDay = new Map(); // uid → 已通知日期（保留线跌破气泡每账号每天一次）
 
 export async function refreshCreditsOnce(cfg, site) {
-  const results = [];
-  if (!supportsCreditQuery(cfg, site)) return results;
-  for (const a of listAccounts(site)) {
-    if (a.enabled === false || !a.accessToken) continue;
+  if (!supportsCreditQuery(cfg, site)) return [];
+  const accounts = listAccounts(site).filter((a) => a.enabled !== false && a.accessToken);
+  // 账号间并发 3：原先全串行，10 个账号首轮要 40s+，控制台整段时间都显示「—」。
+  // 上限刻意保守——计费接口是上游限流最紧的端点；失败仍按账号隔离（try/catch 在 fn 内）。
+  return mapLimit(accounts, 3, async (a) => {
     try {
       const credit = await queryCredit(cfg, site, a.id);
       updateCreditDetail(site, a.id, credit);
@@ -71,9 +73,8 @@ export async function refreshCreditsOnce(cfg, site) {
       if (Array.isArray(credit.detail) && credit.detail.length > 0 && typeof credit.remain === 'number' && credit.remain <= 0) {
         markExhausted(site, a.id, '余额为 0');
       }
-      results.push({ id: a.id, label: a.label || a.id, ok: true, remain: credit.remain });
+      return { id: a.id, label: a.label || a.id, ok: true, remain: credit.remain };
     } catch (e) {
-      results.push({ id: a.id, label: a.label || a.id, ok: false, error: String(e.message || e).slice(0, 160) });
       // 事件时间线（T6）：刷新失败通常意味着 401 登录态失效或上游异常，值得在时间线上回看
       recordEvent('credit', `积分刷新失败：${a.label || a.id}：${String(e.message || e).slice(0, 140)}`, { site, accountId: a.id });
       // T11 通知：登录态失效（401/refresh_token 缺失）需要用户重新扫码，弹一次（节流）
@@ -81,23 +82,23 @@ export async function refreshCreditsOnce(cfg, site) {
       if (/\b401\b|refresh_token|登录态|unauthorized/i.test(errText)) {
         notify(cfg, '账号登录态失效 🔴', `${a.label || a.id}（${site}）：${errText.slice(0, 100)}——请重新 /wbp-login 扫码或导入本机登录态`, { key: `account-401-${a.id}` });
       }
+      return { id: a.id, label: a.label || a.id, ok: false, error: String(e.message || e).slice(0, 160) };
     }
-  }
-  return results;
+  });
 }
 
-/** 刷新所有站点的积分明细。 */
+/** 刷新所有站点的积分明细。站点间并发 2：单站点超时不再阻塞其他站点。 */
 export async function refreshCreditsAll(cfg) {
-  const out = {};
-  for (const site of siteKeys(cfg)) {
+  const sites = siteKeys(cfg);
+  const pairs = await mapLimit(sites, 2, async (site) => {
     try {
-      out[site] = await refreshCreditsOnce(cfg, site);
+      return [site, await refreshCreditsOnce(cfg, site)];
     } catch (e) {
       warn(`[${site}] 积分刷新失败：`, e.message);
-      out[site] = [{ ok: false, error: String(e.message || e).slice(0, 160) }];
+      return [site, [{ ok: false, error: String(e.message || e).slice(0, 160) }]];
     }
-  }
-  return out;
+  });
+  return Object.fromEntries(pairs);
 }
 
 /** 对话出口调用：告诉刷新循环「刚有真实消耗，缓存该跟紧一点」（T31）。

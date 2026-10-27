@@ -670,7 +670,7 @@ body.hud-on header.legacy-header:has(#alerts:empty){display:none}
 }
 
 /* ---------- 溢出根治第二刀：旧 T38 表格 min-width:520px 无横滑容器时撑破布局 ---------- */
-body.hud-on{overflow-x:hidden}
+body.hud-on{overflow-x:clip} /* 0.3.62：hidden 会把 body 变成滚动容器、钉死侧栏 sticky（侧栏随页滚走的根因）；clip 不产生滚动容器 */
 body.hud-on .card{overflow-x:auto}
 body.hud-on table{max-width:none}
 

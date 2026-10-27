@@ -115,6 +115,52 @@ function expandAlias(cfg, name, depth = 0) {
 
 /** 取站点模型目录（带缓存）。动态接口不可用时回落到站点内置清单（seedModels）。 */
 export async function getCatalog(cfg, site, { force = false } = {}) {
+  // CodeArts 站点（0.3.66）：目录来自华为云双端点（AK/SK 签名），协议与 /v2/plugin/*
+  // 完全不同，单独走 codearts-upstream 的目录缓存；未登录时同样回落 seedModels。
+  if (cfg.sites[site]?.codearts) {
+    const cached0 = catalogs.get(site);
+    if (!force && cached0 && Date.now() - cached0.at < cached0.ttl) return cached0;
+    const 过滤ca = (list) =>
+      new Map(list.filter((m) => !isExcluded(cfg, site, m.id)).map((m) => [m.id, m]));
+    const 登记上限ca = (list) => {
+      for (const m of list) if (m?.id && m.contextWindow) learnLimit(site, m.id, m.contextWindow);
+    };
+    const { codeartsCatalog, codeartsIsLoggedIn } = await import('./codearts-upstream.mjs');
+    if (!codeartsIsLoggedIn(site)) {
+      const entry = { at: Date.now(), ttl: TTL_ERR, models: new Map(), error: '未登录', source: 'none' };
+      catalogs.set(site, entry);
+      return entry;
+    }
+    try {
+      const remote = await codeartsCatalog(cfg, { force });
+      const list = remote.map((m) => ({
+        id: m.id,
+        name: m.name,
+        // 华为的倍率展示串是「0.18x」（x 在尾），parseMultiplier 只认「x0.18」
+        // （x 在头）——不归一化就解析成 Infinity，选择器后缀回退成腾讯同名模型的
+        // x0.11（张冠李戴）。转成 x0.18 形态，选择器显示 CodeArts 自己的倍率。
+        ...(m.rateLabel ? { credits: 'x' + String(m.rateLabel).replace(/x\s*$/i, '') + ' credits' } : {}),
+      }));
+      const models = 过滤ca(list);
+      if (!models.size) throw new Error('远端目录为空');
+      const entry = { at: Date.now(), ttl: TTL_OK, models, error: null, source: 'upstream' };
+      catalogs.set(site, entry);
+      return entry;
+    } catch (e) {
+      const prev = catalogs.get(site);
+      if (prev?.source === 'upstream' && prev.models.size) {
+        const entry = { at: Date.now(), ttl: TTL_ERR, models: prev.models, error: e.message, source: 'upstream(cache)' };
+        catalogs.set(site, entry);
+        return entry;
+      }
+      const seed = cfg.sites[site]?.seedModels || [];
+      登记上限ca(seed);
+      const models = 过滤ca(seed.map((m) => ({ ...m, seed: true })));
+      const entry = { at: Date.now(), ttl: TTL_ERR, models, error: e.message, source: models.size ? 'seed' : 'none' };
+      catalogs.set(site, entry);
+      return entry;
+    }
+  }
   const cached = catalogs.get(site);
   if (!force && cached && Date.now() - cached.at < cached.ttl) return cached;
 
@@ -227,12 +273,36 @@ function 有可用账号(site) {
  * 它真正生效的位置是 resolveTargetInner 对 default/auto 哨兵的改道（见 pickFreeModelFromCatalogs）。
  */
 export function rankSiteCandidates(candidates, defaultSite) {
+  // defaultSite 的比较必须对称：双方都不是默认站点时要返回 0（旧三元式在这种情况
+  // 恒返回 1，违反比较器一致性约定，排序结果依赖 V8 实现细节——0.3.53 P3 修复）
+  const defRank = (x) => (x.site === defaultSite ? 0 : 1);
   return [...candidates].sort(
     (a, b) =>
       Number(Boolean(b.usable)) - Number(Boolean(a.usable)) ||
       a.mult - b.mult ||
-      (a.site === defaultSite ? -1 : 1),
+      defRank(a) - defRank(b),
   );
+}
+
+/**
+ * 模型链候选（0.3.56，借鉴 dsh 路由页的「把多个模型串成链」）：
+ * cfg.modelChains = { 请求模型: [候选1, 候选2, …] }——首个候选失败（限流/额度/
+ * 模型不存在这类**模型层**错误）时按序换下一个。返回去重后的候选数组，首项恒为
+ * 请求模型自身（剥掉选择器倍率后缀再查表/比较）；没配链就只有一项，行为与旧版全等。
+ * 候选项本身可以是别名或 `站点/模型`（每个候选独立走 resolveTarget）。
+ * 上限 7 项防手滑配出环状长链。
+ */
+export function chainCandidates(cfg, requestedModel) {
+  const key = stripMultiplierSuffix(String(requestedModel || '').trim());
+  const out = [key];
+  const chain = cfg?.modelChains?.[key];
+  if (Array.isArray(chain)) {
+    for (const m of chain) {
+      const v = stripMultiplierSuffix(String(m ?? '').trim());
+      if (v && !out.includes(v) && out.length < 7) out.push(v);
+    }
+  }
+  return out;
 }
 
 /** 从 cfg 里读调度策略；读不到按空串处理（走原有行为）。 */
@@ -378,19 +448,22 @@ export async function resolveTarget(cfg, requestedModel) {
 
   let target = await resolveTargetInner(cfg, requestedModel);
 
-  const 改派站点 = await 改派到有额度的站点(cfg, target.site, target.model);
-  if (改派站点) {
-    warn(
-      `[${target.site}] 该站点当前没有可用账号，直接改派到 ${改派站点}（模型 ${target.model}）`
-      + `，不再先撞一次失败`,
-    );
-    target = { ...target, site: 改派站点, fallback: await computeFallback(cfg, 改派站点, target.model) };
-  }
-
-  try {
-    await getCatalog(cfg, target.site);
-  } catch {
-    /* 目录拿不到不影响主流程，压缩会退化成「按比例收缩」 */
+  // 聚合渠道泳道（0.3.58）：自有 key 的外部 provider 没有「账号/额度改派」语义，
+  // 也不需要站点目录预载（转发是直连，不经过压缩上限表）
+  if (!target.aggregate) {
+    const 改派站点 = await 改派到有额度的站点(cfg, target.site, target.model);
+    if (改派站点) {
+      warn(
+        `[${target.site}] 该站点当前没有可用账号，直接改派到 ${改派站点}（模型 ${target.model}）`
+        + '，不再先撞一次失败',
+      );
+      target = { ...target, site: 改派站点, fallback: await computeFallback(cfg, 改派站点, target.model) };
+    }
+    try {
+      await getCatalog(cfg, target.site);
+    } catch {
+      /* 目录拿不到不影响主流程，压缩会退化成「按比例收缩」 */
+    }
   }
   return target;
 }
@@ -400,6 +473,24 @@ async function resolveTargetInner(cfg, requestedModel) {
   let raw = stripMultiplierSuffix(String(requestedModel || '').trim());
   const sites = siteKeys(cfg);
   if (!raw) raw = cfg.defaultModel;
+
+  // -1) 聚合渠道泳道（0.3.58）：agg:<渠道>/<模型> —— 用户自有 key 的 OpenAI 兼容
+  //     provider（控制台「资源池 → 聚合渠道」添加）。不走账号池/站点目录/换站降级，
+  //     入口层按 target.aggregate 改走直连转发。
+  if (raw.toLowerCase().startsWith('agg:')) {
+    const rest = raw.slice(4);
+    const slash = rest.indexOf('/');
+    const provider = slash > 0 ? rest.slice(0, slash).trim() : '';
+    const model = slash > 0 ? rest.slice(slash + 1).trim() : '';
+    if (!provider || !model) {
+      throw Object.assign(new Error(`聚合模型格式应为 agg:<渠道>/<模型>，收到 ${raw}`), { status: 400 });
+    }
+    const { aggregateProviders } = await import('./aggregate.mjs');
+    if (!aggregateProviders(cfg).some((p) => p.name === provider)) {
+      throw Object.assign(new Error(`聚合渠道 ${provider} 不存在或未启用（在控制台「资源池 → 聚合渠道」添加）`), { status: 404 });
+    }
+    return { site: 'aggregate', model, requested: raw, aggregate: { provider, model } };
+  }
 
   // 0) 特殊哨兵：客户端只配一个 `default` 模型，之后切换模型全在控制台完成；
   //    `auto` 是上游的自动路由入口（seedModels 里有同名条目）。

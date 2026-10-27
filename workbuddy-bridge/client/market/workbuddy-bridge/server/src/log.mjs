@@ -74,6 +74,11 @@ export function recentRequests(n = 20) {
   return reqRing.slice(-n).reverse();
 }
 
+/** 清空最近请求环（数据看板「清空调用记录」按钮；只清内存，统计口径不受影响）。 */
+export function clearRequests() {
+  reqRing.length = 0;
+}
+
 /** 取最近的日志（seq 之后的），供 /console/logs 长轮询。 */
 export function recentLogs(afterSeq = 0) {
   const list = buffer.filter((l) => l.seq > afterSeq);

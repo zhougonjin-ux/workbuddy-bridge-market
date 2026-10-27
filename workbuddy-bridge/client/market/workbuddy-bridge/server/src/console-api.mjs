@@ -22,7 +22,7 @@ import { queryCredit, supportsCreditQuery } from './upstream.mjs';
 import { probeModel, runHealthScan, healthStatus, reloadHealthState } from './health.mjs';
 import { startLogin, pollLogin } from './device-login.mjs';
 import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel, usageCsv, reloadUsage } from './usage.mjs';
-import { recentLogs, recentRequests } from './log.mjs';
+import { recentLogs, recentRequests, clearRequests } from './log.mjs';
 import { recentEvents, recordEvent, reloadEvents } from './events.mjs';
 import { compressionStats, reloadLearned } from './compress.mjs';
 import { sendJson, writeJsonFileAtomic } from './util.mjs';
@@ -38,12 +38,15 @@ import { weeklyTick } from './weekly.mjs';
 import { burnoutReport, predictAccount } from './burnout.mjs';
 import { recentDailyCreditAvg } from './usage.mjs';
 import { checkForUpdate } from './updatecheck.mjs';
+import { onboardingStatus } from './onboarding.mjs';
 import { runDiagnostics, startDoctorLoop } from './doctor.mjs';
 import { flushLearned } from './compress.mjs';
 import { flushEvents } from './events.mjs';
 
 const startedAt = Date.now();
 const loginStates = new Map(); // site → { state, authUrl, at }
+// CodeArts OAuth 登录流程（0.3.66）：site 'codearts' → { flow }（startCodeArtsOAuthFlow 返回值）
+const codeartsLoginFlows = new Map();
 
 const isPlainObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -158,6 +161,21 @@ function attachBurnoutToAccounts(cfg, site, accounts, dailyAvg) {
   return accounts;
 }
 
+/**
+ * 最近请求 + T9 异常标注（/recent-requests 与 /dashboard 共用同一映射）：
+ * 单次消耗 > 该模型今日均值 ×5 且 ≥1 积分才算异常（低倍率模型的自然波动不标）。
+ */
+function recentRequestsWithAnomaly(n = 50) {
+  const avg = todayAvgCreditByModel();
+  return recentRequests(n).map((r) => {
+    const base = r.credit != null ? avg[`${r.site}/${r.model}`] : null;
+    if (base != null && base > 0 && r.credit > base * 5 && r.credit >= 1) {
+      return { ...r, creditAvg: Math.round(base * 100) / 100, anomaly: true };
+    }
+    return r;
+  });
+}
+
 export async function handleConsoleApi(ctx) {
   const { cfg, req, res, url } = ctx;
   const p = url.pathname.replace(/^\/console\/api/, '') || '/';
@@ -178,6 +196,22 @@ export async function handleConsoleApi(ctx) {
           if (typeof credit.remain === 'number') recordBalance(s, credit.remain);
         } catch (e) {
           info.credit_error = e.message.slice(0, 160);
+        }
+      }
+      // CodeArts（0.3.66）：积分走华为云 snap-manager（AK/SK 签名），与 /codearts/credits 同源
+      if (s === 'codearts' && info.logged_in) {
+        try {
+          const { listAccounts } = await import('./pool.mjs');
+          const { codeartsCredOf } = await import('./codearts-upstream.mjs');
+          const { codeartsFetchCredits } = await import('./codearts.mjs');
+          const acc = listAccounts('codearts').filter((a) => a.enabled !== false && codeartsCredOf(a))[0];
+          if (acc) {
+            const cr = await codeartsFetchCredits(codeartsCredOf(acc));
+            info.credit = cr.total;
+            info.codearts_packages = cr.packages;
+          }
+        } catch (e) {
+          info.credit_error = String(e.message || e).slice(0, 160);
         }
       }
       sites.push(info);
@@ -362,6 +396,31 @@ export async function handleConsoleApi(ctx) {
         }
       }
     }
+    // CodeArts（0.3.66 补丁）：billingBase 留空避开了通用计费路径，账号卡余额在这里补——
+    // 华为云 snap-manager 的积分是账户级（不分账号维度端点），查一次填给第一个可用账号；
+    // 单账号是常态（同账号重复登录会被身份查重合并），多账号时其余账号沿用池内缓存值。
+    if (site === 'codearts' && withCredit) {
+      const { listAccounts } = await import('./pool.mjs');
+      const { codeartsCredOf } = await import('./codearts-upstream.mjs');
+      const { codeartsFetchCredits } = await import('./codearts.mjs');
+      const poolAccounts = listAccounts('codearts').filter((a) => a.enabled !== false && codeartsCredOf(a));
+      let filled = false;
+      for (const a of accounts) {
+        if (filled) break;
+        const pooled = poolAccounts.find((x) => x.id === a.id);
+        if (!pooled || !codeartsCredOf(pooled)) continue;
+        try {
+          const cr = await codeartsFetchCredits(codeartsCredOf(pooled));
+          a.credit = cr.total;
+          a.credit_detail = cr.packages.map((pkg) => ({ package: pkg.name, remain: pkg.remain, total: pkg.amount, used: pkg.used }));
+          if (typeof cr.total === 'number') recordBalance(`codearts/${a.label}`, cr.total);
+          updateCreditDetail(site, a.id, { remain: cr.total, detail: a.credit_detail });
+          filled = true;
+        } catch (e) {
+          a.credit_error = String(e.message || e).slice(0, 160);
+        }
+      }
+    }
     return sendJson(res, 200, { site, accounts: attachBurnoutToAccounts(cfg, site, accounts, recentDailyCreditAvg(7)), supports_credit: supportsCreditQuery(cfg, site) });
   }
 
@@ -375,6 +434,11 @@ export async function handleConsoleApi(ctx) {
     const r = setPolicy(cfg, { policy: body.policy, pinnedAccountId: body.pinnedAccountId });
     return sendJson(res, r.ok ? 200 : 400, r);
   }
+  // ---- 首次使用向导：逻辑在 src/onboarding.mjs（纯函数可单测，只读不改配置）----
+  if (p === '/onboarding' && method === 'GET') {
+    return sendJson(res, 200, onboardingStatus(cfg));
+  }
+
   if (p === '/bridge' && method === 'GET') {
     // B3：轮询通道（20s 一次）同样脱敏。此前只有 SSE 通道 redact，这个接口每 20 秒
     // 把两个账号的 accessToken/refreshToken 明文发给浏览器——前端对这两个字段零消费
@@ -429,6 +493,18 @@ export async function handleConsoleApi(ctx) {
   if (p === '/tasks/config' && method === 'POST') {
     const body = ctx.body || {};
     const enabledBefore = cfg.tasks.enabled !== false;
+    // 合规确认（一次性）：自动签到/代打走非官方接口，README 已声明 ToS/封号风险，
+    // 但控制台里点一下就开始跑、没有任何提示 —— 这里把决策显式交给用户。
+    // 只在「从关到开」时要求确认；老用户改时点/开关分类不会被拦。
+    const enabling = body.enabled === true && !enabledBefore;
+    if (enabling && cfg.tasks.riskAccepted !== true && body.riskAccepted !== true) {
+      return sendJson(res, 409, {
+        ok: false,
+        code: 'risk_required',
+        error: 'RISK_REQUIRED 自动任务会用非官方接口代替你签到/领奖/代打，可能违反 WorkBuddy 服务条款并带来封号风险。确认后才会开启。',
+      });
+    }
+    if (body.riskAccepted === true) cfg.tasks.riskAccepted = true;
     const parseTimes = (v) => String(v ?? '')
       .split(/[,，;；\s]+/)
       .map((s) => s.trim())
@@ -489,6 +565,46 @@ export async function handleConsoleApi(ctx) {
         maxChatsPerTask: cfg.tasks.maxChatsPerTask,
       },
     });
+  }
+
+  // ---- CodeArts 每日签到与积分查询（0.3.66，协议见 codearts.mjs）----
+  if (p === '/codearts/credits' && method === 'GET') {
+    const { listAccounts } = await import('./pool.mjs');
+    const { codeartsCredOf } = await import('./codearts-upstream.mjs');
+    const { codeartsFetchCredits } = await import('./codearts.mjs');
+    const accounts = listAccounts('codearts').filter((a) => a.enabled !== false);
+    const results = [];
+    for (const a of accounts) {
+      const cred = codeartsCredOf(a);
+      if (!cred) continue;
+      try {
+        const info = await codeartsFetchCredits(cred);
+        results.push({ id: a.id, label: a.label || a.nickname || a.id, ok: true, ...info });
+      } catch (e) {
+        results.push({ id: a.id, label: a.label || a.nickname || a.id, ok: false, error: String(e.message || e).slice(0, 160) });
+      }
+    }
+    return sendJson(res, 200, { ok: true, results });
+  }
+  if (p === '/codearts/checkin' && method === 'POST') {
+    const { listAccounts } = await import('./pool.mjs');
+    const { codeartsCredOf } = await import('./codearts-upstream.mjs');
+    const { codeartsDailyCheckin } = await import('./codearts.mjs');
+    const accounts = listAccounts('codearts').filter((a) => a.enabled !== false);
+    if (!accounts.length) return sendJson(res, 400, { error: '还没有 CodeArts 账号——先在「扫码登录」页添加' });
+    const results = [];
+    for (const a of accounts) {
+      const cred = codeartsCredOf(a);
+      if (!cred) continue;
+      try {
+        const r = await codeartsDailyCheckin(cred);
+        results.push({ id: a.id, label: a.label || a.nickname || a.id, ...r });
+        if (r.claimed) recordEvent('tasks', `CodeArts 签到：${r.message}（${a.label || a.id}）`, { site: 'codearts', accountId: a.id });
+      } catch (e) {
+        results.push({ id: a.id, label: a.label || a.nickname || a.id, claimed: false, message: String(e.message || e).slice(0, 160) });
+      }
+    }
+    return sendJson(res, 200, { ok: true, results });
   }
 
   // ---- workbuddy-bridge：成长任务中心（T14）----
@@ -684,15 +800,41 @@ export async function handleConsoleApi(ctx) {
   // T9：对照「该模型今日平均单次消耗」标注异常——单次 > 均值 ×5 且 ≥1 积分才算
   // （低倍率模型 0.0x 积分的自然波动不标；无基线/无 credit 的请求不标）。
   if (p === '/recent-requests' && method === 'GET') {
-    const avg = todayAvgCreditByModel();
-    const requests = recentRequests(50).map((r) => {
-      const base = r.credit != null ? avg[`${r.site}/${r.model}`] : null;
-      if (base != null && base > 0 && r.credit > base * 5 && r.credit >= 1) {
-        return { ...r, creditAvg: Math.round(base * 100) / 100, anomaly: true };
-      }
-      return r;
+    return sendJson(res, 200, { ok: true, requests: recentRequestsWithAnomaly(50) });
+  }
+
+  // ---- 数据看板（0.3.64，形态对齐 dsh-xdpool）：今日轮次/调用/失败/token/速度/缓存命中
+  // + 最近调用内存环。轮次/上游调用的口径见 usage.mjs 的 recordRound/recordUpstreamCall。----
+  if (p === '/dashboard' && method === 'GET') {
+    const snap = usageSnapshot(1);
+    const t = snap.today || {};
+    const tokens = (t.promptTokens || 0) + (t.completionTokens || 0);
+    return sendJson(res, 200, {
+      ok: true,
+      today: {
+        rounds: t.rounds || 0,
+        roundFailures: t.roundFailures || 0,
+        upstreamCalls: t.upstreamCalls || 0,
+        calls: t.calls || 0,
+        errors: t.errors || 0,
+        recovered: t.recovered || 0,
+        promptTokens: t.promptTokens || 0,
+        completionTokens: t.completionTokens || 0,
+        tokens,
+        tokensReported: t.calls > 0 && tokens > 0, // 有调用但 token 为 0 = 上游没发 usage 帧
+        cacheHitTokens: t.cacheHitTokens || 0,
+        credit: t.credit || 0,
+        ms: t.ms || 0,
+      },
+      recent: recentRequestsWithAnomaly(50),
+      ring: 50,
+      since: snap.since,
     });
-    return sendJson(res, 200, { ok: true, requests });
+  }
+  if (p === '/dashboard/clear' && method === 'POST') {
+    clearRequests();
+    recordEvent('system', '数据看板：最近调用记录已清空（内存环）');
+    return sendJson(res, 200, { ok: true });
   }
 
   // 事件时间线（T6）：系统/任务/账号/策略等结构化事件的统一视图，前端过滤 kind
@@ -967,6 +1109,72 @@ export async function handleConsoleApi(ctx) {
     const body = ctx.body || {};
     const site = String(body.site || cfg.defaultSite);
     if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
+    // CodeArts（0.3.66）：华为云 OAuth + PKCE + DPoP，本地起回调服务器，portal 只认
+    // ≥10000 的回调端口。前端拿 authUrl 开浏览器，轮询 /login/poll 等授权完成。
+    if (site === 'codearts') {
+      const { startCodeArtsOAuthFlow } = await import('./codearts.mjs');
+      const { addAccount } = await import('./pool.mjs');
+      // 复用既有 flow（若还在等待）：刷新登录 URL 而不是再起一个回调服务器
+      const existing = codeartsLoginFlows.get('codearts');
+      if (existing) {
+        try { existing.flow.close(); } catch { /* 已关 */ }
+        codeartsLoginFlows.delete('codearts');
+      }
+      const flow = startCodeArtsOAuthFlow();
+      const authUrl = await flow.getLoginUrl();
+      const entry = { flow };
+      codeartsLoginFlows.set('codearts', entry);
+      const { listAccounts: caListFromPool } = await import('./pool.mjs'); // .then 回调非 async，先取好闭包
+      // 后台等结果：成功即入号池（不做长轮询阻塞——控制台前端自己 poll）
+      flow.waitForResult().then(
+        (credential) => {
+          codeartsLoginFlows.delete('codearts');
+          try {
+            // 身份查重：refresh_token JWT 的 user_profile.account_id 是华为云账号唯一标识
+            //（credential 里 user_id/user_name 恒为 null，不能当 uid）。同账号重复登录
+            // 覆盖原账号而不是新增——否则同会话三条凭据互相踩（STS 刷新会作废旧 access）。
+            let huaweiAccountId = null;
+            try {
+              const pl = JSON.parse(Buffer.from(credential.refresh_token.split('.')[1], 'base64url').toString('utf8'));
+              huaweiAccountId = String(JSON.parse(Buffer.from(pl.user_profile, 'base64url').toString('utf8')).account_id || '') || null;
+            } catch { /* 形状变化时退化为不查重 */ }
+            // caListFromPool 闭包来自下方 handler 开头的 await import（.then 回调非 async，不能 import）
+            if (huaweiAccountId && caListFromPool) {
+              for (const a of caListFromPool('codearts')) {
+                let dup = false;
+                try {
+                  const c = JSON.parse(a.accessToken);
+                  const pl = JSON.parse(Buffer.from(c.refresh_token.split('.')[1], 'base64url').toString('utf8'));
+                  dup = String(JSON.parse(Buffer.from(pl.user_profile, 'base64url').toString('utf8')).account_id || '') === huaweiAccountId;
+                } catch { /* 坏凭据不当重复 */ }
+                if (dup && a.id) {
+                  removeAccount('codearts', a.id);
+                  recordEvent('login', `CodeArts：同账号重新登录，已覆盖 ${a.label || a.id}`, { site: 'codearts' });
+                  break;
+                }
+              }
+            }
+            const saved = addAccount('codearts', {
+              accessToken: JSON.stringify(credential),
+              refreshToken: credential.refresh_token || 'codearts',
+              expiresAt: new Date(credential.expires_at || Date.now() + 86_400_000).getTime(),
+              uid: huaweiAccountId,
+              nickname: null,
+            }, { label: body.label ? String(body.label).slice(0, 40) : null });
+            recordEvent('login', `CodeArts 账号登录成功：${saved.label || saved.nickname || saved.id}`, { site: 'codearts', accountId: saved.id });
+          } catch (e) {
+            recordEvent('login', `CodeArts 账号入池失败：${String(e.message || e).slice(0, 140)}`, { site: 'codearts' });
+          }
+        },
+        (error) => {
+          codeartsLoginFlows.delete('codearts');
+          if (!/超时/.test(String(error.message || ''))) {
+            recordEvent('login', `CodeArts 登录失败：${String(error.message || error).slice(0, 140)}`, { site: 'codearts' });
+          }
+        },
+      );
+      return sendJson(res, 200, { site, authUrl, state: 'codearts-oauth', at: Date.now() });
+    }
     const r = await startLogin(cfg, site);
     loginStates.set(site, { ...r, label: body.label ? String(body.label).slice(0, 40) : null });
     return sendJson(res, 200, r);
@@ -974,6 +1182,16 @@ export async function handleConsoleApi(ctx) {
 
   if (p === '/login/poll' && method === 'GET') {
     const site = String(url.searchParams.get('site') || cfg.defaultSite);
+    if (site === 'codearts') {
+      // CodeArts：结果由后台 promise 写号池；这里只报「等待中 / 已完成 / 无流程」
+      const entry = codeartsLoginFlows.get('codearts');
+      if (!entry) {
+        const { listAccounts } = await import('./pool.mjs');
+        const n = listAccounts('codearts').length;
+        return sendJson(res, 200, { done: true, account_count: n, msg: 'codearts flow settled' });
+      }
+      return sendJson(res, 200, { done: false, msg: '等待你在浏览器完成华为云授权…' });
+    }
     const st = loginStates.get(site);
     if (!st) return sendJson(res, 400, { error: '请先点击「开始登录」' });
     const r = await pollLogin(cfg, site, st.state, { label: st.label || null });
@@ -1055,6 +1273,7 @@ export async function handleConsoleApi(ctx) {
     return sendJson(res, 200, {
       aliases: cfg.modelAliases || {},
       routes: cfg.modelRoutes || {},
+      chains: cfg.modelChains || {},
       allowModels: cfg.allowModels || [],
       excludeModels: cfg.excludeModels || [],
       models: m.map((x) => ({ id: x.id, site: x.site, aliasOf: x.aliasOf || null })),
@@ -1077,6 +1296,23 @@ export async function handleConsoleApi(ctx) {
       }
       cfg.modelRoutes = body.routes;
     }
+    // 模型链（0.3.56）：模型 → 候选数组。键不能为空、候选必须是非空字符串、
+    // 不能包含自身（打转）；最多 6 个候选（与 config 层清洗同口径）
+    if (body.chains !== undefined) {
+      if (!isPlainObj(body.chains)) return sendJson(res, 400, { error: 'chains 必须是对象（模型 → 候选数组）' });
+      const clean = {};
+      for (const [k, list] of Object.entries(body.chains)) {
+        const key = k.trim();
+        if (!key) return sendJson(res, 400, { error: 'chains 的键（模型名）不能为空' });
+        if (!Array.isArray(list) || !list.length || list.some((x) => typeof x !== 'string' || !x.trim())) {
+          return sendJson(res, 400, { error: `链 ${key} 的候选必须是非空字符串数组` });
+        }
+        const vals = [...new Set(list.map((x) => x.trim()))].filter(Boolean).slice(0, 6);
+        if (vals.includes(key)) return sendJson(res, 400, { error: `链 ${key} 不能包含自身（会在链上原地打转）` });
+        if (vals.length) clean[key] = vals;
+      }
+      cfg.modelChains = clean;
+    }
     for (const field of ['allowModels', 'excludeModels']) {
       if (body[field] !== undefined) {
         if (!Array.isArray(body[field]) || body[field].some((s) => typeof s !== 'string')) {
@@ -1086,7 +1322,52 @@ export async function handleConsoleApi(ctx) {
       }
     }
     saveConfig(cfg);
-    return sendJson(res, 200, { ok: true, aliases: cfg.modelAliases, routes: cfg.modelRoutes, allowModels: cfg.allowModels, excludeModels: cfg.excludeModels });
+    return sendJson(res, 200, { ok: true, aliases: cfg.modelAliases, routes: cfg.modelRoutes, chains: cfg.modelChains, allowModels: cfg.allowModels, excludeModels: cfg.excludeModels });
+  }
+
+  // ---- 聚合渠道泳道（0.3.58）----
+  if (p === '/aggregate' && method === 'GET') {
+    const { aggregateProviders, aggregateModels } = await import('./aggregate.mjs');
+    const { AGG_PRESETS } = await import('./aggpresets.mjs');
+    const providers = aggregateProviders(cfg).map((x) => ({ ...x, apiKeys: x.apiKeys.map((k) => k.slice(0, 6) + '…') }));
+    let models = [];
+    try { models = (await aggregateModels(cfg)).map((m) => m.id); } catch { /* 目录失败给空 */ }
+    return sendJson(res, 200, { providers, models, all: (cfg.aggregate?.providers || []).length, enabled: cfg.aggregate?.enabled !== false, presets: AGG_PRESETS });
+  }
+  if (p === '/aggregate' && method === 'POST') {
+    // 整包替换 providers（前端聚合渠道卡编辑后提交）。key 打码值（以 … 结尾且长度≤7）
+    // 视为「保留原值」，避免 GET→POST 回显把真 key 抹掉
+    const body = ctx.body || {};
+    if (!Array.isArray(body.providers)) return sendJson(res, 400, { error: 'providers 必须是数组' });
+    const prev = new Map((cfg.aggregate?.providers || []).map((x) => [x.name, x]));
+    const next = [];
+    for (const q of body.providers) {
+      const name = String(q?.name ?? '').trim();
+      const baseUrl = String(q?.baseUrl ?? '').trim().replace(/\/+$/, '');
+      let apiKeys = Array.isArray(q?.apiKeys) ? q.apiKeys.map((k) => String(k ?? '').trim()).filter(Boolean) : [];
+      apiKeys = apiKeys.map((k) => (/…$/.test(k) && k.length <= 7 && prev.get(name) ? prev.get(name).apiKeys.find((old) => old.startsWith(k.slice(0, 6))) ?? k : k));
+      if (!/^[A-Za-z0-9_-]{1,32}$/.test(name)) return sendJson(res, 400, { error: `渠道名 ${JSON.stringify(q?.name)} 非法（字母数字_-，≤32）` });
+      if (!/^https?:\/\/.+/.test(baseUrl)) return sendJson(res, 400, { error: `渠道 ${name} 的 baseUrl 必须是 http(s) 地址` });
+      if (!apiKeys.length) return sendJson(res, 400, { error: `渠道 ${name} 至少要一个 API key` });
+      if (next.some((x) => x.name === name)) return sendJson(res, 400, { error: `渠道名 ${name} 重复` });
+      next.push({ name, baseUrl, apiKeys, enabled: q.enabled !== false });
+    }
+    // 聚合总开关（0.3.62，仿 dsh 泳道开关）：false 时聚合渠道不贡献任何模型；缺省 = 开
+    const laneEnabled = body.enabled === false ? false : cfg.aggregate?.enabled !== false;
+    cfg.aggregate = { enabled: laneEnabled, providers: next };
+    const { invalidateAggregateCatalog } = await import('./aggregate.mjs');
+    invalidateAggregateCatalog();
+    saveConfig(cfg);
+    return sendJson(res, 200, { ok: true, count: next.length, enabled: laneEnabled });
+  }
+  if (p === '/aggregate/refresh' && method === 'POST') {
+    const { aggregateModels, invalidateAggregateCatalog } = await import('./aggregate.mjs');
+    invalidateAggregateCatalog();
+    let models = [];
+    try { models = (await aggregateModels(cfg, { force: true })).map((m) => m.id); } catch (e) {
+      return sendJson(res, 502, { error: '聚合目录拉取失败：' + String(e.message || e).slice(0, 120) });
+    }
+    return sendJson(res, 200, { ok: true, models, count: models.length });
   }
 
   // ---- T19：模型清单过滤（白/黑名单预览：保存前看看哪些模型会被剔除）----

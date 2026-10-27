@@ -30,6 +30,7 @@ import { orderAccounts, EXHAUST_TTL_MS } from './expiry.mjs';
 import { warn } from './log.mjs';
 import { writeJsonFileAtomic, readJsonFileWithBackup } from './util.mjs';
 import { recordEvent } from './events.mjs';
+import { notify } from './notify.mjs';
 
 /** 池文件里代表「旧版单账号凭证」的固定 id。 */
 export const DEFAULT_ACCOUNT_ID = 'default';
@@ -504,6 +505,7 @@ export function markSuccess(site, id, model = '') {
     if (a.exhaustedAt) a.exhaustedAt = null;
     if (model && a.modelCooldowns) delete a.modelCooldowns[model];
     a.lastUsedAt = Date.now();
+    if (model) a.lastModel = model; // 桌面客户端账号卡显示「上次模型」用
   };
   if (!hasPoolFile(site)) {
     return mutateLegacy(site, id, clear);
@@ -530,15 +532,24 @@ export function markSuccess(site, id, model = '') {
  * 但状态仍要记进内存态覆盖——否则 usableCount 永远说「可用」，
  * 路由就会一直把已经 429 的单账号站点当成健康站点（详见 legacyState 说明）。
  */
+// 事件节流（0.3.53 P3）：同账号同状态码的失败 60 秒内只进一次时间线——上游持续 5xx
+// 时轮换链会高频调用 markFailure，不节流几分钟就刷满 300 条环形时间线，把其他账号/
+// 种类的事件全部挤掉。冷却阶梯/失败计数等状态机本身不受节流影响。
+const failEventAt = new Map(); // `${site}\0${id}\0${status}` → 上次进时间线的时间
 export function markFailure(site, id, { status = 0, message = '', model = '', modelCooldownMs = 0 } = {}) {
-  // 事件时间线（T6）：账号失败/冷却进时间线。冷却阶梯会挡住连续重试，
-  // 所以正常情况下不会刷屏；真刷屏本身就是「该账号在持续失败」的信号。
-  recordEvent(
-    'account',
-    `账号请求失败${status ? `（HTTP ${status}）` : ''}：${String(message || '未知原因').slice(0, 140)}`
-      + (isQuotaError(status, message) ? '，判定额度耗尽' : ''),
-    { site, accountId: id },
-  );
+  const evKey = `${site}\u0000${id}\u0000${status}`;
+  const now = Date.now();
+  if (now - (failEventAt.get(evKey) || 0) > 60_000) {
+    failEventAt.set(evKey, now);
+    // 事件时间线（T6）：账号失败/冷却进时间线。冷却阶梯会挡住连续重试，
+    // 所以正常情况下不会刷屏；真刷屏本身就是「该账号在持续失败」的信号。
+    recordEvent(
+      'account',
+      `账号请求失败${status ? `（HTTP ${status}）` : ''}：${String(message || '未知原因').slice(0, 140)}`
+        + (isQuotaError(status, message) ? '，判定额度耗尽' : ''),
+      { site, accountId: id },
+    );
+  }
   const extra = { status, message, model, modelCooldownMs };
   if (!hasPoolFile(site)) return mutateLegacy(site, id, (a) => applyFailure(a, extra));
   return mutate(site, (pool) => {
@@ -549,11 +560,24 @@ export function markFailure(site, id, { status = 0, message = '', model = '', mo
 }
 
 /** 明确标记某账号额度耗尽（由额度查询/业务码驱动）。 */
+const exhaustNotifyDay = new Map(); // uid → 已通知日期（积分限额气泡每账号每天一次）
+
 export function markExhausted(site, id, message = '额度不足') {
   // 事件时间线（T6）：只在「可用 → 耗尽」的转变时记一条——余额轮询会对已耗尽的
   // 账号反复调用这里，不判转变的话时间线每 30 秒就被刷一条重复事件。
   const announce = (a) => {
     if (!a.exhaustedAt) {
+        // 积分限额提示（0.3.51，借鉴 dsh）：首次转变发气泡（每账号每天一次），
+        // 用户在智能体里看到失败时，托盘/通知中心已经解释过原因。
+        try {
+          const dayKey = new Date().toISOString().slice(0, 10);
+          if (exhaustNotifyDay.get(id) !== dayKey) {
+            exhaustNotifyDay.set(id, dayKey);
+            const acct = loadPool(site).accounts.find((x) => x.id === id);
+            const remainTxt = acct && acct.creditRemain != null ? String(acct.creditRemain) : '?';
+            notify(loadConfig(), '账号积分限额', (acct && acct.label ? acct.label : id) + ' 积分限额（剩 ' + remainTxt + '），已自动切换其他账号继续（同模型）');
+          }
+        } catch { /* 通知失败不影响标记 */ }
       recordEvent('account', `账号额度耗尽：${String(message).slice(0, 140)}`, { site, accountId: id });
     }
   };

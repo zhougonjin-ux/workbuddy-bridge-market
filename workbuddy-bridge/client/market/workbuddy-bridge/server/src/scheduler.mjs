@@ -13,6 +13,7 @@ import { suggestedPlan } from './expiry.mjs';
 import { log, warn } from './log.mjs';
 import { recordEvent } from './events.mjs';
 import { notify } from './notify.mjs';
+import { mapLimit } from './util.mjs';
 
 const timers = { credit: null, soon: null, boot: null };
 let creditLoopStopped = true;
@@ -45,22 +46,35 @@ export function scheduleCreditRefreshSoon(cfg, delayMs = 4000) {
  * 立即刷新一个站点所有启用账号的积分/到期明细。
  * 返回 { results: [{id, label, ok, remain?, error?}] }。
  */
+const balanceNotifyDay = new Map(); // uid → 已通知日期（保留线跌破气泡每账号每天一次）
+
 export async function refreshCreditsOnce(cfg, site) {
-  const results = [];
-  if (!supportsCreditQuery(cfg, site)) return results;
-  for (const a of listAccounts(site)) {
-    if (a.enabled === false || !a.accessToken) continue;
+  if (!supportsCreditQuery(cfg, site)) return [];
+  const accounts = listAccounts(site).filter((a) => a.enabled !== false && a.accessToken);
+  // 账号间并发 3：原先全串行，10 个账号首轮要 40s+，控制台整段时间都显示「—」。
+  // 上限刻意保守——计费接口是上游限流最紧的端点；失败仍按账号隔离（try/catch 在 fn 内）。
+  return mapLimit(accounts, 3, async (a) => {
     try {
       const credit = await queryCredit(cfg, site, a.id);
       updateCreditDetail(site, a.id, credit);
+      // 保留线跌破通知（0.3.51）：用户设了保留积分下限且余额跌破——气泡（每账号每天一次），
+      // 该账号同时会被 pickAccount 停止派活（isUsable 的 minRemain 判断）。
+      try {
+        const min = Number(a.minRemain);
+        const dayKey = new Date().toISOString().slice(0, 10);
+        if (Number.isFinite(min) && min > 0 && typeof credit.remain === 'number' && credit.remain < min
+          && balanceNotifyDay.get(a.id) !== dayKey) {
+          balanceNotifyDay.set(a.id, dayKey);
+          notify(cfg, '余额跌破保留线', (a.label || a.id) + ' 剩 ' + credit.remain + '（保留线 ' + min + '）——该账号已暂停派活，充值或调低保留线后恢复');
+        }
+      } catch { /* 通知失败不影响刷新 */ }
       // 明细为空（计费接口偶发返回空 Accounts）时 remain 恒为 0，不能据此判耗尽——
       // 否则健康账号被误标 6 小时 exhaustedAt，且每轮刷新周而复始
       if (Array.isArray(credit.detail) && credit.detail.length > 0 && typeof credit.remain === 'number' && credit.remain <= 0) {
         markExhausted(site, a.id, '余额为 0');
       }
-      results.push({ id: a.id, label: a.label || a.id, ok: true, remain: credit.remain });
+      return { id: a.id, label: a.label || a.id, ok: true, remain: credit.remain };
     } catch (e) {
-      results.push({ id: a.id, label: a.label || a.id, ok: false, error: String(e.message || e).slice(0, 160) });
       // 事件时间线（T6）：刷新失败通常意味着 401 登录态失效或上游异常，值得在时间线上回看
       recordEvent('credit', `积分刷新失败：${a.label || a.id}：${String(e.message || e).slice(0, 140)}`, { site, accountId: a.id });
       // T11 通知：登录态失效（401/refresh_token 缺失）需要用户重新扫码，弹一次（节流）
@@ -68,23 +82,23 @@ export async function refreshCreditsOnce(cfg, site) {
       if (/\b401\b|refresh_token|登录态|unauthorized/i.test(errText)) {
         notify(cfg, '账号登录态失效 🔴', `${a.label || a.id}（${site}）：${errText.slice(0, 100)}——请重新 /wbp-login 扫码或导入本机登录态`, { key: `account-401-${a.id}` });
       }
+      return { id: a.id, label: a.label || a.id, ok: false, error: String(e.message || e).slice(0, 160) };
     }
-  }
-  return results;
+  });
 }
 
-/** 刷新所有站点的积分明细。 */
+/** 刷新所有站点的积分明细。站点间并发 2：单站点超时不再阻塞其他站点。 */
 export async function refreshCreditsAll(cfg) {
-  const out = {};
-  for (const site of siteKeys(cfg)) {
+  const sites = siteKeys(cfg);
+  const pairs = await mapLimit(sites, 2, async (site) => {
     try {
-      out[site] = await refreshCreditsOnce(cfg, site);
+      return [site, await refreshCreditsOnce(cfg, site)];
     } catch (e) {
       warn(`[${site}] 积分刷新失败：`, e.message);
-      out[site] = [{ ok: false, error: String(e.message || e).slice(0, 160) }];
+      return [site, [{ ok: false, error: String(e.message || e).slice(0, 160) }]];
     }
-  }
-  return out;
+  });
+  return Object.fromEntries(pairs);
 }
 
 /** 对话出口调用：告诉刷新循环「刚有真实消耗，缓存该跟紧一点」（T31）。
@@ -238,6 +252,7 @@ export function bridgeStatus(cfg, { redact = false } = {}) {
   return {
     policy: cfg.pool?.policy || 'expiry-first',
     pinnedAccountId: cfg.pool?.pinnedAccountId || null,
+    defaultModel: cfg.defaultModel,
     creditRefreshMinutes: cfg.creditRefreshMinutes,
     // tasks + budget 一起下发：任务页预算卡（T13/T63）输入框初值要用真实配置——
     // 以前 tasks 里没有 budget，改过 dailyCredits/按账号预算后重开页面输入框永远显示默认值。

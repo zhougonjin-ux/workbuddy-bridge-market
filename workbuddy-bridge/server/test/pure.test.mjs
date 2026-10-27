@@ -618,20 +618,12 @@ test('T32 predictAccount / burnoutReport：汇总风险批次数与总浪费额'
 // 背景（2026-10-03 22:0x）：原来只要 pathname !== '/health' 就计数，控制台的
 // 20 秒轮询与 SSE 长连接也被计入。老标签页开着时活跃数永久 ≥ 1，交棒重启永远等
 // 不到空闲 → 老实例不退出、新实例 30 秒后放弃 → 改了代码却没生效（health 却正常）。
-// isModelPath 定义在 server.mjs 里（单测不加载它），这里用源码提取的方式验证判定口径。
+// isModelPath 已抽到 src/pathmatch.mjs（server.mjs 的协议分派共用同一实现）。
+// 这里直接测真实模块：原先从 server.mjs 里 eval 源码，只能测到「字符串还在」，
+// 测不到行为，而且函数一搬家测试就假失败。
 
 test('交棒重启：isModelPath 只把模型调用算活跃请求，控制台轮询/SSE 不算', async () => {
-  const fs = await import('node:fs');
-  const path = await import('node:path');
-  const { fileURLToPath } = await import('node:url');
-  // import.meta.url 是 file:///E:/... 形式的 URL，必须过 fileURLToPath 再算路径 ——
-  // 直接 path.dirname 会得到 "E:\E:\..." 双前缀（Windows 上踩过，报 ENOENT）。
-  const here = path.dirname(fileURLToPath(import.meta.url));
-  const src = fs.readFileSync(path.join(here, '..', 'server.mjs'), 'utf8');
-  const m = src.match(/function isModelPath\(pathname\) \{[\s\S]*?\n\}/);
-  assert.ok(m, 'server.mjs 里应能提取到 isModelPath 函数');
-  // 用 new Function 显式返回：ESM 是严格模式，eval 里的 function 声明不会泄漏到外层作用域
-  const isModelPath = new Function(`${m[0]}; return isModelPath;`)();
+  const { isModelPath } = await import('../src/pathmatch.mjs');
 
   // 模型调用：掐断它 = 用户会话断线，必须计入
   for (const p of ['/v1/chat/completions', '/chat/completions', '/v1/messages', '/v1/responses', '/v1/models', '/v1/messages/chat/completions']) {
@@ -641,6 +633,15 @@ test('交棒重启：isModelPath 只把模型调用算活跃请求，控制台�
   for (const p of ['/health', '/healthz', '/console/api/stream', '/console/api/bridge', '/console', '/admin/restart', '/status', '/']) {
     assert.equal(isModelPath(p), false, `${p} 不是模型调用，不该计入活跃请求（计入会导致交棒重启永远等不到空闲）`);
   }
+
+  // 防回退：server.mjs 必须引用共享实现，不能又内联一份（口径漂移会掐断会话）
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { fileURLToPath } = await import('node:url');
+  const here = path.dirname(fileURLToPath(import.meta.url));
+  const src = fs.readFileSync(path.join(here, '..', 'server.mjs'), 'utf8');
+  assert.equal(/function isModelPath\s*\(/.test(src), false, 'server.mjs 不应再内联 isModelPath，应 import src/pathmatch.mjs');
+  assert.match(src, /from '\.\/src\/pathmatch\.mjs'/);
 });
 
 /* ---------------- B4 provider_config 隔离守卫（2026-10-03 端口污染事故） ---------------- */
@@ -777,6 +778,47 @@ test('B5 连续同步不重复追加 CodeArts 条目（0.3.66 选择器整份失
   const ids = doc.config.providerConfigRules.providerRules.map((r) => r.providerId);
   assert.equal(ids.filter((id) => id === 'workbuddy-bridge').length, 1, 'WorkBuddy 条目只能有一条');
   assert.equal(ids.filter((id) => id === 'workbuddy-bridge-codearts').length, 1, 'CodeArts 条目只能有一条（重复即整份校验失败）');
+});
+
+test('模型分组按 site（权威）而不是模型名正则：腾讯/华为同名不再错分', async () => {
+  // 0.3.66 补丁 7/8/9 连续修「名字正则分组」的漏判：上游加一个华为 SKU 就要改代码，
+  // 腾讯 glm-5.2 与华为 GLM-5.2 只差大小写。现在 /v1/models 自带 site，直接按站点分组。
+  const { syncProviderConfigFile } = await import('../src/pickersync.mjs');
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-group-'));
+  const target = path.join(iso, 'provider_config.json');
+  const base = { contextWindow: 200000, maxOutputTokens: 32000, supportsImages: false };
+  const models = [
+    { ...base, id: 'glm-5.2 (x0.3)', site: 'cn-cli' },
+    { ...base, id: 'GLM-5.2 (x0.7)', site: 'codearts' },
+    { ...base, id: 'brand-new-huawei-sku (x0.2)', site: 'codearts' }, // 名字正则不认识，site 能分对
+  ];
+  const r = syncProviderConfigFile({ apiKey: 'sk-wb-test', baseUrl: 'http://127.0.0.1:8788/v1', models, target });
+  assert.equal(r, 'written');
+  const doc = JSON.parse(fs.readFileSync(target, 'utf8'));
+  const rules = doc.config.providerConfigRules.providerRules;
+  const wb = rules.find((x) => x.providerId === 'workbuddy-bridge');
+  const ca = rules.find((x) => x.providerId === 'workbuddy-bridge-codearts');
+  assert.deepEqual(wb.config.personalModelIds, ['glm-5.2 (x0.3)'], '腾讯站点模型进 WorkBuddy');
+  assert.deepEqual(ca.config.personalModelIds, ['GLM-5.2 (x0.7)', 'brand-new-huawei-sku (x0.2)'], '华为站点模型全部进 CodeArts');
+});
+
+test('兜底模型没有 site 时仍按名字正则分组（升级兼容）', async () => {
+  const { syncProviderConfigFile } = await import('../src/pickersync.mjs');
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-group2-'));
+  const target = path.join(iso, 'provider_config.json');
+  const base = { contextWindow: null, maxOutputTokens: null, supportsImages: false };
+  syncProviderConfigFile({
+    apiKey: 'sk-wb-test',
+    baseUrl: 'http://127.0.0.1:8788/v1',
+    models: [
+      { ...base, id: 'glm-5.3 (x0.69)' },
+      { ...base, id: 'codearts/glm-5.3 (x0.69)' },
+    ],
+    target,
+  });
+  const rules = JSON.parse(fs.readFileSync(target, 'utf8')).config.providerConfigRules.providerRules;
+  assert.deepEqual(rules.find((x) => x.providerId === 'workbuddy-bridge').config.personalModelIds, ['glm-5.3 (x0.69)']);
+  assert.deepEqual(rules.find((x) => x.providerId === 'workbuddy-bridge-codearts').config.personalModelIds, ['codearts/glm-5.3 (x0.69)']);
 });
 
 /* ---------------- T33/T34/T35/T36/T37/T39：新功能纯函数 ---------------- */

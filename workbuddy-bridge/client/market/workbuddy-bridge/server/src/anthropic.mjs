@@ -2,7 +2,8 @@
 // Trae 的「Claude 型自定义模型」走 Anthropic Messages 协议，这里做双向转换。
 import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId, reportFrameError } from './upstream.mjs';
 import { resolveTarget } from './router.mjs';
-import { openWithSiteFallback } from './openai.mjs';
+import { openWithSiteFallback, openWithModelChain } from './openai.mjs';
+import { aggregateOpen } from './aggregate.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
 import { startSSE, writeSSEEvent, sendJson, sendError, writeAsync, estimateTokens, startHeartbeat } from './util.mjs';
 import { requestLog, warn } from './log.mjs';
@@ -129,15 +130,18 @@ export async function handleMessages(ctx) {
   const openaiBody = toOpenAIBody({ ...body, model });
   if (openaiBody.max_tokens === undefined) openaiBody.max_tokens = cfg.defaultMaxTokens;
 
-  // 与 openai/responses 入口共用同一条降级编排（openWithSiteFallback）：
+  // 与 openai/responses 入口共用同一条降级编排（openWithModelChain：站点降级之上
+  // 还带模型链——cfg.modelChains 配了链时，模型层失败按序换下一个模型）：
   // 连接失败 / 模型不存在 / 网关 5xx / 额度 429·402 四条路径在这里统一处理，
   // 补齐了原实现缺的「额度层换站」——429/402 是 return 不是 throw，原来根本进不了降级。
-  const r = await openWithSiteFallback(
+  const r = await openWithModelChain(
     cfg,
     target,
     openaiBody,
     signal,
-    (s, b) => openChatRotating(cfg, s, b, { signal }).then((x) => x.up)
+    target.aggregate
+      ? (s, b) => aggregateOpen(cfg, target.aggregate.provider, b, signal)
+      : (s, b) => openChatRotating(cfg, s, b, { signal }).then((x) => x.up)
   );
   const up = r.up;
   site = r.site;
@@ -161,10 +165,17 @@ export async function handleMessages(ctx) {
     // 兜底：max_tokens 过小导致空回答时放大预算重试一次。
     // 加 frames/finish 守卫：零帧空流（上游异常）重试也是空流，白打一次计费请求
     const askedMax = Number(body.max_tokens ?? 0);
-    if (!agg.content && agg.toolCallList.length === 0 && (agg.finishReason === 'length' || agg.frames > 0) && askedMax > 0 && askedMax < 1024) {
+    if (!agg.content && agg.toolCallList.length === 0 && !target.aggregate && (agg.finishReason === 'length' || agg.frames > 0) && askedMax > 0 && askedMax < 1024) {
       warn(`[${site}] 空回答（finish=${agg.finishReason}，max_tokens=${askedMax}），放大到 1024 重试一次`);
-      const up2 = await openChat(cfg, site, { ...openaiBody, max_tokens: Math.max(1024, askedMax * 4) }, { signal });
-      if (up2.ok) {
+      // 与 openai 入口对齐（0.3.53 P2）：①改走 openChatRotating 拿账号轮换（重试不该
+      // 又选中刚失败的号）；②重试的传输失败不顶掉已拿到的（空但合法的）结果
+      let up2 = null;
+      try {
+        up2 = await openChatRotating(cfg, site, { ...openaiBody, max_tokens: Math.max(1024, askedMax * 4) }, { signal }).then((r) => r.up);
+      } catch (e) {
+        warn(`[${site}] 空回答放大重试失败（保留原结果）：`, e?.message || String(e));
+      }
+      if (up2?.ok) {
         try {
           agg = await aggregateFrames(up2.frames);
         } catch {
@@ -172,7 +183,7 @@ export async function handleMessages(ctx) {
         } finally {
           up2.close();
         }
-      } else {
+      } else if (up2) {
         up2.close?.();
       }
     }
@@ -199,6 +210,7 @@ export async function handleMessages(ctx) {
       tools: agg.toolCallList.length,
       account: up.accountId,
       upstreamCredit: Number.isFinite(agg.usage?.credit) ? agg.usage.credit : null,
+      cacheHitTokens: agg.usage?.prompt_cache_hit_tokens ?? agg.usage?.cached_tokens ?? 0,
     });
     return sendJson(res, 200, {
       id: newId('msg'),
@@ -351,6 +363,7 @@ export async function handleMessages(ctx) {
       tools: toolBlocks.size,
       account: up.accountId,
       upstreamCredit: Number.isFinite(usage?.credit) ? usage.credit : null,
+      cacheHitTokens: usage?.prompt_cache_hit_tokens ?? usage?.cached_tokens ?? 0,
     });
   }
 }

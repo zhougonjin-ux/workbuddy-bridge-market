@@ -16,10 +16,26 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import { getConfigDir } from './config.mjs';
+import { getConfigDir, primaryKey } from './config.mjs';
 
 export const PROVIDER_ID = 'workbuddy-bridge';
 export const PROVIDER_NAME = 'WorkBuddy';
+/** 华为云 CodeArts 独立供应商条目（0.3.66）：选择器分类里与 WorkBuddy 并列显示。
+ *  同一个代理端点，仅是 ZCode 侧的分组名——模型按平台拆开归组。 */
+export const CODEARTS_PROVIDER_ID = 'workbuddy-bridge-codearts';
+export const CODEARTS_PROVIDER_NAME = 'CodeArts (华为云)';
+/** 模型 id → 所属分组：codearts 站点的模型（裸名华为独有 + codearts/ 前缀变体）。
+ *  ⚠️ 选择器 id 带倍率后缀（如 "GLM-5.2 (x0.7)"）——分组前必须先剥掉，否则
+ *  0.3.66 补丁8 之后华为模型全部错分进 WorkBuddy 组（实测 CodeArts 只剩 3 个）。
+ *  1017（deepseek-v4.1-flash-1017）是华为独有 SKU，一并归组。 */
+function codeartsGroupOf(modelId) {
+  const id = String(modelId || '')
+    .replace(/\s*\((?:x[\d.]+|免费)\)\s*$/, '') // 剥倍率/免费后缀
+    .trim();
+  if (id.startsWith('codearts/')) return true;
+  // ⚠️ 大小写敏感：华为是 GLM-5.2（大写），腾讯是 glm-5.2（小写）——/i 会把腾讯的误分进来
+  return /^(GLM-5\.2|openpangu-2\.0-(?:flash|pro)|glm-5\.2-sft-harmony|kimi-k2\.6-vl|kimi-k3|deepseek-v4\.1-flash-1017)$/.test(id);
+}
 
 /** 生产数据目录（未设 WB_CONFIG_DIR 时用的那个）。 */
 function productionConfigDir() {
@@ -53,8 +69,8 @@ export function providerConfigTarget() {
     || path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
 }
 
-/** 拉取代理当前暴露的模型（带倍率后缀的 ID、上下文/输出上限、图像支持）。 */
-export async function fetchPickerModels(port, timeoutMs = 3000) {
+/** 拉取代理当前暴露的模型（带倍率后缀的 ID、上下文/输出上限、图像支持、所属站点）。 */
+export async function fetchPickerModels(port, timeoutMs = 8000) {
   const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`/v1/models HTTP ${res.status}`);
   const body = await res.json();
@@ -62,6 +78,9 @@ export async function fetchPickerModels(port, timeoutMs = 3000) {
     .filter((m) => typeof m?.id === 'string' && m.id)
     .map((m) => ({
       id: m.id,
+      // 所属站点是分组的权威依据（router.mergedModels 已经带 site）。
+      // 3 秒超时对「聚合多个站点目录」太紧，偶发超时会退回旧清单，模型看起来像没更新。
+      site: typeof m.site === 'string' && m.site ? m.site : null,
       contextWindow: Number.isFinite(m.context_window) ? m.context_window : null,
       maxOutputTokens: Number.isFinite(m.max_output_tokens) ? m.max_output_tokens : null,
       supportsImages: m.supports_images === true,
@@ -146,7 +165,11 @@ export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
     : {};
   const providerRules = Array.isArray(pcr.providerRules) ? pcr.providerRules.filter((r) => r && typeof r === 'object') : [];
   const previous = providerRules.find((r) => r?.providerId === PROVIDER_ID);
-  const keptRules = providerRules.filter((r) => r?.providerId !== PROVIDER_ID);
+  // 两个自己的条目都要先摘掉再重建：只摘 WORKBUDDY 会让 CODEARTS 每轮同步
+  // 再追加一条（下面 push 新条目），providerId 重复后 ZCode 的 Zod 校验整份
+  // 文件判失败 → 内存降级为空配置 → 选择器里 WorkBuddy/CodeArts 模型全消失
+  // （2026-10-27 事故：6 条重复 codearts、140 次「加载失败」）。
+  const keptRules = providerRules.filter((r) => r?.providerId !== PROVIDER_ID && r?.providerId !== CODEARTS_PROVIDER_ID);
 
   const modelIds = models.map((m) => m.id);
   if (modelIds.length === 0 && Array.isArray(previous?.config?.personalModelIds) && previous.config.personalModelIds.length > 0) {
@@ -155,43 +178,60 @@ export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
     // 编译规则缺失导致模型回退内置默认行为，直到下次成功同步才自愈
     return 'unchanged';
   }
-  const personalModelIds = modelIds.length > 0
-    ? modelIds
-    : (Array.isArray(previous?.config?.personalModelIds) ? previous.config.personalModelIds : []);
+  // 按平台拆组（0.3.66）：腾讯系归 WorkBuddy，华为系归 CodeArts 独立条目——
+  // ZCode 选择器的供应商分类里两家并列。同一 baseUrl/apiKey，仅分组不同。
+  //
+  // 分组依据优先用模型自带的 site（权威来源），只有兜底模型（没有 site 字段）才
+  // 回落到 codeartsGroupOf 的名字正则。这样上游新增华为 SKU 不需要改代码，
+  // 腾讯/华为同名模型（glm-5.2 vs GLM-5.2）也不会再错分。
+  const isCodeartsModel = (m) => (m.site ? m.site === 'codearts' : codeartsGroupOf(m.id));
+  const wbModels = models.filter((m) => !isCodeartsModel(m));
+  const caModels = models.filter((m) => isCodeartsModel(m));
+  const personalModelIds = wbModels.map((m) => m.id);
   if (personalModelIds.length === 0 && !previous) return 'skipped'; // 首次注册但一个模型都拿不到，等下次
 
-  keptRules.push({
-    providerId: PROVIDER_ID,
-    providerName: PROVIDER_NAME,
+  const buildProviderEntry = (providerId, providerName, list) => ({
+    providerId,
+    providerName,
     enabled: true,
     config: {
       group: 'standard-personal',
       access: { type: 'api-key', apiKey },
       api: { type: 'openai-chat-completions', baseUrl },
-      personalModelIds,
-      modelOrder: personalModelIds,
+      personalModelIds: list.map((m) => m.id),
+      modelOrder: list.map((m) => m.id),
     },
   });
+  keptRules.push(buildProviderEntry(PROVIDER_ID, PROVIDER_NAME, wbModels));
+  // CodeArts 条目：有华为模型才注册；这轮拉不到时保留旧条目（避免分类闪没）
+  const prevCodearts = providerRules.find((r) => r?.providerId === CODEARTS_PROVIDER_ID);
+  const caModelsOrPrev = caModels.length
+    ? caModels
+    : (prevCodearts?.config?.personalModelIds || []).map((id) => ({ id, contextWindow: null, maxOutputTokens: null, supportsImages: false }));
+  if (caModelsOrPrev.length > 0) keptRules.push(buildProviderEntry(CODEARTS_PROVIDER_ID, CODEARTS_PROVIDER_NAME, caModelsOrPrev));
+  else if (prevCodearts) keptRules.push(prevCodearts);
   pcr.providerRules = keptRules;
   cfgRoot.providerConfigRules = pcr;
 
-  // --- modelConfigRules：只替换自己供应商的规则 ---
+  // --- modelConfigRules：只替换自己两个供应商的规则 ---
   const mcr = (cfgRoot.modelConfigRules && typeof cfgRoot.modelConfigRules === 'object' && !Array.isArray(cfgRoot.modelConfigRules))
     ? cfgRoot.modelConfigRules
     : {};
   const manualRules = Array.isArray(mcr.manualProviderModelRules)
-    ? mcr.manualProviderModelRules.filter((r) => r && typeof r === 'object' && r.providerId !== PROVIDER_ID)
+    ? mcr.manualProviderModelRules.filter((r) => r && typeof r === 'object' && r.providerId !== PROVIDER_ID && r.providerId !== CODEARTS_PROVIDER_ID)
     : [];
-  for (const m of models) manualRules.push(buildModelRule(m));
+  for (const m of wbModels) manualRules.push({ ...buildModelRule(m), providerId: PROVIDER_ID });
+  for (const m of caModels) manualRules.push({ ...buildModelRule(m), providerId: CODEARTS_PROVIDER_ID });
   mcr.manualProviderModelRules = manualRules;
   // providerModelRules 是必填键（且不能与 manual 规则同 provider/model 重复）
   if (!Array.isArray(mcr.providerModelRules)) mcr.providerModelRules = [];
-  mcr.providerModelRules = mcr.providerModelRules.filter((r) => r?.providerId !== PROVIDER_ID);
+  mcr.providerModelRules = mcr.providerModelRules.filter((r) => r?.providerId !== PROVIDER_ID && r?.providerId !== CODEARTS_PROVIDER_ID);
   cfgRoot.modelConfigRules = mcr;
 
   // --- providerOrder：不存在就放最前，已存在保持用户排的顺序 ---
   if (!Array.isArray(cfgRoot.providerOrder)) cfgRoot.providerOrder = [];
   if (!cfgRoot.providerOrder.includes(PROVIDER_ID)) cfgRoot.providerOrder.unshift(PROVIDER_ID);
+  if (!cfgRoot.providerOrder.includes(CODEARTS_PROVIDER_ID)) cfgRoot.providerOrder.splice(cfgRoot.providerOrder.indexOf(PROVIDER_ID) + 1, 0, CODEARTS_PROVIDER_ID);
 
   const next = JSON.stringify({ schemaVersion: 1, config: cfgRoot }, null, 2);
   let current = null;
@@ -239,7 +279,7 @@ export async function triggerProviderConfigSyncNow() {
   try {
     const r = await runProviderConfigSync({
       port: currentCfg.port,
-      apiKey: currentCfg.apiKey,
+      apiKey: primaryKey(currentCfg),
       fallbackModels: (currentCfg.models || []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
     });
     if (r.result === 'written') {
@@ -262,7 +302,7 @@ export function startProviderConfigSync(cfg, onError) {
     try {
       const r = await runProviderConfigSync({
         port: cfg.port,
-        apiKey: cfg.apiKey,
+        apiKey: primaryKey(cfg),
         fallbackModels: (cfg.models || []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
       });
       if (r.result === 'written') {

@@ -195,6 +195,8 @@ function parseHash() {
 
 function showView(name, focus = null) {
   active = name;
+  // 回首页时重新检查向导：用户刚加完账号/同步完模型，5 分钟缓存会显示旧状态
+  if (name === 'home') onboardingCache = null;
   window.__wbActiveView = name; // HUD 壳层同步导航高亮用（shell.js 轮询读取）
   for (const v of VIEWS) { const el = $('#view-' + v); if (el) el.hidden = v !== name; }
   $('#backBar').hidden = name === 'home';
@@ -289,7 +291,23 @@ function bindTaskSwitch(id, key, after) {
   if (!cb) return;
   cb.onchange = async () => {
     try {
-      const r = await api('/tasks/config', { method: 'POST', body: { [key]: cb.checked } });
+      let r;
+      try {
+        r = await api('/tasks/config', { method: 'POST', body: { [key]: cb.checked } });
+      } catch (e) {
+        // 首次开启自动化任务：必须显式确认 ToS/封号风险（一次性）。
+        // 后端只在「关 → 开」时回 409，老用户改时点不会被拦。
+        if (!/RISK_REQUIRED/.test(String(e.message || ''))) throw e;
+        const ok = window.confirm(
+          '开启自动任务前请确认：\n\n'
+          + '插件会用非官方接口代替你执行签到、领奖、代打等操作，\n'
+          + '这可能违反 WorkBuddy / CodeBuddy 服务条款，并带来封号风险。\n\n'
+          + '账号凭证只保存在本机，不会外发。\n\n'
+          + '确认你已了解并自行承担风险，现在开启？',
+        );
+        if (!ok) { cb.checked = false; toast('已取消开启自动任务', 'warn'); return; }
+        r = await api('/tasks/config', { method: 'POST', body: { [key]: cb.checked, riskAccepted: true } });
+      }
       const s = r.saved || {};
       toast(key === 'enabled'
         ? (s.enabled === false ? '自动任务已整体关闭（调度循环已停）' : '自动任务已开启（调度循环已启动）')
@@ -298,6 +316,40 @@ function bindTaskSwitch(id, key, after) {
     } catch (e) { toast('切换失败：' + e.message, 'bad'); cb.checked = !cb.checked; }
   };
 }
+/* ---------- 首次使用向导：首页顶部「下一步」清单（5 分钟缓存） ---------- */
+// 新用户最大的门槛不是功能不够，而是不知道下一步点哪：装 Node → 加账号 →
+// 接选择器 → 拿 key。这里把四件事变成可勾选清单，全部完成自动消失。
+let onboardingCache = null;
+async function loadOnboarding() {
+  if (onboardingCache && Date.now() - onboardingCache.at < 5 * 60_000) return onboardingCache;
+  try {
+    const r = await api('/onboarding');
+    onboardingCache = { at: Date.now(), ...r };
+  } catch {
+    // 接口异常不应让首页报错——当作已完成，静默隐藏
+    onboardingCache = { at: Date.now(), allDone: true, steps: [] };
+  }
+  return onboardingCache;
+}
+
+function onboardingHtml(ob) {
+  if (!ob || ob.allDone || !Array.isArray(ob.steps) || !ob.steps.length) return '';
+  const rows = ob.steps.map((s) => `
+    <div style="display:flex;gap:10px;align-items:flex-start;padding:9px 0;border-top:1px solid rgba(255,255,255,.06)">
+      <span style="width:18px;flex:none;text-align:center;color:${s.ok ? '#34D399' : 'var(--mu)'}">${s.ok ? '✓' : '○'}</span>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px">${esc(s.title)} <span class="muted" style="font-size:12px">${esc(s.detail || '')}</span></div>
+        ${s.ok ? '' : `<div class="muted" style="font-size:12px;margin-top:3px">${esc(s.action || '')}</div>`}
+      </div>
+      ${s.ok || !s.href ? '' : `<a href="${esc(s.href)}" style="flex:none;font-size:12px;color:var(--ac);text-decoration:none">去处理 →</a>`}
+    </div>`).join('');
+  return `
+    <div class="card" style="--c:#4F8CFF;margin-bottom:14px">
+      <div class="h">开始使用 <span>${ob.done}/${ob.total} 已完成 · 全部完成后自动隐藏</span></div>
+      <div style="margin-top:4px">${rows}</div>
+    </div>`;
+}
+
 async function loadTcSummary() {
   if (tcSummary && Date.now() - tcSummary.at < 10 * 60_000) return; // 10 分钟内不重复拉
   tcSummary = { at: Date.now(), rows: [], loading: true };
@@ -648,7 +700,9 @@ async function loadOverview() {
         </div>
       </div>`;
 
+    const ob = await loadOnboarding();
     const changed = paint(el, `
+      ${onboardingHtml(ob)}
       <div class="k4">${kpis}</div>
       <div class="g">
         <div class="card hv tilt an" style="--c:#7B5CFF;animation-delay:240ms">

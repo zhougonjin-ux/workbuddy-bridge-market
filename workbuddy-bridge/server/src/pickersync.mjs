@@ -69,8 +69,8 @@ export function providerConfigTarget() {
     || path.join(os.homedir(), '.zcode', 'v2', 'provider_config.json');
 }
 
-/** 拉取代理当前暴露的模型（带倍率后缀的 ID、上下文/输出上限、图像支持）。 */
-export async function fetchPickerModels(port, timeoutMs = 3000) {
+/** 拉取代理当前暴露的模型（带倍率后缀的 ID、上下文/输出上限、图像支持、所属站点）。 */
+export async function fetchPickerModels(port, timeoutMs = 8000) {
   const res = await fetch(`http://127.0.0.1:${port}/v1/models`, { signal: AbortSignal.timeout(timeoutMs) });
   if (!res.ok) throw new Error(`/v1/models HTTP ${res.status}`);
   const body = await res.json();
@@ -78,6 +78,9 @@ export async function fetchPickerModels(port, timeoutMs = 3000) {
     .filter((m) => typeof m?.id === 'string' && m.id)
     .map((m) => ({
       id: m.id,
+      // 所属站点是分组的权威依据（router.mergedModels 已经带 site）。
+      // 3 秒超时对「聚合多个站点目录」太紧，偶发超时会退回旧清单，模型看起来像没更新。
+      site: typeof m.site === 'string' && m.site ? m.site : null,
       contextWindow: Number.isFinite(m.context_window) ? m.context_window : null,
       maxOutputTokens: Number.isFinite(m.max_output_tokens) ? m.max_output_tokens : null,
       supportsImages: m.supports_images === true,
@@ -177,8 +180,13 @@ export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
   }
   // 按平台拆组（0.3.66）：腾讯系归 WorkBuddy，华为系归 CodeArts 独立条目——
   // ZCode 选择器的供应商分类里两家并列。同一 baseUrl/apiKey，仅分组不同。
-  const wbModels = models.filter((m) => !codeartsGroupOf(m.id));
-  const caModels = models.filter((m) => codeartsGroupOf(m.id));
+  //
+  // 分组依据优先用模型自带的 site（权威来源），只有兜底模型（没有 site 字段）才
+  // 回落到 codeartsGroupOf 的名字正则。这样上游新增华为 SKU 不需要改代码，
+  // 腾讯/华为同名模型（glm-5.2 vs GLM-5.2）也不会再错分。
+  const isCodeartsModel = (m) => (m.site ? m.site === 'codearts' : codeartsGroupOf(m.id));
+  const wbModels = models.filter((m) => !isCodeartsModel(m));
+  const caModels = models.filter((m) => isCodeartsModel(m));
   const personalModelIds = wbModels.map((m) => m.id);
   if (personalModelIds.length === 0 && !previous) return 'skipped'; // 首次注册但一个模型都拿不到，等下次
 
