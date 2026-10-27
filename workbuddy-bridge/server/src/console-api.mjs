@@ -1081,17 +1081,42 @@ export async function handleConsoleApi(ctx) {
       const authUrl = await flow.getLoginUrl();
       const entry = { flow };
       codeartsLoginFlows.set('codearts', entry);
+      const { listAccounts: caListFromPool } = await import('./pool.mjs'); // .then 回调非 async，先取好闭包
       // 后台等结果：成功即入号池（不做长轮询阻塞——控制台前端自己 poll）
       flow.waitForResult().then(
         (credential) => {
           codeartsLoginFlows.delete('codearts');
           try {
+            // 身份查重：refresh_token JWT 的 user_profile.account_id 是华为云账号唯一标识
+            //（credential 里 user_id/user_name 恒为 null，不能当 uid）。同账号重复登录
+            // 覆盖原账号而不是新增——否则同会话三条凭据互相踩（STS 刷新会作废旧 access）。
+            let huaweiAccountId = null;
+            try {
+              const pl = JSON.parse(Buffer.from(credential.refresh_token.split('.')[1], 'base64url').toString('utf8'));
+              huaweiAccountId = String(JSON.parse(Buffer.from(pl.user_profile, 'base64url').toString('utf8')).account_id || '') || null;
+            } catch { /* 形状变化时退化为不查重 */ }
+            // caListFromPool 闭包来自下方 handler 开头的 await import（.then 回调非 async，不能 import）
+            if (huaweiAccountId && caListFromPool) {
+              for (const a of caListFromPool('codearts')) {
+                let dup = false;
+                try {
+                  const c = JSON.parse(a.accessToken);
+                  const pl = JSON.parse(Buffer.from(c.refresh_token.split('.')[1], 'base64url').toString('utf8'));
+                  dup = String(JSON.parse(Buffer.from(pl.user_profile, 'base64url').toString('utf8')).account_id || '') === huaweiAccountId;
+                } catch { /* 坏凭据不当重复 */ }
+                if (dup && a.id) {
+                  removeAccount('codearts', a.id);
+                  recordEvent('login', `CodeArts：同账号重新登录，已覆盖 ${a.label || a.id}`, { site: 'codearts' });
+                  break;
+                }
+              }
+            }
             const saved = addAccount('codearts', {
               accessToken: JSON.stringify(credential),
               refreshToken: credential.refresh_token || 'codearts',
               expiresAt: new Date(credential.expires_at || Date.now() + 86_400_000).getTime(),
-              uid: credential.user_id || null,
-              nickname: credential.user_name || null,
+              uid: huaweiAccountId,
+              nickname: null,
             }, { label: body.label ? String(body.label).slice(0, 40) : null });
             recordEvent('login', `CodeArts 账号登录成功：${saved.label || saved.nickname || saved.id}`, { site: 'codearts', accountId: saved.id });
           } catch (e) {
