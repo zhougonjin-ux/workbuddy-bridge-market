@@ -412,21 +412,21 @@ class MainForm : Form
     readonly Dictionary<string, Label> loginCountLabels = new Dictionary<string, Label>();
     readonly Dictionary<string, Button> loginAddButtons = new Dictionary<string, Button>();
     bool loginPolling;
-    static readonly string[] LoginSites = { "cn-cli", "intl-cli", "intl-work" };
-    static readonly string[] LoginNames = { "WorkBuddy 国内版", "WorkBuddy 国际版", "WorkBuddy 国际工作版" };
+    static readonly string[] LoginSites = { "codearts", "cn-cli", "intl-cli", "intl-work" };
+    static readonly string[] LoginNames = { "CodeArts（华为云）", "WorkBuddy 国内版", "WorkBuddy 国际版", "WorkBuddy 国际工作版" };
     static readonly string[] LoginDescs = {
+        "GLM-5.3-Flash · DeepSeek-V4.1-Flash 免费额度 + 每日签到积分，华为云账号 OAuth 授权（浏览器完成）",
         "与 CodeBuddy 共用端点：DeepSeek · Kimi · GLM 免费线，每日赠送积分",
         "codebuddy.ai 独立端点与账号体系：GPT · Claude · Gemini 阵容，积分与国内版不互通",
         "workbuddy.ai 工作台端点：独立账号体系，与国内/国际 CLI 互不相通",
     };
-    static readonly Color[] LoginColors = { Color.FromArgb(59, 130, 246), Color.FromArgb(16, 185, 129), Color.FromArgb(245, 158, 11) };
+    static readonly Color[] LoginColors = { Color.FromArgb(225, 29, 72), Color.FromArgb(59, 130, 246), Color.FromArgb(16, 185, 129), Color.FromArgb(245, 158, 11) };
 
     // dsh-xdpool 支持网页/扫码登录的其它厂商目录（0.3.65）：本插件只代理 WorkBuddy/CodeBuddy
     // 账号体系，这几家没有端点适配，仅作目录展示（未接入置灰，按钮不可点）。
-    static readonly string[] PendingNames = { "CodeArts", "LobsterAI", "Qoder 国际版", "Qoder 国内版", "TRAE", "Cline" };
-    static readonly string[] PendingVendors = { "华为云", "有道", "阿里云", "阿里云", "字节跳动", "Cline Bot" };
+    static readonly string[] PendingNames = { "LobsterAI", "Qoder 国际版", "Qoder 国内版", "TRAE", "Cline" };
+    static readonly string[] PendingVendors = { "有道", "阿里云", "阿里云", "字节跳动", "Cline Bot" };
     static readonly string[] PendingDescs = {
-        "已开通免费体验套餐，自动续期不收费；新人积分 + DeepSeek · GLM · openPangu 每日免费额度",
         "每日签到领积分，积分换模型调用额度",
         "每日 100 Credits，加密推理端点",
         "每日 100 Credits，国内端点与模型池",
@@ -434,7 +434,7 @@ class MainForm : Form
         "绑定 GitHub 账号后送美元计价的免费额度；后端没有每日签到接口",
     };
     static readonly Color[] PendingColors = {
-        Color.FromArgb(225, 29, 72), Color.FromArgb(249, 115, 22), Color.FromArgb(99, 102, 241),
+        Color.FromArgb(249, 115, 22), Color.FromArgb(99, 102, 241),
         Color.FromArgb(139, 92, 246), Color.FromArgb(20, 184, 166), Color.FromArgb(91, 33, 182),
     };
 
@@ -1391,8 +1391,80 @@ class MainForm : Form
         loginStatus.ForeColor = color;
     }
 
-    /** 设备授权登录：POST /login/start → 浏览器打开授权页 → 每 3 秒轮询 /login/poll，最长 10 分钟。 */
+    /** 登录入口分发：CodeArts 走华为云 OAuth（服务端起本地回调，浏览器授权）；其余走设备授权。 */
     void StartDeviceLogin(string site)
+    {
+        if (site == "codearts") { StartCodeArtsLogin(site); return; }
+        StartDeviceLoginBase(site);
+    }
+
+    /** CodeArts OAuth 登录：POST /login/start（服务端返回 portal 授权 URL 并已在本地挂回调服务器）
+     *  → 打开浏览器 → 每 2.5 秒轮询 /login/poll 到 done（服务端后台 promise 已把凭据写入号池）。 */
+    void StartCodeArtsLogin(string site)
+    {
+        if (loginPolling) { SetLoginStatus("已有登录流程进行中——请先等它完成", Warn); return; }
+        loginPolling = true;
+        foreach (var b in loginAddButtons.Values) b.Enabled = false;
+        SetLoginStatus("正在准备华为云授权（" + site + "）…", SubText);
+        new Thread(delegate()
+        {
+            string doneMsg = null;
+            bool ok = false;
+            try
+            {
+                string outText = Program.Api("POST", "/console/api/login/start", "{\"site\":\"" + site + "\"}");
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer();
+                var d = ser.DeserializeObject(outText) as Dictionary<string, object>;
+                string authUrl = d != null && d.ContainsKey("authUrl") ? Str(d, "authUrl") : "";
+                if (authUrl == "") throw new Exception("响应里没有授权链接：" + (outText.Length > 140 ? outText.Substring(0, 140) : outText));
+                try { Process.Start(authUrl); }
+                catch { /* 打不开浏览器不挡流程 */ }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    SetLoginStatus("已在浏览器打开华为云授权页——登录并点击授权后自动检测。若未弹出请手动访问：" + authUrl, Accent);
+                });
+                var deadline = DateTime.UtcNow.AddMinutes(4);
+                var t0 = DateTime.UtcNow;
+                while (DateTime.UtcNow < deadline)
+                {
+                    Thread.Sleep(2500);
+                    string poll;
+                    try { poll = Program.Api("GET", "/console/api/login/poll?site=" + site, null); }
+                    catch { continue; }
+                    try
+                    {
+                        var pd = ser.DeserializeObject(poll) as Dictionary<string, object>;
+                        if (pd == null) continue;
+                        if (Str(pd, "done") == "True")
+                        {
+                            doneMsg = "✅ CodeArts 登录成功（该站点现有 " + Str(pd, "account_count") + " 个账号）";
+                            ok = true;
+                            break;
+                        }
+                        int wait = (int)(DateTime.UtcNow - t0).TotalSeconds;
+                        string line = "等待授权完成…（" + wait + "s）";
+                        BeginInvoke((MethodInvoker)delegate { SetLoginStatus(line, SubText); });
+                    }
+                    catch { /* 单次轮询失败继续等 */ }
+                }
+                if (!ok && doneMsg == null) doneMsg = "⌛ 等待超时（4 分钟）——请重试";
+            }
+            catch (Exception ex)
+            {
+                doneMsg = "发起登录失败：" + ex.Message;
+            }
+            BeginInvoke((MethodInvoker)delegate
+            {
+                loginPolling = false;
+                foreach (var b in loginAddButtons.Values) b.Enabled = true;
+                SetLoginStatus(doneMsg ?? "登录流程结束", ok ? Accent : Danger);
+                if (ok) RefreshAll();
+            });
+        }).Start();
+    }
+
+    /** 设备授权登录：POST /login/start → 浏览器打开授权页 → 每 3 秒轮询 /login/poll，最长 10 分钟。 */
+    void StartDeviceLoginBase(string site)
     {
         if (loginPolling) { SetLoginStatus("已有登录流程进行中——请先等它完成（或在网页控制台多账号并登）", Warn); return; }
         loginPolling = true;

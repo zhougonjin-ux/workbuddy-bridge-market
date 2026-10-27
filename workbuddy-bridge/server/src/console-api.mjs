@@ -44,6 +44,8 @@ import { flushEvents } from './events.mjs';
 
 const startedAt = Date.now();
 const loginStates = new Map(); // site → { state, authUrl, at }
+// CodeArts OAuth 登录流程（0.3.66）：site 'codearts' → { flow }（startCodeArtsOAuthFlow 返回值）
+const codeartsLoginFlows = new Map();
 
 const isPlainObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -193,6 +195,22 @@ export async function handleConsoleApi(ctx) {
           if (typeof credit.remain === 'number') recordBalance(s, credit.remain);
         } catch (e) {
           info.credit_error = e.message.slice(0, 160);
+        }
+      }
+      // CodeArts（0.3.66）：积分走华为云 snap-manager（AK/SK 签名），与 /codearts/credits 同源
+      if (s === 'codearts' && info.logged_in) {
+        try {
+          const { listAccounts } = await import('./pool.mjs');
+          const { codeartsCredOf } = await import('./codearts-upstream.mjs');
+          const { codeartsFetchCredits } = await import('./codearts.mjs');
+          const acc = listAccounts('codearts').filter((a) => a.enabled !== false && codeartsCredOf(a))[0];
+          if (acc) {
+            const cr = await codeartsFetchCredits(codeartsCredOf(acc));
+            info.credit = cr.total;
+            info.codearts_packages = cr.packages;
+          }
+        } catch (e) {
+          info.credit_error = String(e.message || e).slice(0, 160);
         }
       }
       sites.push(info);
@@ -504,6 +522,46 @@ export async function handleConsoleApi(ctx) {
         maxChatsPerTask: cfg.tasks.maxChatsPerTask,
       },
     });
+  }
+
+  // ---- CodeArts 每日签到与积分查询（0.3.66，协议见 codearts.mjs）----
+  if (p === '/codearts/credits' && method === 'GET') {
+    const { listAccounts } = await import('./pool.mjs');
+    const { codeartsCredOf } = await import('./codearts-upstream.mjs');
+    const { codeartsFetchCredits } = await import('./codearts.mjs');
+    const accounts = listAccounts('codearts').filter((a) => a.enabled !== false);
+    const results = [];
+    for (const a of accounts) {
+      const cred = codeartsCredOf(a);
+      if (!cred) continue;
+      try {
+        const info = await codeartsFetchCredits(cred);
+        results.push({ id: a.id, label: a.label || a.nickname || a.id, ok: true, ...info });
+      } catch (e) {
+        results.push({ id: a.id, label: a.label || a.nickname || a.id, ok: false, error: String(e.message || e).slice(0, 160) });
+      }
+    }
+    return sendJson(res, 200, { ok: true, results });
+  }
+  if (p === '/codearts/checkin' && method === 'POST') {
+    const { listAccounts } = await import('./pool.mjs');
+    const { codeartsCredOf } = await import('./codearts-upstream.mjs');
+    const { codeartsDailyCheckin } = await import('./codearts.mjs');
+    const accounts = listAccounts('codearts').filter((a) => a.enabled !== false);
+    if (!accounts.length) return sendJson(res, 400, { error: '还没有 CodeArts 账号——先在「扫码登录」页添加' });
+    const results = [];
+    for (const a of accounts) {
+      const cred = codeartsCredOf(a);
+      if (!cred) continue;
+      try {
+        const r = await codeartsDailyCheckin(cred);
+        results.push({ id: a.id, label: a.label || a.nickname || a.id, ...r });
+        if (r.claimed) recordEvent('tasks', `CodeArts 签到：${r.message}（${a.label || a.id}）`, { site: 'codearts', accountId: a.id });
+      } catch (e) {
+        results.push({ id: a.id, label: a.label || a.nickname || a.id, claimed: false, message: String(e.message || e).slice(0, 160) });
+      }
+    }
+    return sendJson(res, 200, { ok: true, results });
   }
 
   // ---- workbuddy-bridge：成长任务中心（T14）----
@@ -1008,6 +1066,47 @@ export async function handleConsoleApi(ctx) {
     const body = ctx.body || {};
     const site = String(body.site || cfg.defaultSite);
     if (!cfg.sites[site]) return sendJson(res, 400, { error: `未知站点 ${site}` });
+    // CodeArts（0.3.66）：华为云 OAuth + PKCE + DPoP，本地起回调服务器，portal 只认
+    // ≥10000 的回调端口。前端拿 authUrl 开浏览器，轮询 /login/poll 等授权完成。
+    if (site === 'codearts') {
+      const { startCodeArtsOAuthFlow } = await import('./codearts.mjs');
+      const { addAccount } = await import('./pool.mjs');
+      // 复用既有 flow（若还在等待）：刷新登录 URL 而不是再起一个回调服务器
+      const existing = codeartsLoginFlows.get('codearts');
+      if (existing) {
+        try { existing.flow.close(); } catch { /* 已关 */ }
+        codeartsLoginFlows.delete('codearts');
+      }
+      const flow = startCodeArtsOAuthFlow();
+      const authUrl = await flow.getLoginUrl();
+      const entry = { flow };
+      codeartsLoginFlows.set('codearts', entry);
+      // 后台等结果：成功即入号池（不做长轮询阻塞——控制台前端自己 poll）
+      flow.waitForResult().then(
+        (credential) => {
+          codeartsLoginFlows.delete('codearts');
+          try {
+            const saved = addAccount('codearts', {
+              accessToken: JSON.stringify(credential),
+              refreshToken: credential.refresh_token || 'codearts',
+              expiresAt: new Date(credential.expires_at || Date.now() + 86_400_000).getTime(),
+              uid: credential.user_id || null,
+              nickname: credential.user_name || null,
+            }, { label: body.label ? String(body.label).slice(0, 40) : null });
+            recordEvent('login', `CodeArts 账号登录成功：${saved.label || saved.nickname || saved.id}`, { site: 'codearts', accountId: saved.id });
+          } catch (e) {
+            recordEvent('login', `CodeArts 账号入池失败：${String(e.message || e).slice(0, 140)}`, { site: 'codearts' });
+          }
+        },
+        (error) => {
+          codeartsLoginFlows.delete('codearts');
+          if (!/超时/.test(String(error.message || ''))) {
+            recordEvent('login', `CodeArts 登录失败：${String(error.message || error).slice(0, 140)}`, { site: 'codearts' });
+          }
+        },
+      );
+      return sendJson(res, 200, { site, authUrl, state: 'codearts-oauth', at: Date.now() });
+    }
     const r = await startLogin(cfg, site);
     loginStates.set(site, { ...r, label: body.label ? String(body.label).slice(0, 40) : null });
     return sendJson(res, 200, r);
@@ -1015,6 +1114,16 @@ export async function handleConsoleApi(ctx) {
 
   if (p === '/login/poll' && method === 'GET') {
     const site = String(url.searchParams.get('site') || cfg.defaultSite);
+    if (site === 'codearts') {
+      // CodeArts：结果由后台 promise 写号池；这里只报「等待中 / 已完成 / 无流程」
+      const entry = codeartsLoginFlows.get('codearts');
+      if (!entry) {
+        const { listAccounts } = await import('./pool.mjs');
+        const n = listAccounts('codearts').length;
+        return sendJson(res, 200, { done: true, account_count: n, msg: 'codearts flow settled' });
+      }
+      return sendJson(res, 200, { done: false, msg: '等待你在浏览器完成华为云授权…' });
+    }
     const st = loginStates.get(site);
     if (!st) return sendJson(res, 400, { error: '请先点击「开始登录」' });
     const r = await pollLogin(cfg, site, st.state, { label: st.label || null });

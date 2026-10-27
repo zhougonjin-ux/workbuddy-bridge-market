@@ -1242,6 +1242,53 @@ function openLoginModal(sites, preselect = null) {
   };
 }
 
+/* ---------- CodeArts 登录弹窗（0.3.66）：华为云 OAuth 授权 ----------
+ * 与 WorkBuddy 二维码不同：portal 授权在浏览器里完成（含华为云账号登录页），
+ * 本地起回调服务器接 code。前端只负责开 URL + 轮询 /login/poll 到 done。 */
+function openCodeArtsLoginModal() {
+  $('#modalRoot').innerHTML = `<div class="modal" id="mWrap"><div class="box">
+    <h3>添加 CodeArts（华为云）账号</h3>
+    <div id="caArea" style="margin-top:10px">
+      <div class="muted"><span class="spin"></span>正在准备华为云授权…</div>
+    </div>
+    <div class="row" style="margin-top:12px"><span class="spacer"></span><button class="btn" id="caCancel">取消</button></div>
+  </div></div>`;
+  $('#mWrap').onclick = (e) => { if (e.target.id === 'mWrap') stopCa(); };
+  $('#caCancel').onclick = stopCa;
+  let caT = null;
+  function stopCa() { clearInterval(caT); closeModal(); }
+  (async () => {
+    const area = $('#caArea');
+    try {
+      const r = await api('/login/start', { method: 'POST', body: { site: 'codearts' } });
+      area.innerHTML = `
+        <div class="qrhint">
+          <b style="color:var(--text)">浏览器授权登录：</b>已打开华为云授权页（未弹出请
+          <a href="${esc(r.authUrl)}" target="_blank" rel="noopener" style="color:var(--accent)">点此打开</a>）。
+          登录华为云账号并点击授权后本窗口会自动检测到（最多等 3 分钟）。<br>
+          免费模型：GLM-5.3-Flash · DeepSeek-V4.1-Flash（免费额度）；每日可在「任务」页签到领积分。
+        </div>
+        <div id="caStatus" class="muted" style="margin-top:10px"><span class="spin"></span>等待授权完成…</div>`;
+      const t0 = Date.now();
+      caT = setInterval(async () => {
+        try {
+          const p = await api('/login/poll?site=codearts');
+          if (p.done) {
+            clearInterval(caT);
+            $('#caStatus').innerHTML = `<span class="ok">✅ 登录成功（该站点现有 ${p.account_count} 个账号）</span>`;
+            toast('CodeArts 账号已添加', 'ok');
+            setTimeout(() => { closeModal(); loadLogin(); }, 1200);
+            return;
+          }
+          $('#caStatus').innerHTML = `<span class="spin"></span>等待授权完成…（${Math.round((Date.now() - t0) / 1000)}s）`;
+        } catch { /* 轮询失败继续等 */ }
+      }, 2500);
+    } catch (e) {
+      area.innerHTML = `<div class="bad">发起登录失败：${esc(e.message)}</div>`;
+    }
+  })();
+}
+
 function makeQR(text) {
   try {
     const qr = qrcode(0, 'M');
@@ -2323,12 +2370,12 @@ function loadAggregate() {
  * LOGIN_PENDING（0.3.65）= dsh-xdpool 支持网页/扫码登录的其它厂商目录：本插件只代理
  * WorkBuddy / CodeBuddy 账号体系，这几家没有对应端点适配，仅作目录展示（未接入置灰）。 */
 const LOGIN_VENDORS = [
+  { site: 'codearts', name: 'CodeArts', vendor: '华为云', color: '#e11d48', desc: '免费体验套餐自动续期：GLM-5.3-Flash · DeepSeek-V4.1-Flash 免费额度 + 每日签到积分，华为云账号 OAuth 授权' },
   { site: 'cn-cli', name: 'WorkBuddy 国内版', vendor: '腾讯', color: '#3b82f6', desc: '与 CodeBuddy 共用端点：DeepSeek · Kimi · GLM 免费线，每日赠送积分' },
   { site: 'intl-cli', name: 'WorkBuddy 国际版', vendor: '腾讯', color: '#10b981', desc: 'codebuddy.ai 独立端点与账号体系：GPT · Claude · Gemini 阵容，积分与国内版不互通' },
   { site: 'intl-work', name: 'WorkBuddy 国际工作版', vendor: '腾讯', color: '#f59e0b', desc: 'workbuddy.ai 工作台端点：独立账号体系，与国内/国际 CLI 互不相通' },
 ];
 const LOGIN_PENDING = [
-  { name: 'CodeArts', vendor: '华为云', color: '#e11d48', desc: '已开通免费体验套餐，自动续期不收费；新人积分 + DeepSeek · GLM · openPangu 每日免费额度' },
   { name: 'LobsterAI', vendor: '有道', color: '#f97316', desc: '每日签到领积分，积分换模型调用额度' },
   { name: 'Qoder 国际版', vendor: '阿里云', color: '#6366f1', desc: '每日 100 Credits，加密推理端点' },
   { name: 'Qoder 国内版', vendor: '阿里云', color: '#8b5cf6', desc: '每日 100 Credits，国内端点与模型池' },
@@ -2414,7 +2461,11 @@ async function loadLogin() {
       <div class="muted" style="font-size:12.5px;margin-top:6px">扫描本机已登录的 CodeBuddy CLI 明文配置自动入池；桌面客户端凭证是加密存储读不到。导入的账号 60 秒内跟随客户端续期自动跟进。</div>
     </div>`;
   for (const b of el.querySelectorAll('[data-login-site]')) {
-    b.onclick = () => openLoginModal(sites, b.getAttribute('data-login-site'));
+    b.onclick = () => {
+      const site = b.getAttribute('data-login-site');
+      if (site === 'codearts') openCodeArtsLoginModal(); // 华为云 OAuth：开浏览器授权，非二维码
+      else openLoginModal(sites, site);
+    };
   }
   $('#lgImport').onclick = async () => {
     const b = $('#lgImport');

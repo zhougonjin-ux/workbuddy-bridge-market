@@ -115,6 +115,49 @@ function expandAlias(cfg, name, depth = 0) {
 
 /** 取站点模型目录（带缓存）。动态接口不可用时回落到站点内置清单（seedModels）。 */
 export async function getCatalog(cfg, site, { force = false } = {}) {
+  // CodeArts 站点（0.3.66）：目录来自华为云双端点（AK/SK 签名），协议与 /v2/plugin/*
+  // 完全不同，单独走 codearts-upstream 的目录缓存；未登录时同样回落 seedModels。
+  if (cfg.sites[site]?.codearts) {
+    const cached0 = catalogs.get(site);
+    if (!force && cached0 && Date.now() - cached0.at < cached0.ttl) return cached0;
+    const 过滤ca = (list) =>
+      new Map(list.filter((m) => !isExcluded(cfg, site, m.id)).map((m) => [m.id, m]));
+    const 登记上限ca = (list) => {
+      for (const m of list) if (m?.id && m.contextWindow) learnLimit(site, m.id, m.contextWindow);
+    };
+    const { codeartsCatalog, codeartsIsLoggedIn } = await import('./codearts-upstream.mjs');
+    if (!codeartsIsLoggedIn(site)) {
+      const entry = { at: Date.now(), ttl: TTL_ERR, models: new Map(), error: '未登录', source: 'none' };
+      catalogs.set(site, entry);
+      return entry;
+    }
+    try {
+      const remote = await codeartsCatalog(cfg, { force });
+      const list = remote.map((m) => ({
+        id: m.id,
+        name: m.name,
+        ...(m.rateLabel ? { credits: m.rateLabel } : {}),
+      }));
+      const models = 过滤ca(list);
+      if (!models.size) throw new Error('远端目录为空');
+      const entry = { at: Date.now(), ttl: TTL_OK, models, error: null, source: 'upstream' };
+      catalogs.set(site, entry);
+      return entry;
+    } catch (e) {
+      const prev = catalogs.get(site);
+      if (prev?.source === 'upstream' && prev.models.size) {
+        const entry = { at: Date.now(), ttl: TTL_ERR, models: prev.models, error: e.message, source: 'upstream(cache)' };
+        catalogs.set(site, entry);
+        return entry;
+      }
+      const seed = cfg.sites[site]?.seedModels || [];
+      登记上限ca(seed);
+      const models = 过滤ca(seed.map((m) => ({ ...m, seed: true })));
+      const entry = { at: Date.now(), ttl: TTL_ERR, models, error: e.message, source: models.size ? 'seed' : 'none' };
+      catalogs.set(site, entry);
+      return entry;
+    }
+  }
   const cached = catalogs.get(site);
   if (!force && cached && Date.now() - cached.at < cached.ttl) return cached;
 

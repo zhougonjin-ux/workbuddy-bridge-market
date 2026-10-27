@@ -111,6 +111,28 @@ export const SITE_PRESETS = {
       { id: 'hy3', name: 'Hy3' },
     ],
   },
+  // 华为云 CodeArts（0.3.66）：登录/对话/积分协议移植自 MIT 开源 dsh-codearts-auth。
+  // 该站点不走 /v2/plugin/* 与 Bearer token：凭据是华为 STS 的 AK/SK/ST（JSON 串存
+  // 账号池 accessToken 字段），对话走 SDK-HMAC-SHA256 签名（codearts-upstream.mjs）。
+  // apiBase 仅作占位（refreshToken 等通用路径不会对它发请求）。
+  codearts: {
+    label: 'CodeArts（华为云）',
+    enabled: true,
+    apiBase: 'https://snap-access.cn-north-4.myhuaweicloud.com',
+    billingBase: '',
+    origin: 'https://codearts.huaweicloud.com',
+    userAgent: 'codearts-agent',
+    product: 'CodeArts',
+    codearts: true, // 站点协议标记：openai.mjs / console-api.mjs 据此走 CodeArts 分支
+    seedModels: [
+      { id: 'glm-5.3-flash', name: 'GLM-5.3-Flash（免费额度）', contextWindow: 1048576 },
+      { id: 'deepseek-v4.1-flash', name: 'DeepSeek-V4.1-Flash（免费额度）', contextWindow: 1048576 },
+      { id: 'deepseek-v4-flash', name: 'DeepSeek-V4-Flash', contextWindow: 1048576 },
+      { id: 'deepseek-v4-pro', name: 'DeepSeek-V4-Pro', contextWindow: 1048576 },
+      { id: 'GLM-5.2', name: 'GLM-5.2', contextWindow: 1048576 },
+      { id: 'openpangu-2.0-pro', name: 'openPangu-2.0-Pro', contextWindow: 524288 },
+    ],
+  },
   'intl-work': {
     label: '国际版 WorkBuddy（workbuddy.ai）',
     enabled: true,

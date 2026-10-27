@@ -125,6 +125,13 @@ export function saveAuth(site, next) {
 }
 
 export function isLoggedIn(site = 'cn-cli') {
+  // CodeArts 站点（0.3.66）：凭据在账号池的 accessToken 字段里（AK/SK JSON 串），
+  // 不走 getAuth 的单账号兼容视图。pool.mjs 已是本模块的既有依赖，直接用。
+  if (site === 'codearts') {
+    try {
+      return listAccounts('codearts').some((a) => a.enabled !== false && Boolean(a.accessToken));
+    } catch { return false; }
+  }
   return Boolean(getAuth(site).accessToken);
 }
 

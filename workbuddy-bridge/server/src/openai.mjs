@@ -40,6 +40,11 @@ export function normalizeChunk(obj, publicModel) {
  * 401 先原地刷 token，仍失败则换号；这里只负责把结果交给上层做站点降级。
  */
 async function openWithRetry(cfg, site, body, signal, opts = {}) {
+  // CodeArts 站点（0.3.66）：AK/SK 签名协议，单账号（无池轮换），失败交上层处理
+  if (cfg.sites[site]?.codearts) {
+    const { codeartsOpenChat } = await import('./codearts-upstream.mjs');
+    return codeartsOpenChat(cfg, body, { signal });
+  }
   const r = await openChatRotating(cfg, site, body, { signal, ...opts });
   return r.up;
 }
