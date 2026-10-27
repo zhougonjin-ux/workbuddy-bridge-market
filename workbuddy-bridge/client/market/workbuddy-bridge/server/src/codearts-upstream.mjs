@@ -113,7 +113,68 @@ export function restoreToolNames(frames, origByShort) {
 /** 鉴权失效判定：401/403，或华为 APIG 对过期 STS 返回的 400 + APIG.0602。 */
 export function isAuthDeadResponse(status, text = '') {
   return status === 401 || status === 403
-    || /APIG\.0602|security token (?:has )?expired|token[^"]*expired/i.test(String(text || ''));
+    || /APIG\.0602|security token (?:has )?expired|token[^"]*expired|invalid\s+token/i.test(String(text || ''));
+}
+
+/**
+ * 排队/限流判定（借鉴 dsh channel-pack 的 isQueueError / isSseQueueErrorCode）。
+ *
+ * 覆盖两种形态：
+ *   - HTTP 400 纯文本：TM.00001041「并发会话数已达上限」、peak hours 等
+ *   - HTTP 200 + SSE 内嵌 error_code：同样的码 + 429 家族
+ * 这些错误等一会儿就会好，应该排队重试而不是把 502 丢给用户。
+ */
+export function isQueueErrorCode(code = '', message = '') {
+  const s = `${code || ''} ${message || ''}`;
+  return /TM\.00001041|81111|TPM|(^|[^0-9])429([^0-9]|$)|rate.?limit|too.?many.?requests|排队|限流|peak\s+usage|try\s+again\s+after|peak\s+hours|high\s+demand/i.test(s);
+}
+
+/** 额度耗尽判定：排队救不了，应换号/换站或直接告诉用户。 */
+export function isQuotaErrorCode(code = '', message = '') {
+  return /4291|insufficient[\s_-]+quota/i.test(`${code || ''} ${message || ''}`);
+}
+
+/**
+ * tool_choice 规范化（对齐 dsh channel-pack 的 normalizeToolChoice）。
+ *
+ * 华为上游只接受字符串形态；对象形式会报 InferHub.001001005.400。注意
+ * `{type:'function', function:{name}}` 应转成「具名工具字符串」而不是
+ * required —— required 会放宽成「可以调别的工具」，语义变了。
+ */
+export function normalizeToolChoice(body) {
+  const tc = body?.tool_choice;
+  if (tc === undefined) return body;
+  const suppressTools = () => {
+    delete body.tools;
+    delete body.functions;
+  };
+  if (typeof tc === 'string') {
+    if (tc.toLowerCase().trim() === 'none') {
+      delete body.tool_choice;
+      suppressTools();
+    }
+    return body;
+  }
+  if (tc && typeof tc === 'object') {
+    const type = String(tc.type || '').toLowerCase().trim();
+    if (type === 'none') {
+      delete body.tool_choice;
+      suppressTools();
+    } else if (type === 'auto' || type === 'required') {
+      body.tool_choice = type;
+    } else if (type === 'function') {
+      // dsh 的 normalizeToolChoice 会转成具名工具字符串；但 CodeArts 实测
+      // （2026-10-27 16:06）连 "t_wb_..." 也报 InferHub.001001005.400，
+      // 只接受 auto/none/required。退回 required：语义是「必须调工具」，
+      // 比丢弃 tool_choice 更接近原意，且实测可用。
+      body.tool_choice = 'required';
+    } else {
+      delete body.tool_choice;
+    }
+    return body;
+  }
+  delete body.tool_choice;
+  return body;
 }
 
 function clampMaxTokens(v) {
@@ -246,13 +307,9 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
   };
   if (safeBody?.reasoningEffort === 'off') payload.thinking = { type: 'disabled' };
   delete payload.reasoningEffort;
-  // 华为上游不接受对象形式的 tool_choice（{type:'function',...} → InferHub.001001005.400
-  // "The request param is invalid"）。降级成 required：语义最接近「必须调工具」，
-  // 且实测 none/auto/required 三种字符串形态都可用。
-  if (payload.tool_choice && typeof payload.tool_choice === 'object') {
-    warn('[codearts] 上游不支持对象形式 tool_choice，已降级为 required');
-    payload.tool_choice = 'required';
-  }
+  // 华为上游只接受字符串 tool_choice（对象形式 → InferHub.001001005.400）。
+  // 规范化规则对齐 dsh：function 对象转「具名工具字符串」，none 连 tools 一起抑制。
+  normalizeToolChoice(payload);
 
   const url = `${CODEARTS_CHAT_BASE}/chat/completions`;
   const bodyText = JSON.stringify(payload);
@@ -306,7 +363,9 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
       // 最多 3 个并发会话）。移植上游参考实现：等 10 秒直接重发 chat（不轮询状态
       // 端点），上限 30 分钟；排队期间换其它账号接手由外层 openChatRotating 语义
       // 处理——这里只对本账号重试，超限原样返回（轮换层会标记失败换号）。
-      if (res.status === 400 && /TM\.00001041/.test(text)) {
+      // 排队/限流（TM.00001041 并发上限、peak hours、429 家族）：等 10 秒重发。
+      // 以前只认 TM.00001041，峰值时段/文案变体仍会直接 502 给用户。
+      if ((res.status === 400 || res.status === 429) && isQueueErrorCode('', text)) {
         queueAttempts += 1;
         if (queueAttempts > 180) {
           return { ok: false, status: 400, text: '[codearts] 排队等待超时（30 分钟）——账号并发会话一直占满', site, accountId: account.id };
@@ -319,6 +378,54 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
       return { ok: false, status: res.status, text: `[codearts] HTTP ${res.status}：${text.slice(0, 400)}`, site, accountId: account.id };
     }
 
+    // 200 也可能是错误信封：CodeArts 用 SSE 内嵌 error_code 表达并发排队/限流/额度。
+    // 首帧预读后分流（借鉴 dsh 的 isSseQueueErrorCode / SseQueueRetryError）：
+    //   排队 → 取消本次流，等 10 秒重发（与 HTTP 400 分支同一套上界）
+    //   鉴权 → 刷新 STS 后重发
+    //   额度 → 直接失败（换号/换站才有意义）
+    //   其他 → 交给 readCodeArtsSSEFromReader 还原成错误帧
+    // 正常内容的首帧原样放行，不改变流式时序。
+    const reader = res.body.getReader();
+    const first = await peekFirstSSEFrame(reader);
+    if (first) {
+      let obj = null;
+      try { obj = JSON.parse(first.payload); } catch { /* 非 JSON 交给后续解析 */ }
+      const code = typeof obj?.error_code === 'string' ? obj.error_code : '';
+      const msg = typeof obj?.error_msg === 'string' ? obj.error_msg : '';
+      if (code) {
+        const cancel = async () => { try { await reader.cancel(); } catch { /* 已断 */ } };
+        if (isAuthDeadResponse(200, JSON.stringify(obj))) {
+          await cancel();
+          if (!authRefreshed) {
+            authRefreshed = true;
+            warn(`[codearts] 流内鉴权错误 ${code}，刷新 STS 凭据后重试`);
+            try {
+              cred = await codeartsRefreshCredential(cfg, site, account.id);
+              continue;
+            } catch (e) {
+              return { ok: false, status: 401, text: `[codearts] 凭据已失效且刷新失败：${e.message}——请重新扫码登录 CodeArts`, site, accountId: account.id };
+            }
+          }
+          return { ok: false, status: 401, text: `[codearts] 凭据已失效：${code} ${msg}`.slice(0, 320), site, accountId: account.id };
+        }
+        if (isQuotaErrorCode(code, msg)) {
+          await cancel();
+          return { ok: false, status: 402, text: `[codearts] 额度不足：${code} ${msg}`.slice(0, 320), site, accountId: account.id };
+        }
+        if (isQueueErrorCode(code, msg)) {
+          await cancel();
+          queueAttempts += 1;
+          if (queueAttempts > 180) {
+            return { ok: false, status: 429, text: '[codearts] 排队等待超时（30 分钟）——账号并发会话一直占满', site, accountId: account.id };
+          }
+          if (queueAttempts === 1) warn(`[codearts] 流内排队/限流（${code}），10 秒后重试（最多等 30 分钟）`);
+          await new Promise((r) => setTimeout(r, 10_000));
+          if (signal?.aborted) return { ok: false, status: 499, text: '[codearts] 客户端已取消（排队等待中）', site, accountId: account.id };
+          continue;
+        }
+      }
+    }
+
     markSuccess(site, account.id, model);
     return {
       ok: true,
@@ -326,7 +433,7 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
       site,
       accountId: account.id,
       payload,
-      frames: restoreToolNames(readCodeArtsSSE(res.body, signal), origByShort),
+      frames: restoreToolNames(readCodeArtsSSEFromReader(reader, signal, first), origByShort),
       close: () => {
         // readCodeArtsSSE 的 reader 已经锁住 res.body，并在 finally 里 cancel 过。
         // 这里再 body.cancel() 会返回一个 rejected Promise（ERR_INVALID_STATE:
@@ -346,12 +453,56 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
  * CodeArts SSE：OpenAI 兼容 chunk 之外，上游用 HTTP 200 + SSE 内嵌 error_code 表达
  * 排队/限流/额度（上游实测形态）。把内嵌错误还原成「错误帧」（classifyFrame 认得的
  * { code, msg } 形态），让三协议入口的既有错误分支统一处理。
+ *
+ * 0.3.71 起拆成「首帧预读 + 余下读取」两段：调用方要先看首帧是不是排队/鉴权/
+ * 额度错误（这些应在代理内部重试，而不是把 502 丢给客户端），再决定是否建流。
  */
-async function* readCodeArtsSSE(stream, signal) {
-  const reader = stream.getReader();
+function safeJson(text) {
+  try { return JSON.parse(text); } catch { return null; }
+}
+
+/** 解析一行 SSE；非 data 行 / 空 payload / [DONE] 返回 null。 */
+function parseSSELine(raw) {
+  if (!raw.startsWith('data:')) return null;
+  const payload = raw.slice(5).trim();
+  if (!payload || payload === '[DONE]') return null;
+  return { payload };
+}
+
+/**
+ * 预读第一个完整 data 帧。返回 { payload, rest, decoder } 或 null（空流）。
+ * decoder 要传给后续 reader，否则跨 chunk 的多字节字符会被截断成乱码。
+ */
+async function peekFirstSSEFrame(reader) {
   const decoder = new TextDecoder('utf-8');
   let buf = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) return null;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const raw = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      const line = parseSSELine(raw);
+      if (line) return { payload: line.payload, rest: buf, decoder };
+    }
+  }
+}
+
+async function* readCodeArtsSSEFromReader(reader, signal, first = null) {
+  const decoder = first?.decoder || new TextDecoder('utf-8');
+  let buf = first?.rest || '';
   try {
+    if (first) {
+      const obj = safeJson(first.payload);
+      if (typeof obj?.error_code === 'string' && obj.error_code) {
+        warn(`[codearts] 上游内嵌错误 ${obj.error_code}：${String(obj.error_msg || '').slice(0, 160)}`);
+        yield JSON.stringify({ code: obj.error_code, msg: obj.error_msg || obj.error_code });
+        return;
+      }
+      yield first.payload;
+    }
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
@@ -360,12 +511,10 @@ async function* readCodeArtsSSE(stream, signal) {
       while ((idx = buf.indexOf('\n')) >= 0) {
         const raw = buf.slice(0, idx).trim();
         buf = buf.slice(idx + 1);
-        if (!raw.startsWith('data:')) continue;
-        const payload = raw.slice(5).trim();
-        if (!payload || payload === '[DONE]') continue;
-        let obj;
-        try { obj = JSON.parse(payload); } catch { continue; }
-        if (typeof obj.error_code === 'string' && obj.error_code) {
+        const line = parseSSELine(raw);
+        if (!line) continue;
+        const obj = safeJson(line.payload);
+        if (typeof obj?.error_code === 'string' && obj.error_code) {
           // 内嵌错误 → 错误信封形态（classifyFrame 识别 { code }）
           // 记录原始码/文案：以前只把信封交给上层，日志里只剩 status=502，
           // 排障时不知道到底是并发排队、限流还是额度问题。
@@ -373,12 +522,17 @@ async function* readCodeArtsSSE(stream, signal) {
           yield JSON.stringify({ code: obj.error_code, msg: obj.error_msg || obj.error_code });
           return;
         }
-        yield payload;
+        yield line.payload;
       }
     }
   } finally {
     try { await reader.cancel(); } catch { /* 已断 */ }
   }
+}
+
+/** 旧入口（无需预读的调用方）：等价于从头读。 */
+export function readCodeArtsSSE(stream, signal) {
+  return readCodeArtsSSEFromReader(stream.getReader(), signal, null);
 }
 
 /** CodeArts 目录合并进 mergedModels 的条目形态（router.mjs 消费）。 */
