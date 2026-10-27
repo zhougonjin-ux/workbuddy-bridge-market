@@ -79,9 +79,22 @@ export async function codeartsCatalog(cfg, { force = false } = {}) {
   const fresh = Date.now() - caCatalogCache.at < 2 * 3600_000;
   if (!force && fresh && caCatalogCache.complete && caCatalogCache.models.length) return caCatalogCache.models;
   const accounts = listAccounts('codearts').filter((a) => a.enabled !== false);
-  const cred = accounts.map(codeartsCredOf).find(Boolean);
-  if (!cred) return caCatalogCache.models.length ? caCatalogCache.models : [];
-  const out = await codeartsFetchCatalog(cred);
+  const account = accounts.map((a) => ({ a, cred: codeartsCredOf(a) })).find((x) => x.cred);
+  if (!account) return caCatalogCache.models.length ? caCatalogCache.models : [];
+  // STS 临时凭证只有 2 小时寿命（0.3.66 实测：目录拉取没接刷新逻辑，过期后
+  // APIG.0602 security token expired → 「远端目录为空」→ 永远回落 seed 兜底，
+  // 选择器里看不到华为最新模型）。鉴权失效自动刷新一次再试。
+  let out = await codeartsFetchCatalog(account.cred);
+  const authDead = (o) => !o.gatewayOk && !o.builtinOk;
+  if (authDead(out)) {
+    warn('[codearts] 目录双端点鉴权失效（STS 可能过期），刷新凭据后重试');
+    try {
+      const fresh2 = await codeartsRefreshCredential(cfg, 'codearts', account.a.id);
+      out = await codeartsFetchCatalog(fresh2);
+    } catch (e) {
+      warn('[codearts] 目录刷新凭据失败：' + (e.message || e));
+    }
+  }
   if (out.gatewayOk && out.builtinOk && out.models.length) {
     caCatalogCache = { at: Date.now(), models: out.models, complete: true };
   } else if (out.models.length) {
