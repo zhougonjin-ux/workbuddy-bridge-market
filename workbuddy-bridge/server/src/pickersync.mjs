@@ -24,12 +24,17 @@ export const PROVIDER_NAME = 'WorkBuddy';
  *  同一个代理端点，仅是 ZCode 侧的分组名——模型按平台拆开归组。 */
 export const CODEARTS_PROVIDER_ID = 'workbuddy-bridge-codearts';
 export const CODEARTS_PROVIDER_NAME = 'CodeArts (华为云)';
-/** 模型 id → 所属分组：codearts 站点的模型（裸名华为独有 + codearts/ 前缀变体）。 */
+/** 模型 id → 所属分组：codearts 站点的模型（裸名华为独有 + codearts/ 前缀变体）。
+ *  ⚠️ 选择器 id 带倍率后缀（如 "GLM-5.2 (x0.7)"）——分组前必须先剥掉，否则
+ *  0.3.66 补丁8 之后华为模型全部错分进 WorkBuddy 组（实测 CodeArts 只剩 3 个）。
+ *  1017（deepseek-v4.1-flash-1017）是华为独有 SKU，一并归组。 */
 function codeartsGroupOf(modelId) {
-  const id = String(modelId || '');
+  const id = String(modelId || '')
+    .replace(/\s*\((?:x[\d.]+|免费)\)\s*$/, '') // 剥倍率/免费后缀
+    .trim();
   if (id.startsWith('codearts/')) return true;
-  // 华为独有裸名（目录合并后仍归属 codearts 站点的那批）
-  return /^(GLM-5\.2|openpangu-2\.0-(?:flash|pro)|glm-5\.2-sft-harmony|kimi-k2\.6-vl|kimi-k3)$/.test(id);
+  // ⚠️ 大小写敏感：华为是 GLM-5.2（大写），腾讯是 glm-5.2（小写）——/i 会把腾讯的误分进来
+  return /^(GLM-5\.2|openpangu-2\.0-(?:flash|pro)|glm-5\.2-sft-harmony|kimi-k2\.6-vl|kimi-k3|deepseek-v4\.1-flash-1017)$/.test(id);
 }
 
 /** 生产数据目录（未设 WB_CONFIG_DIR 时用的那个）。 */
