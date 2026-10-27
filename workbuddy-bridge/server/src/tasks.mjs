@@ -999,6 +999,51 @@ async function runForSite(cfg, site, kind, { force = false, cap = null, onlyAcco
  *  同一账号重复代打、重复领奖尝试（上游幂等兜底得住，但没有必要打两遍）。 */
 const runningTasks = new Set();
 
+/**
+ * CodeArts 每日签到（0.3.66）：遍历池内账号逐个 claim→confirm。
+ * 幂等 = 上游 claimable 为 false（已签过）时如实返回；doneToday 键用 'checkin'
+ * 与腾讯站签到同族（今日已记则跳过，一键代打 force 时无视）。
+ * 通知走 notifyTask 同款（签到成功不弹，失败弹——收益固定，别刷屏）。
+ */
+async function codeartsCheckinForSite(cfg, site, { force = false } = {}) {
+  const { codeartsCredOf } = await import('./codearts-upstream.mjs');
+  const { codeartsDailyCheckin } = await import('./codearts.mjs');
+  const out = [];
+  for (const a of listAccounts(site)) {
+    if (a.enabled === false) continue;
+    const cred = codeartsCredOf(a);
+    if (!cred) continue;
+    const uid = a.uid || a.id;
+    if (!force && doneToday('checkin', uid)) {
+      out.push({ id: a.id, label: a.label || a.id, skipped: true, ok: true });
+      continue;
+    }
+    try {
+      const r = await codeartsDailyCheckin(cred);
+      record('checkin', uid, { ok: true, site, msg: r.message, claimed: r.claimed });
+      out.push({ id: a.id, label: a.label || a.id, ok: true, ...r });
+      if (r.claimed) {
+        recordEvent('tasks', `CodeArts 每日签到：${r.message}（${a.label || a.id}）`, { site, accountId: a.id });
+        // 领到积分 → 顺带刷一次余额进账号池（与 refreshAfterGain 同款目的）
+        try {
+          const { updateCreditDetail } = await import('./pool.mjs');
+          const { codeartsFetchCredits } = await import('./codearts.mjs');
+          const cr = await codeartsFetchCredits(cred);
+          updateCreditDetail(site, a.id, { remain: cr.total, detail: cr.packages.map((p) => ({ package: p.name, remain: p.remain, total: p.amount, used: p.used })) });
+        } catch { /* 余额刷新失败不影响签到结果 */ }
+      } else {
+        out[out.length - 1].skipped = true;
+      }
+    } catch (e) {
+      const msg = String(e.message || e).slice(0, 200);
+      record('checkin', uid, { ok: false, site, msg });
+      out.push({ id: a.id, label: a.label || a.id, ok: false, error: msg });
+      notifyTask(cfg, 'CodeArts 签到失败 ✗', `${a.label || a.id}：${msg.slice(0, 120)}`, a.id);
+    }
+  }
+  return out;
+}
+
 export async function runTasks(cfg, kind = 'all', site = null) {
   if (runningTasks.has(kind)) {
     return { busy: true, msg: `${KIND_LABEL[kind] || kind}任务正在进行中，请稍后再试` };
@@ -1012,6 +1057,15 @@ export async function runTasks(cfg, kind = 'all', site = null) {
     const wantReport = kind === 'report' || kind === 'all';
     for (const s of sites) {
       if (!cfg.sites[s]) continue;
+      // CodeArts 站点（0.3.66）：协议不同（AK/SK 签名），白嫖动作只有每日签到一件；
+      // 幂等走通用 doneToday（record 写的键与签到同族），不进 runForSite（那套流程
+      // 满是 /v2/plugin/* 与 chat_request_send 的腾讯站假设）。
+      if (cfg.sites[s].codearts) {
+        if (wantCheckin && cfg.tasks?.checkin !== false && cfg.tasks?.enabled !== false) {
+          result[`checkin:${s}`] = await codeartsCheckinForSite(cfg, s, { force: false });
+        }
+        continue;
+      }
       // 活跃上报放最前（借鉴 dsh：Order matters——报到要先于任务落地）
       if (wantReport && cfg.tasks?.report !== false) {
         result[`report:${s}`] = await runForSite(cfg, s, 'report');
@@ -1059,6 +1113,18 @@ export async function playAllTasks(cfg, { site = null, accountId = null, cap = n
     const manualAll = [];
     for (const s of sites) {
       if (!cfg.sites[s] || cfg.sites[s].enabled === false) continue;
+      // CodeArts（0.3.66）：一键代打只做签到一件事（force 无视 doneToday）
+      if (cfg.sites[s].codearts) {
+        const checkin = cfg.tasks?.checkin !== false ? await codeartsCheckinForSite(cfg, s, { force: true }) : [];
+        perSite[s] = { checkin, streak: [], growth: [], travel: [] };
+        for (const ck of checkin) {
+          if (ck.error) { lines.push(`${ck.label || ck.id}：签到 ✗ ${String(ck.error).slice(0, 40)}`); continue; }
+          if (ck.claimed) {
+            lines.push(`${ck.label || ck.id}：${ck.message || '签到成功'}`);
+          }
+        }
+        continue;
+      }
       const opts = { force: true, cap, onlyAccountId: accountId || null };
       const checkin = cfg.tasks?.checkin !== false ? await runForSite(cfg, s, 'checkin', opts) : [];
       const streak = await runForSite(cfg, s, 'streak', opts);

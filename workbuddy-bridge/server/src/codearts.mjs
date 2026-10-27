@@ -506,7 +506,9 @@ export async function codeartsFetchCredits(credential, { fetcher = fetch } = {})
   return { total, expiring: expiringTotal ?? 0, packageName: data?.package?.package_name_cn || data?.package?.package_name_en || '', packages };
 }
 
-/** 带 AK/SK 签名的 JSON 请求（GET/POST），返回响应文本；非 2xx 抛错。 */
+/** 带 AK/SK 签名的 JSON 请求（GET/POST），返回响应文本；非 2xx 抛错。
+ *  ⚠️ Agent-Type/X-Language 必须**签名后追加**、不进 canonical：进签名会 401
+ *  APIG.0301 验签失败（上游实测教训），但服务端路由又需要这两个头（TM.00001001）。 */
 async function codeartsSignedBody(method, url, bodyObj, credential, fetcher) {
   const { access_key_id: ak, secret_access_key: sk, security_token: st } = credential ?? {};
   if (!ak || !sk) throw new Error('CodeArts 凭据缺失');
@@ -514,6 +516,8 @@ async function codeartsSignedBody(method, url, bodyObj, credential, fetcher) {
   const signed = signRequestHuawei(ak, sk, st, method, url, body);
   const headers = wireHeadersFromSigned(signed);
   if (method.toUpperCase() !== 'GET') headers['Content-Type'] = 'application/json';
+  headers['Agent-Type'] = 'PromptCenter';
+  headers['X-Language'] = 'zh-cn';
   const res = await fetcher(url, { method, headers, body: body.length ? body : undefined, signal: AbortSignal.timeout(30_000) });
   const text = await res.text();
   if (!res.ok) throw new Error(`CodeArts HTTP ${res.status}：${text.slice(0, 160)}`);
