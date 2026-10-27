@@ -157,7 +157,11 @@ export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
     : {};
   const providerRules = Array.isArray(pcr.providerRules) ? pcr.providerRules.filter((r) => r && typeof r === 'object') : [];
   const previous = providerRules.find((r) => r?.providerId === PROVIDER_ID);
-  const keptRules = providerRules.filter((r) => r?.providerId !== PROVIDER_ID);
+  // 两个自己的条目都要先摘掉再重建：只摘 WORKBUDDY 会让 CODEARTS 每轮同步
+  // 再追加一条（下面 push 新条目），providerId 重复后 ZCode 的 Zod 校验整份
+  // 文件判失败 → 内存降级为空配置 → 选择器里 WorkBuddy/CodeArts 模型全消失
+  // （2026-10-27 事故：6 条重复 codearts、140 次「加载失败」）。
+  const keptRules = providerRules.filter((r) => r?.providerId !== PROVIDER_ID && r?.providerId !== CODEARTS_PROVIDER_ID);
 
   const modelIds = models.map((m) => m.id);
   if (modelIds.length === 0 && Array.isArray(previous?.config?.personalModelIds) && previous.config.personalModelIds.length > 0) {

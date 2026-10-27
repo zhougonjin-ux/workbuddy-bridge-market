@@ -759,6 +759,26 @@ test('B4 隔离实例即使继承了指向生产的覆盖变量，也只写隔�
   }
 });
 
+test('B5 连续同步不重复追加 CodeArts 条目（0.3.66 选择器整份失效的根因）', async () => {
+  // 0.3.66 起同步会写两个供应商条目，但 keptRules 只摘掉了 PROVIDER_ID，
+  // 于是 CODEARTS_PROVIDER_ID 每轮再追加一条，providerId 重复后 ZCode 的
+  // strict schema 整份判失败 → 降级为空配置 → 选择器里一个模型都没有。
+  const { syncProviderConfigFile } = await import('../src/pickersync.mjs');
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-dedupe-'));
+  const target = path.join(iso, 'provider_config.json');
+  const models = [
+    { id: 'glm-5.3 (x0.69)', contextWindow: 1000000, maxOutputTokens: 64000, supportsImages: true },
+    { id: 'codearts/glm-5.3 (x0.69)', contextWindow: 1000000, maxOutputTokens: 64000, supportsImages: true },
+  ];
+  for (let i = 0; i < 3; i++) {
+    syncProviderConfigFile({ apiKey: 'sk-wb-test', baseUrl: 'http://127.0.0.1:8788/v1', models, target });
+  }
+  const doc = JSON.parse(fs.readFileSync(target, 'utf8'));
+  const ids = doc.config.providerConfigRules.providerRules.map((r) => r.providerId);
+  assert.equal(ids.filter((id) => id === 'workbuddy-bridge').length, 1, 'WorkBuddy 条目只能有一条');
+  assert.equal(ids.filter((id) => id === 'workbuddy-bridge-codearts').length, 1, 'CodeArts 条目只能有一条（重复即整份校验失败）');
+});
+
 /* ---------------- T33/T34/T35/T36/T37/T39：新功能纯函数 ---------------- */
 
 const { enabledChannels, buildChannelRequest, notifyChannels } = await import('../src/notify.mjs');
