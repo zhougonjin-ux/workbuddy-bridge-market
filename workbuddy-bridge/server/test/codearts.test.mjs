@@ -120,8 +120,16 @@ test('凭据缺失时目录返回空且两来源都算失败（残缺不缓存�
 // 事故：ZCode 的 MCP 工具名是 mcp__plugin_workbuddy-bridge_workbuddy-bridge__wb_refresh_credits
 //（70 字符），华为上游限制 function.name ≤ 64，整条请求被拒 → 用户看到「模型不通」。
 
-const { compactToolNames, restoreToolNames, MAX_TOOL_NAME_LEN } = await import('../src/codearts-upstream.mjs');
+const { compactToolNames, restoreToolNames, MAX_TOOL_NAME_LEN, isAuthDeadResponse } = await import('../src/codearts-upstream.mjs');
 const LONG_TOOL = 'mcp__plugin_workbuddy-bridge_workbuddy-bridge__wb_refresh_credits';
+
+test('isAuthDeadResponse：400 + APIG.0602 也算鉴权失效，并发排队不算', () => {
+  assert.equal(isAuthDeadResponse(401, ''), true);
+  assert.equal(isAuthDeadResponse(403, ''), true);
+  assert.equal(isAuthDeadResponse(400, '{"error_code":"APIG.0602","error_msg":"Bad request: the security token has expired"}'), true);
+  assert.equal(isAuthDeadResponse(400, '{"error_code":"TM.00001041","error_msg":"concurrency limit"}'), false);
+  assert.equal(isAuthDeadResponse(400, '{"error_code":"InferHub.001001017.413"}'), false);
+});
 
 test('compactToolNames：压缩 >64 的 MCP 工具名，短名 ≤64 且可还原', () => {
   assert.ok(LONG_TOOL.length > MAX_TOOL_NAME_LEN);

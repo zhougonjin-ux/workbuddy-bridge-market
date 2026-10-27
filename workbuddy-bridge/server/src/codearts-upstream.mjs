@@ -110,6 +110,12 @@ export function restoreToolNames(frames, origByShort) {
   })();
 }
 
+/** 鉴权失效判定：401/403，或华为 APIG 对过期 STS 返回的 400 + APIG.0602。 */
+export function isAuthDeadResponse(status, text = '') {
+  return status === 401 || status === 403
+    || /APIG\.0602|security token (?:has )?expired|token[^"]*expired/i.test(String(text || ''));
+}
+
 function clampMaxTokens(v) {
   if (v === undefined || !Number.isFinite(v)) return undefined;
   const n = Math.floor(v);
@@ -270,24 +276,32 @@ export async function codeartsOpenChat(cfg, body, { signal, accountId = null } =
       throw Object.assign(new Error(`[codearts] 连接失败：${e?.cause?.code || e?.message || e}`), { transport: true, status: 504 });
     }
 
-    if (res.status === 401 || res.status === 403) {
-      // 网关侧凭据失效（APIG.0602 等）：刷新 STS 凭据重试一次（同一次 stream 最多一次）
-      if (!authRefreshed) {
-        authRefreshed = true;
-        warn(`[codearts] 网关 ${res.status}，刷新 STS 凭据后重试`);
-        try {
-          cred = await codeartsRefreshCredential(cfg, site, account.id);
-          continue;
-        } catch (e) {
-          warn(`[codearts] 凭据刷新失败：${e.message}`);
-          return { ok: false, status: res.status, text: `[codearts] 凭据已失效：${e.message}`, site, accountId: account.id };
-        }
-      }
-      return { ok: false, status: res.status, text: `[codearts] HTTP ${res.status}：${await res.text().catch(() => '')}`, site, accountId: account.id };
-    }
-
     if (res.status >= 400) {
       const text = await res.text().catch(() => '');
+      // 鉴权失效不止 401/403：华为 APIG 对过期 STS 返回 **400 + APIG.0602**
+      //（"the security token has expired"）。只认 401/403 时，令牌一过 2 小时
+      // 就永久 400 —— 2026-10-27 15:29 实测正是这条，表现为「模型不通」。
+      const authDead = isAuthDeadResponse(res.status, text);
+      if (authDead) {
+        if (!authRefreshed) {
+          authRefreshed = true;
+          warn(`[codearts] 鉴权失效（HTTP ${res.status}），刷新 STS 凭据后重试`);
+          try {
+            cred = await codeartsRefreshCredential(cfg, site, account.id);
+            continue;
+          } catch (e) {
+            warn(`[codearts] 凭据刷新失败：${e.message}`);
+            return {
+              ok: false,
+              status: res.status,
+              text: `[codearts] 凭据已失效且刷新失败：${e.message}——请在控制台重新扫码登录 CodeArts`,
+              site,
+              accountId: account.id,
+            };
+          }
+        }
+        return { ok: false, status: res.status, text: `[codearts] 凭据已失效：${text.slice(0, 300)}`, site, accountId: account.id };
+      }
       // TM.00001041「并发会话数已达上限(N)」= 账号级排队信号（上游实测语义：每账号
       // 最多 3 个并发会话）。移植上游参考实现：等 10 秒直接重发 chat（不轮询状态
       // 端点），上限 30 分钟；排队期间换其它账号接手由外层 openChatRotating 语义
