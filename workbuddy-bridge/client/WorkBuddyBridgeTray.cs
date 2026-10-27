@@ -1552,8 +1552,8 @@ class MainForm : Form
             Run(delegate { Program.Api("POST", "/console/api/dashboard/clear", "{}"); },
                 delegate { dashStatus.Text = "已清空调用记录（内存环，不影响统计）✓"; dashStatus.ForeColor = Accent; });
         };
-        var webBtn = PlainButton("打开网页控制台（完整看板）");
-        webBtn.Location = new Point(180, 216);
+        var webBtn = PlainButton("打开网页控制台");
+        webBtn.Location = new Point(160, 216);
         webBtn.Click += delegate { Program.OpenConsole("dash"); };
         page.Controls.Add(clearBtn);
         page.Controls.Add(webBtn);
@@ -2175,8 +2175,14 @@ class MainForm : Form
                     double promptT = ToD(dashToday, "promptTokens"), completionT = ToD(dashToday, "completionTokens");
                     bool reported = Str(dashToday, "tokensReported") == "True";
                     double callsN = ToD(dashToday, "calls");
-                    dashTokens.Text = reported ? ToD(dashToday, "tokens").ToString("#,0") : (callsN > 0 ? "未上报" : "—");
-                    dashTokensSub.Text = reported ? "输入 " + promptT.ToString("#,0") + " · 输出 " + completionT.ToString("#,0") : (callsN > 0 ? "上游没发 usage 帧" : "还没有调用");
+                    // 大数以「万 token」展示（1380px 卡宽放不下 8 位完整数字，截断比换行更难读）
+                    double tokens = ToD(dashToday, "tokens");
+                    dashTokens.Text = reported
+                        ? (tokens >= 100000 ? (tokens / 10000.0).ToString("0.##") + " 万" : tokens.ToString("#,0"))
+                        : (callsN > 0 ? "未上报" : "—");
+                    dashTokensSub.Text = reported
+                        ? "输入 " + Wan(promptT) + " · 输出 " + Wan(completionT)
+                        : (callsN > 0 ? "上游没发 usage 帧" : "还没有调用");
                     dashRounds.Text = ToD(dashToday, "rounds").ToString("#,0");
                     dashRoundsSub.Text = ToD(dashToday, "upstreamCalls").ToString("#,0") + " 次上游调用";
                     dashFails.Text = ToD(dashToday, "roundFailures").ToString("#,0");
@@ -2316,6 +2322,12 @@ class MainForm : Form
         if (d == null || !d.ContainsKey(key) || d[key] == null) return 0;
         double v;
         return double.TryParse(d[key].ToString(), out v) ? v : 0;
+    }
+
+    /** 大数转「N.NN 万」（≥10 万才转，否则原样）；Token 卡副标题用。 */
+    static string Wan(double v)
+    {
+        return v >= 100000 ? (v / 10000.0).ToString("0.##") + " 万" : v.ToString("#,0");
     }
 
     Control MakeAccountCard(Dictionary<string, object> a, string siteLabel, string site, string policy, string pinnedAccountId)
