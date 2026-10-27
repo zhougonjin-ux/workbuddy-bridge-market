@@ -120,10 +120,36 @@ export function reloadUsage() {
 
 function dayOf(key = todayKey()) {
   ensureLoaded();
-  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0, cacheHitTokens: 0, hours: {}, models: {}, accounts: {} };
+  if (!data.days[key]) data.days[key] = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0, cacheHitTokens: 0, rounds: 0, roundFailures: 0, upstreamCalls: 0, hours: {}, models: {}, accounts: {} };
   // 老数据（在 accounts 维度上线前落的盘）就地补，不动已有字段
   if (!data.days[key].accounts) data.days[key].accounts = {};
   return data.days[key];
+}
+
+/* ---------------- 数据看板维度（0.3.64，对齐 dsh-xdpool）----------------
+ * 轮次 = 客户端发来的 generation 请求（一次提问）；上游调用 = 实际打到上游的次数
+ * （换号/降级会把一次提问变成几次调用）。两个计数都只在内存+usage.json 落盘，
+ * 轮次在 server.mjs 的模型路径入口计，上游调用在 openChatRotating 每次尝试前计。 */
+
+/** 记一次客户端提问（轮次）。POST 到协议端点（不含 models/count_tokens 探测）即一轮。 */
+export function recordRound() {
+  const day = dayOf();
+  day.rounds = (day.rounds || 0) + 1;
+  scheduleSave();
+}
+
+/** 记一轮最终失败（HTTP ≥400 回给客户端）。SSE 信封错误仍是 200，不计在这里（recordUsage 的 errors 已覆盖）。 */
+export function recordRoundFailure() {
+  const day = dayOf();
+  day.roundFailures = (day.roundFailures || 0) + 1;
+  scheduleSave();
+}
+
+/** 记一次上游调用尝试（含换号重试与 401 刷 token 后的原地重试）。 */
+export function recordUpstreamCall() {
+  const day = dayOf();
+  day.upstreamCalls = (day.upstreamCalls || 0) + 1;
+  scheduleSave();
 }
 
 /** 记录一次调用。account = 实际出力的账号 id（T36 报表的账号维度；缺失时记 'unknown'）。
@@ -221,7 +247,7 @@ export function usageDays() {
 export function usageSnapshot(days = 7) {
   ensureLoaded();
   const today = todayKey();
-  const t = data.days[today] || { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, recovered: 0, models: {} };
+  const t = data.days[today] || { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, recovered: 0, rounds: 0, roundFailures: 0, upstreamCalls: 0, models: {} };
   // 今日小时分布（T7）：固定 24 桶（本地时区），旧数据没有 hours 字段时全为 0
   const todayHours = [];
   for (let i = 0; i < 24; i++) {
@@ -230,7 +256,7 @@ export function usageSnapshot(days = 7) {
   }
   const keys = Object.keys(data.days).sort().slice(-days);
   const recent = keys.map((k) => ({ date: k, ...data.days[k], models: undefined }));
-  const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0, cacheHitTokens: 0 };
+  const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, recovered: 0, cacheHitTokens: 0, rounds: 0, roundFailures: 0, upstreamCalls: 0 };
   const byModel = new Map();
   for (const k of Object.keys(data.days)) {
     const d = data.days[k];
@@ -242,6 +268,9 @@ export function usageSnapshot(days = 7) {
     totals.ms += d.ms || 0;
     totals.recovered += d.recovered || 0;
     totals.cacheHitTokens += d.cacheHitTokens || 0;
+    totals.rounds += d.rounds || 0;
+    totals.roundFailures += d.roundFailures || 0;
+    totals.upstreamCalls += d.upstreamCalls || 0;
     for (const [mid, m] of Object.entries(d.models || {})) {
       const cur = byModel.get(mid) || { id: mid, site: m.site, model: m.model, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, cacheHitTokens: 0 };
       cur.calls += m.calls;

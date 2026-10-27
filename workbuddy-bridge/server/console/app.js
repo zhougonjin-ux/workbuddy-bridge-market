@@ -173,13 +173,15 @@ function paint(el, html) {
 /* ---------- 0.3.24 视图路由：无页签，大屏(home)为唯一主页面，其余全部是下钻子页面 ----------
  * 导航模型：大屏面板/卡片点「详情」进子页面 → 返回条「← 返回大屏」或浏览器后退回大屏；
  * location.hash 同步（#/accounts 等），刷新/转发链接都能直接落到对应子页面。 */
-const VIEWS = ['home', 'accounts', 'models', 'agg', 'tasks', 'usage', 'events', 'settings', 'help'];
+const VIEWS = ['home', 'accounts', 'models', 'login', 'agg', 'tasks', 'usage', 'dash', 'events', 'settings', 'help'];
 const VIEW_META = {
   accounts: ['账号与积分', '账号卡 · 到期批次 · 策略 · 扫码登录'],
   models: ['模型库', '清单 · 倍率 · 巡检 · 设为默认'],
+  login: ['扫码登录', '厂商卡片 · 扫码/设备授权登录 · 本机导入'],
   agg: ['聚合渠道', '自有 key 的 OpenAI 兼容 provider · agg:渠道/模型'],
   tasks: ['任务中心', '签到 · 连登 · 成长任务 · 猫猫旅行 · 日历'],
   usage: ['用量分析', '消耗图表 · 按模型/账号 · CSV 导出'],
+  dash: ['数据看板', '轮次 · 调用 · 失败 · token · 速度 · 缓存命中 · 最近调用'],
   events: ['事件时间线', '任务 / 账号 / 策略 / 登录 回放'],
   settings: ['接入与运维', '接入配置 · 通知 · 备份 · 诊断 · 日志'],
   help: ['使用说明', '快速上手 · 功能导览 · 常见问题 · 命令与端点'],
@@ -214,8 +216,10 @@ function enterView(name, focus = null) {
   if (name === 'accounts') { loadAccounts().then(() => focusAcct(focus)).catch(() => {}); refreshTimer = setInterval(loadAccounts, 30000); }
   if (name === 'models') { loadModels(); refreshTimer = setInterval(loadModels, 60000); }
   if (name === 'agg') { loadAggregate(); } // 进页拉一次即可，无轮询
+  if (name === 'login') { loadLogin(); } // 扫码登录页（0.3.64）：进页拉一次，登录动作各自刷新
   if (name === 'tasks') { loadTasks(); loadTaskCenter(); void loadTcSummary(); refreshTimer = setInterval(loadTasks, 30000); }
   if (name === 'usage') { loadUsage(); refreshTimer = setInterval(loadUsage, 60000); }
+  if (name === 'dash') { loadDash(); refreshTimer = setInterval(loadDash, 15000); } // 数据看板（0.3.64）：本地接口，15s 轻轮询
   if (name === 'events') { loadEvents(); refreshTimer = setInterval(loadEvents, 30000); }
   if (name === 'settings') { loadGuide(); loadHealth(); startLogs(); refreshTimer = setInterval(loadHealth, 30000); }
   // T67 使用说明：纯静态内容，只在进入时渲染一次（没有轮询，避免无谓的 paint 比对）
@@ -2312,6 +2316,169 @@ function loadAggregate() {
   loadAgg();
 }
 
+/* ---------- 扫码登录页（0.3.64，形态对齐 dsh-xdpool「扫码登录」）----------
+ * 厂商卡 = 支持网页/扫码设备授权登录的站点：登一次，免费模型就进同一个选择器。
+ * 每卡带「已添加 N 个账号」徽章与「添加账号」按钮（复用账号页的登录弹窗，预选站点）；
+ * 另有一张「本机导入」卡（CodeBuddy CLI 明文登录态一键入池，无需扫码）。 */
+const LOGIN_VENDORS = [
+  { site: 'cn-cli', name: 'WorkBuddy 国内版', vendor: '腾讯', color: '#3b82f6', desc: '与 CodeBuddy 共用端点：DeepSeek · Kimi · GLM 免费线，每日赠送积分' },
+  { site: 'intl-cli', name: 'WorkBuddy 国际版', vendor: '腾讯', color: '#10b981', desc: 'codebuddy.ai 独立端点与账号体系：GPT · Claude · Gemini 阵容，积分与国内版不互通' },
+  { site: 'intl-work', name: 'WorkBuddy 国际工作版', vendor: '腾讯', color: '#f59e0b', desc: 'workbuddy.ai 工作台端点：独立账号体系，与国内/国际 CLI 互不相通' },
+];
+
+async function loadLogin() {
+  const el = $('#view-login');
+  if (!el) return;
+  let st = null, tk = null, br = null;
+  try { st = await api('/state'); } catch (e) { el.innerHTML = `<div class="card muted" style="padding:14px">加载失败：${esc(e.message)}</div>`; return; }
+  try { tk = await api('/tasks'); } catch (e) { /* 横幅数据缺失不挡页面 */ }
+  try { br = await api('/bridge'); } catch (e) { /* 同上 */ }
+  const sites = st.sites || [];
+  const bySite = {}; for (const s of sites) bySite[s.site] = s;
+  const connected = LOGIN_VENDORS.filter((v) => (bySite[v.site]?.account_count || 0) > 0).length;
+  const g = (tk && tk.gainedToday) || {};
+  const tasksOn = (br && br.tasks ? br.tasks.enabled : true) !== false;
+  const gainedBits = [];
+  if (g.checkins) gainedBits.push(`签到 ${g.checkins} 个账号`);
+  if (g.claims) gainedBits.push(`领奖 ${g.claims} 次`);
+  if (g.travels) gainedBits.push(`猫猫旅行 ${g.travels} 次`);
+  if (Number(g.credit) > 0) gainedBits.push(`+${fmtCredit(g.credit)} 积分`);
+  el.innerHTML = `
+    <h2>扫码登录 <span class="sub">登一次，它们的免费模型就出现在同一个选择器里</span></h2>
+    <div class="card" style="margin-bottom:14px">
+      <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+        <b style="font-size:13.5px">微信扫码 / 设备授权登录</b>
+        <span class="badge ${connected ? 'ok' : ''}">已连接 ${connected} 个</span>
+        <span class="muted" style="font-size:12.5px;flex:1;min-width:260px">扫码后账号进账号池，多账号自动轮换；免费模型清单在「模型」页，调度策略在「账号」页顶部可切。</span>
+      </div>
+      <div class="row" style="align-items:center;gap:8px;margin-top:10px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--panel2)">
+        <span class="badge ${tasksOn ? 'ok' : 'warn'}">${tasksOn ? '✓' : '○'} 自动领取每日积分</span>
+        <span class="muted" style="font-size:12.5px;flex:1">${tasksOn
+          ? (gainedBits.length ? `今日：${gainedBits.join(' · ')}（自动任务按「任务」页的时点执行，错过自动补跑）` : '已开启——今日还没有执行记录；时点与开关在「任务」页调整')
+          : '自动任务总开关当前关闭——每日积分不会自动领取，可在「任务」页打开'}</span>
+        <button class="btn mini" id="lgGoTasks">去任务页</button>
+      </div>
+    </div>
+    <div id="loginCards"></div>`;
+  $('#lgGoTasks').onclick = () => showView('tasks');
+  const cards = $('#loginCards');
+  cards.innerHTML = LOGIN_VENDORS.map((v) => {
+    const s = bySite[v.site] || {};
+    const n = s.account_count || 0;
+    return `<div class="card" style="margin-bottom:12px;border-left:3px solid ${v.color}">
+      <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="width:34px;height:34px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:13px;background:${v.color}">${esc(v.name.slice(0, 2))}</span>
+        <b style="font-size:14px">${esc(v.name)}</b>
+        <span class="badge">${esc(v.vendor)}</span>
+        <span class="spacer" style="flex:1"></span>
+        ${n > 0 ? `<span class="badge ok">已添加 ${n} 个账号</span>` : '<span class="badge">未添加</span>'}
+      </div>
+      <div class="muted" style="font-size:12.5px;margin:6px 0 10px">${esc(v.desc)}</div>
+      <div class="row" style="gap:8px">
+        <button class="btn mini primary" data-login-site="${esc(v.site)}">＋ 添加账号</button>
+        ${n > 0 ? `<span class="muted" style="font-size:12px;align-self:center">${s.logged_in ? '登录态正常' : '登录态已失效——重新添加或删除后重扫'}</span>` : ''}
+      </div>
+    </div>`;
+  }).join('') + `
+    <div class="card" style="border-left:3px solid #8b5cf6">
+      <div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="width:34px;height:34px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:13px;background:#8b5cf6">导入</span>
+        <b style="font-size:14px">本机导入（免扫码）</b>
+        <span class="spacer" style="flex:1"></span>
+        <button class="btn mini primary" id="lgImport">⬇ 导入本机账号</button>
+      </div>
+      <div class="muted" style="font-size:12.5px;margin-top:6px">扫描本机已登录的 CodeBuddy CLI 明文配置自动入池；桌面客户端凭证是加密存储读不到。导入的账号 60 秒内跟随客户端续期自动跟进。</div>
+    </div>`;
+  for (const b of el.querySelectorAll('[data-login-site]')) {
+    b.onclick = () => openLoginModal(sites, b.getAttribute('data-login-site'));
+  }
+  $('#lgImport').onclick = async () => {
+    const b = $('#lgImport');
+    b.disabled = true; b.textContent = '扫描本机中…';
+    try {
+      const r = await api('/local/import', { method: 'POST' });
+      showImportModal(r);
+      loadLogin();
+    } catch (e) { toast('导入失败：' + e.message, 'bad'); }
+    b.disabled = false; b.textContent = '⬇ 导入本机账号';
+  };
+}
+
+/* ---------- 数据看板页（0.3.64，形态对齐 dsh-xdpool「数据看板」+ 网关页用量卡）----------
+ * 每个数字都是这个池子真实发出去的调用数出来的：轮次（客户端提问）、上游调用
+ * （换号/降级会把一次提问变成几次）、轮失败、token 总量、平均速度、缓存命中，
+ * 下方是最近 50 次调用的内存环（重启即清空）。 */
+async function loadDash() {
+  const el = $('#view-dash');
+  if (!el) return;
+  let d = null, bridge = null;
+  try { d = await api('/dashboard'); } catch (e) { el.innerHTML = `<div class="card muted" style="padding:14px">加载失败：${esc(e.message)}</div>`; return; }
+  try { bridge = await api('/bridge'); } catch (e) { /* 账号名列缺失不挡页面 */ }
+  const accNames = {};
+  for (const s of (bridge && bridge.sites) || []) for (const a of s.accounts || []) accNames[a.id] = a.label || a.nickname || a.id;
+  const t = d.today || {};
+  const nfmt = (x) => Number(x || 0).toLocaleString('en-US', { maximumFractionDigits: 1 });
+  const speed = (t.ms || 0) > 0 ? ((t.completionTokens || 0) / (t.ms / 1000)).toFixed(1) : null;
+  const hitPct = (t.promptTokens || 0) > 0 ? Math.round((t.cacheHitTokens || 0) / t.promptTokens * 100) : null;
+  const tokenCell = t.tokensReported ? nfmt(t.tokens) : (t.calls > 0 ? '未上报' : '—');
+  const cards = [
+    { k: 'Token 总量', v: tokenCell, sub: t.tokensReported ? `输入 ${nfmt(t.promptTokens)} · 输出 ${nfmt(t.completionTokens)}` : (t.calls > 0 ? '上游没报 usage 帧，token 数暂缺' : '还没有调用') },
+    { k: '轮次', v: nfmt(t.rounds), sub: `${nfmt(t.upstreamCalls)} 次上游调用 · 换号会把一次提问变成几次` },
+    { k: '轮失败', v: nfmt(t.roundFailures), sub: t.roundFailures > 0 ? '有整轮失败——去「事件」或日志看原因' : '没有整轮失败的情况' },
+    { k: '速度', v: speed ? speed + ' tok/s' : '—', sub: speed ? '今日平均输出速度' : '没有计时数据' },
+    { k: '缓存命中', v: hitPct != null ? hitPct + '%' : '—', sub: hitPct != null ? `命中 ${nfmt(t.cacheHitTokens)} / 输入 ${nfmt(t.promptTokens)} tokens` : '上游未区分缓存 tokens' },
+    { k: '换号救回', v: nfmt(t.recovered), sub: '前一账号失败、换号后成功' },
+  ];
+  const MODE_TEXT = { stream: '流式', json: 'JSON', 'anthropic-stream': 'Anthropic 流式', 'anthropic-json': 'Anthropic', responses: 'Responses' };
+  const reqs = d.recent || [];
+  const rows = reqs.map((r) => {
+    const ms = r.ms != null ? (r.ms >= 1000 ? (r.ms / 1000).toFixed(1) + ' s' : r.ms + ' ms') : '—';
+    const statusBad = r.status >= 400 || r.note
+      ? `<span class="badge bad">${r.status}${r.note ? ' · ' + esc(r.note) : ''}</span>`
+      : `<span class="badge ok">${r.status}</span>`;
+    return `<tr${r.anomaly ? ' style="background:rgba(224,92,92,.07)"' : ''}>
+      <td class="muted" style="white-space:nowrap">${esc(new Date(r.at).toLocaleTimeString())}</td>
+      <td><b>${esc(r.model || '')}</b>${r.site ? ` <span class="badge">${esc(r.site)}</span>` : ''}</td>
+      <td>${esc(MODE_TEXT[r.mode] || r.mode || '—')}</td>
+      <td>${statusBad}</td>
+      <td style="white-space:nowrap">${ms}</td>
+      <td>${r.tok_s != null ? `<b>${esc(r.tok_s)}</b> tok/s` : '—'}</td>
+      <td>${r.credit != null ? `<b class="${r.anomaly ? 'bad' : ''}">${fmtCredit(r.credit)}</b>${r.anomaly ? ' <span class="badge bad" title="超过该模型今日均值（' + fmtCredit(r.creditAvg) + ' 积分）的 5 倍">异常 5×</span>' : ''}` : '—'}</td>
+      <td>${r.account ? esc(accNames[r.account] || String(r.account).slice(0, 10)) : '—'}</td>
+    </tr>`;
+  }).join('');
+  el.innerHTML = `
+    <h2>数据看板 <span class="sub">这里每个数字，都是这个池子真实发出去的调用数出来的</span></h2>
+    <div class="card" style="margin-bottom:14px">
+      <div class="row" style="align-items:center;gap:8px;flex-wrap:wrap">
+        <span class="badge acc">最近 ${reqs.length} 次调用</span>
+        <span class="muted" style="font-size:12.5px;flex:1;min-width:240px">统计口径 = 今天（本地日切）；换号/降级的每一次上游尝试都计入「上游调用」。</span>
+        <button class="btn mini" id="dashClear">清空调用记录</button>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:14px">
+      ${cards.map((c) => `<div class="card" style="margin:0">
+        <div class="muted" style="font-size:12px">${esc(c.k)}</div>
+        <div style="font-size:24px;font-weight:700;margin:4px 0">${esc(c.v)}</div>
+        <div class="muted" style="font-size:11.5px;line-height:1.5">${esc(c.sub)}</div>
+      </div>`).join('')}
+    </div>
+    <div class="card">
+      <div style="font-weight:600;font-size:13.5px;margin-bottom:8px">最近调用 <span class="sub">新 → 旧 · 内存中保留最近 50 次；重启会清空</span></div>
+      ${reqs.length ? `<div style="overflow-x:auto"><table style="width:100%;font-size:12.5px;border-collapse:collapse">
+        <thead><tr class="muted" style="text-align:left">${['时间', '模型', '模式', '状态', '耗时', '速度', '积分', '账号'].map((h) => `<th style="padding:6px 8px;border-bottom:1px solid var(--line);font-weight:500">${h}</th>`).join('')}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>` : '<div class="muted" style="padding:14px 0">还没有记录到调用，发一轮对话这里就填上了。</div>'}
+    </div>`;
+  $('#dashClear').onclick = async () => {
+    try {
+      await api('/dashboard/clear', { method: 'POST' });
+      toast('已清空调用记录（不影响统计）', 'ok');
+      loadDash();
+    } catch (e) { toast('清空失败：' + e.message, 'bad'); }
+  };
+}
+
 function loadHelp() {
   const el = $('#view-help');
   if (!el) return;
@@ -2345,9 +2512,11 @@ function loadHelp() {
       ${kv([
         ['总控台', '一屏看全：今日调用/消耗、可用账号、积分总量、批次到期分布、24h 频谱、事件流；<b>连登三档进度条</b>显示 7/14/28 天档位；右上「复制配置」「🎨 主题」，右下悬浮 <b>⌘</b> 坞有 5 个快捷动作。KPI 卡可点击下钻。'],
         ['资源池 · 账号', '账号卡：余额与各批次到期时间、<b>📌 固定使用</b>（策略切 pinned，再点取消）、启用/禁用、重置冷却耗尽状态、<b>同步昵称</b>（拉官方昵称更新显示名）、删除；顶部策略卡可切 5 种调度；批次到期条形按风险着色。'],
+        ['资源池 · 扫码登录', '厂商卡片集中登录（0.3.64，形态对齐 XD Pool）：每个支持扫码/设备授权的站点一张卡，带「已添加 N 个账号」徽章与「添加账号」入口；「自动领取每日积分」横幅显示今日签到/领奖/旅行收益；另有「本机导入」免扫码卡。'],
         ['资源池 · 模型', '模型清单（倍率、上下文、能力标记）、一键设默认、<b>⟳ 手动同步到选择器</b>、巡检（可只巡免费模型省钱）、v3 目录补缺模型会标注来源。'],
         ['运维中心 · 任务', '四个开关（总开关/签到/成长）、<b>立即签到 / 🔗 连登巡检 / 扫描成长任务 / 🐾 猫猫旅行</b> 手动触发；任务中心列表带缓存（每日自动刷新 + 手动刷新）；代打/领奖按钮；<b>官方热力图</b>与本地签到日历并排；连登快照与累计白嫖统计。'],
         ['运维中心 · 用量', '今日/近 7 天消耗、24h 分布、按模型与按账号排行、上下文压缩统计、<b>⬇ CSV 导出</b>（三维度，带 BOM Excel 直开）。'],
+        ['运维中心 · 数据看板', '真实调用口径（0.3.64，形态对齐 XD Pool）：Token 总量、轮次（客户端提问）与上游调用（换号会把一次提问变成几次）、轮失败、平均速度 tok/s、缓存命中、换号救回；下方最近 50 次调用明细（状态/耗时/速度/积分，异常 5× 标红），<b>清空调用记录</b>只清内存环不动统计。'],
         ['运维中心 · 事件', '任务/账号/策略/登录/积分/巡检事件时间线，可按类型筛选；数据落盘重启不丢。'],
         ['系统设置', '接入配置、预警阈值、通知通道（webhook/Bark/Server酱/飞书/钉钉/Telegram）、协议自检、用量周报、<b>数据备份</b>、一键诊断、实时日志、PIN 锁。'],
         ['使用说明', '本页：快速上手、功能导览、自动任务与积分玩法、常见问题、命令与端点速查。'],

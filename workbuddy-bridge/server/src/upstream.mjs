@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ensureToken } from './auth.mjs';
 import { markSuccess, markFailure, isQuotaError, isRateLimitError, usableCount, listModelCooldownAccounts, stickyKeyOf, listAccounts } from './pool.mjs';
-import { recordRecovered } from './usage.mjs';
+import { recordRecovered, recordUpstreamCall } from './usage.mjs';
 import {
   fitMessages,
   estimateMessages,
@@ -1177,6 +1177,7 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
     const exclude = 模型冷却中.length && usableCount(site, undefined, [...tried, ...模型冷却中]) > 0
       ? [...tried, ...模型冷却中]
       : tried;
+    try { recordUpstreamCall(); } catch { /* 统计失败不影响请求 */ } // 数据看板「上游调用」：换号/降级会把一次提问变成几次
     up = await openChat(cfg, site, body, { signal, exclude });
     if (up.ok) {
       // 换号救回（0.3.51）：前一个账号失败、这个账号成功——当日统计 +1
@@ -1191,6 +1192,7 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
       warn(`[${site}] 上游 401，强制刷新账号 ${up.accountId} 的 token 后重试`);
       try {
         await ensureToken(cfg, site, { force: true, accountId: up.accountId });
+        try { recordUpstreamCall(); } catch { /* 统计失败不影响请求 */ }
         const retry = await openChat(cfg, site, body, { signal, accountId: up.accountId });
         if (retry.ok) return { up: retry, tried };
         up = retry;

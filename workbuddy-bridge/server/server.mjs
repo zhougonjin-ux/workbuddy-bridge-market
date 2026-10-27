@@ -15,7 +15,7 @@ import { handleResponses } from './src/responses.mjs';
 import { handleMessages, handleCountTokens } from './src/anthropic.mjs';
 import { queryCredit, supportsCreditQuery } from './src/upstream.mjs';
 import { handleConsoleApi } from './src/console-api.mjs';
-import { flushUsage } from './src/usage.mjs';
+import { flushUsage, recordRound, recordRoundFailure } from './src/usage.mjs';
 import { flushLearned } from './src/compress.mjs';
 import { flushEvents, recordEvent } from './src/events.mjs';
 import { flushPool } from './src/pool.mjs';
@@ -303,6 +303,13 @@ const server = http.createServer(async (req, res) => {
   if (isModelPath(pathname)) {
     activeRequests++;
     res.on('close', () => { activeRequests--; drainWaiters(); });
+    // 数据看板「轮次」（0.3.64，对齐 dsh-xdpool）：POST 到生成类端点 = 一次提问；
+    // models 列表与 count_tokens 探测不算。轮失败 = 给客户端回了 HTTP ≥400。
+    // SSE 信封错误对客户端仍是 200，不计轮失败（recordUsage 的 errors 已覆盖该口径）。
+    if (req.method === 'POST' && !/(^|\/)count_tokens(\/|$)/.test(pathname)) {
+      try { recordRound(); } catch { /* 统计失败不影响请求 */ }
+      res.on('close', () => { if (res.statusCode >= 400) { try { recordRoundFailure(); } catch { /* 同上 */ } } });
+    }
   }
 
   const isConsolePath = pathname === '/console' || pathname.startsWith('/console/');

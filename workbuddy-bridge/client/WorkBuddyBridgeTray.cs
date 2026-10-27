@@ -405,6 +405,38 @@ class MainForm : Form
     readonly ListView topModels = new ListView();
     object todayHoursData = null;
 
+    // 扫码登录页（0.3.64，形态对齐 dsh-xdpool）：厂商卡 + 设备授权登录
+    readonly Label loginConnected = new Label();
+    readonly Label loginBanner = new Label();
+    readonly Label loginStatus = new Label();
+    readonly Dictionary<string, Label> loginCountLabels = new Dictionary<string, Label>();
+    readonly Dictionary<string, Button> loginAddButtons = new Dictionary<string, Button>();
+    bool loginPolling;
+    static readonly string[] LoginSites = { "cn-cli", "intl-cli", "intl-work" };
+    static readonly string[] LoginNames = { "WorkBuddy 国内版", "WorkBuddy 国际版", "WorkBuddy 国际工作版" };
+    static readonly string[] LoginDescs = {
+        "与 CodeBuddy 共用端点：DeepSeek · Kimi · GLM 免费线，每日赠送积分",
+        "codebuddy.ai 独立端点与账号体系：GPT · Claude · Gemini 阵容，积分与国内版不互通",
+        "workbuddy.ai 工作台端点：独立账号体系，与国内/国际 CLI 互不相通",
+    };
+    static readonly Color[] LoginColors = { Color.FromArgb(59, 130, 246), Color.FromArgb(16, 185, 129), Color.FromArgb(245, 158, 11) };
+
+    // 数据看板页（0.3.64）：轮次/调用/失败/token/速度/缓存命中 + 最近调用
+    readonly Label dashTokens = new Label();
+    readonly Label dashTokensSub = new Label();
+    readonly Label dashRounds = new Label();
+    readonly Label dashRoundsSub = new Label();
+    readonly Label dashFails = new Label();
+    readonly Label dashFailsSub = new Label();
+    readonly Label dashSpeed = new Label();
+    readonly Label dashSpeedSub = new Label();
+    readonly Label dashCache = new Label();
+    readonly Label dashCacheSub = new Label();
+    readonly Label dashRecovered = new Label();
+    readonly Label dashRecoveredSub = new Label();
+    readonly ListView dashRecent = new ListView();
+    readonly Label dashStatus = new Label();
+
     // 设置页
     readonly ComboBox policyCombo = new ComboBox();
     readonly Label serviceStatus = new Label();
@@ -481,11 +513,13 @@ class MainForm : Form
         navPanel.Controls.Add(logoText);
 
         AddNav("账号管理", "accounts", 68);
-        AddNav("任务中心", "tasks", 110);
-        AddNav("模型", "models", 152);
-        AddNav("聚合渠道", "agg", 194);
-        AddNav("用量", "usage", 236);
-        AddNav("设置", "settings", 278);
+        AddNav("扫码登录", "login", 110);
+        AddNav("任务中心", "tasks", 152);
+        AddNav("模型", "models", 194);
+        AddNav("聚合渠道", "agg", 236);
+        AddNav("数据看板", "dash", 278);
+        AddNav("用量", "usage", 320);
+        AddNav("设置", "settings", 362);
 
         navVersion.Dock = DockStyle.Bottom;
         navVersion.Height = 36;
@@ -560,9 +594,11 @@ class MainForm : Form
         bodyPanel.BackColor = BodyBack;
 
         pages["accounts"] = BuildAccountsPage();
+        pages["login"] = BuildLoginPage();
         pages["tasks"] = BuildTasksPage();
         pages["models"] = BuildModelsPage();
         pages["agg"] = BuildAggPage();
+        pages["dash"] = BuildDashPage();
         pages["usage"] = BuildUsagePage();
         pages["settings"] = BuildSettingsPage();
         foreach (var p in pages.Values) bodyPanel.Controls.Add(p);
@@ -640,8 +676,8 @@ class MainForm : Form
         addBtn.Location = new Point(32, 128);
         addBtn.Click += delegate
         {
-            Program.OpenConsole();
-            MessageBox.Show("已在浏览器打开网页控制台——在「资源池 → 账号」点「＋ 添加账号」扫码即可。\n（扫码授权流程需要网页，桌面端直接引导过去。）", Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            // 0.3.64：客户端自己支持设备授权登录了（原先是开网页控制台引导），直达「扫码登录」页
+            ShowPage("login");
         };
         var importBtn = PlainButton("导入本机账号");
         importBtn.Location = new Point(192, 128);
@@ -1217,6 +1253,273 @@ class MainForm : Form
         SaveAgg((en ? "已接入 " : "已摘出 ") + Str(p, "name"));
     }
 
+    /** 扫码登录页（0.3.64，形态对齐 dsh-xdpool）：三张站点厂商卡 + 本机导入 + 设备授权登录。
+     *  客户端不画二维码（省第三方依赖）：/login/start 拿到授权链接后直接开浏览器，3 秒轮询授权结果。 */
+    Panel BuildLoginPage()
+    {
+        var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill };
+        page.Controls.Add(PageTitle("扫码登录"));
+        page.Controls.Add(PageSub("登一次，它们的免费模型就出现在同一个选择器里。", 60));
+
+        loginBanner.Location = new Point(32, 92);
+        loginBanner.Size = new Size(900, 26);
+        loginBanner.ForeColor = InkText;
+        loginBanner.BackColor = CardBack;
+        loginBanner.TextAlign = ContentAlignment.MiddleLeft;
+        loginBanner.Padding = new Padding(8, 0, 0, 0);
+        page.Controls.Add(loginBanner);
+
+        loginConnected.Location = new Point(32, 128);
+        loginConnected.Size = new Size(200, 22);
+        loginConnected.ForeColor = Accent;
+        loginConnected.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
+        page.Controls.Add(loginConnected);
+
+        int y = 158;
+        for (int i = 0; i < LoginSites.Length; i++)
+        {
+            string site = LoginSites[i];
+            var card = new Panel { Location = new Point(32, y), Size = new Size(900, 104), BackColor = CardBack };
+            var chip = new Label { Text = LoginNames[i].Substring(0, 2), Location = new Point(16, 14), Size = new Size(34, 34), ForeColor = Color.White, Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold), TextAlign = ContentAlignment.MiddleCenter, BackColor = LoginColors[i] };
+            var name = new Label { Text = LoginNames[i] + "（" + site + "）", Location = new Point(60, 14), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold) };
+            var count = new Label { Text = "未添加", Location = new Point(740, 18), Size = new Size(144, 20), ForeColor = SubText, TextAlign = ContentAlignment.MiddleRight };
+            var desc = new Label { Text = LoginDescs[i], Location = new Point(60, 44), Size = new Size(800, 30), ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 8.75F) };
+            var add = new Button { Text = "＋ 添加账号", Location = new Point(60, 72), Size = new Size(120, 26), FlatStyle = FlatStyle.Flat, BackColor = Accent, ForeColor = Color.White, Cursor = Cursors.Hand, Font = new Font("Microsoft YaHei UI", 9F) };
+            add.FlatAppearance.BorderSize = 0;
+            add.Click += delegate { StartDeviceLogin(site); };
+            card.Controls.Add(chip);
+            card.Controls.Add(name);
+            card.Controls.Add(count);
+            card.Controls.Add(desc);
+            card.Controls.Add(add);
+            card.Paint += delegate (object s, PaintEventArgs e)
+            {
+                using (var pen = new Pen(BorderLine)) e.Graphics.DrawRectangle(pen, 0, 0, card.Width - 1, card.Height - 1);
+            };
+            page.Controls.Add(card);
+            loginCountLabels[site] = count;
+            loginAddButtons[site] = add;
+            y += 116;
+        }
+
+        var importBtn = PlainButton("⬇ 导入本机账号（免扫码）");
+        importBtn.Location = new Point(32, y + 4);
+        importBtn.AutoSize = true;
+        importBtn.Click += delegate
+        {
+            string importMsg = "";
+            Run(delegate
+            {
+                string outText = Program.Api("POST", "/console/api/local/import", "{}");
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer();
+                var d = ser.DeserializeObject(outText) as Dictionary<string, object>;
+                importMsg = "导入完成 ✓ 新增 " + Int(d, "imported") + " · 更新 " + Int(d, "updated") + " · 跳过 " + Int(d, "skipped");
+            }, delegate { SetLoginStatus(importMsg + "（详情见网页控制台）", Accent); });
+        };
+        var webBtn = PlainButton("在网页控制台扫码（显示二维码）");
+        webBtn.Location = new Point(300, y + 4);
+        webBtn.AutoSize = true;
+        webBtn.Click += delegate { Program.OpenConsole("login"); };
+        page.Controls.Add(importBtn);
+        page.Controls.Add(webBtn);
+
+        loginStatus.Location = new Point(32, y + 48);
+        loginStatus.Size = new Size(900, 40);
+        loginStatus.ForeColor = SubText;
+        page.Controls.Add(loginStatus);
+
+        page.Resize += delegate
+        {
+            int w = Math.Max(360, page.ClientSize.Width - 64);
+            loginBanner.Width = w;
+            foreach (Control c in page.Controls)
+            {
+                var card = c as Panel;
+                if (card == null || card.Height != 104) continue;
+                card.Width = w;
+                var count = card.Controls.Count >= 3 ? card.Controls[2] : null;
+                if (count != null) count.Location = new Point(Math.Max(200, card.Width - 160), 18);
+                var desc = card.Controls.Count >= 4 ? card.Controls[3] : null;
+                if (desc != null) desc.Width = Math.Max(120, card.Width - 80);
+            }
+        };
+        return page;
+    }
+
+    void SetLoginStatus(string text, Color color)
+    {
+        loginStatus.Text = text;
+        loginStatus.ForeColor = color;
+    }
+
+    /** 设备授权登录：POST /login/start → 浏览器打开授权页 → 每 3 秒轮询 /login/poll，最长 10 分钟。 */
+    void StartDeviceLogin(string site)
+    {
+        if (loginPolling) { SetLoginStatus("已有登录流程进行中——请先等它完成（或在网页控制台多账号并登）", Warn); return; }
+        loginPolling = true;
+        foreach (var b in loginAddButtons.Values) b.Enabled = false;
+        SetLoginStatus("正在向上游申请授权（" + site + "）…", SubText);
+        new Thread(delegate()
+        {
+            string doneMsg = null;
+            bool ok = false;
+            try
+            {
+                string outText = Program.Api("POST", "/console/api/login/start", "{\"site\":\"" + site + "\"}");
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer();
+                var d = ser.DeserializeObject(outText) as Dictionary<string, object>;
+                string authUrl = d != null && d.ContainsKey("authUrl") ? Str(d, "authUrl") : "";
+                if (authUrl == "") throw new Exception("响应里没有授权链接：" + (outText.Length > 140 ? outText.Substring(0, 140) : outText));
+                try { Process.Start(authUrl); }
+                catch { /* 打不开浏览器不挡流程：授权链接仍显示在状态行 */ }
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    SetLoginStatus("已在浏览器打开授权页——在手机/浏览器上确认登录；每 3 秒自动检测。若浏览器没打开，请手动访问：" + authUrl, Accent);
+                });
+                var deadline = DateTime.UtcNow.AddMinutes(10);
+                var t0 = DateTime.UtcNow;
+                while (DateTime.UtcNow < deadline)
+                {
+                    Thread.Sleep(3000);
+                    string poll;
+                    try { poll = Program.Api("GET", "/console/api/login/poll?site=" + site, null); }
+                    catch { continue; }
+                    try
+                    {
+                        var pd = ser.DeserializeObject(poll) as Dictionary<string, object>;
+                        if (pd == null) continue;
+                        if (Str(pd, "done") == "True")
+                        {
+                            string who = Str(pd, "label") != "" ? Str(pd, "label") : (Str(pd, "nickname") != "" ? Str(pd, "nickname") : Str(pd, "account_id"));
+                            doneMsg = "✅ 登录成功：" + who + "（" + site + " 现有 " + Str(pd, "account_count") + " 个账号）";
+                            ok = true;
+                            break;
+                        }
+                        int wait = (int)(DateTime.UtcNow - t0).TotalSeconds;
+                        string msg = Str(pd, "msg");
+                        if (msg.Length > 60) msg = msg.Substring(0, 60);
+                        string line = "等待确认中（" + wait + "s）…" + (msg != "" ? " 上游：" + msg : "");
+                        BeginInvoke((MethodInvoker)delegate { SetLoginStatus(line, SubText); });
+                    }
+                    catch { /* 单次轮询失败继续等 */ }
+                }
+                if (!ok && doneMsg == null) doneMsg = "⌛ 等待超时（10 分钟）——请重试，或在网页控制台用二维码扫码";
+            }
+            catch (Exception ex)
+            {
+                doneMsg = "发起登录失败：" + ex.Message;
+            }
+            BeginInvoke((MethodInvoker)delegate
+            {
+                loginPolling = false;
+                foreach (var b in loginAddButtons.Values) b.Enabled = true;
+                SetLoginStatus(doneMsg ?? "登录流程结束", ok ? Accent : Danger);
+                if (ok) RefreshAll();
+            });
+        }).Start();
+    }
+
+    /** 数据看板页（0.3.64，形态对齐 dsh-xdpool）：真实调用口径的六张卡 + 最近调用列表。 */
+    Panel BuildDashPage()
+    {
+        var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
+        page.Controls.Add(PageTitle("数据看板"));
+        page.Controls.Add(PageSub("这里每个数字，都是这个池子真实发出去的调用数出来的。", 60));
+
+        var dashCards = new List<Panel>();
+        dashCards.Add(AddDashCard(page, "Token 总量", dashTokens, dashTokensSub, 0));
+        dashCards.Add(AddDashCard(page, "轮次", dashRounds, dashRoundsSub, 1));
+        dashCards.Add(AddDashCard(page, "轮失败", dashFails, dashFailsSub, 2));
+        dashCards.Add(AddDashCard(page, "速度", dashSpeed, dashSpeedSub, 3));
+        dashCards.Add(AddDashCard(page, "缓存命中", dashCache, dashCacheSub, 4));
+        dashCards.Add(AddDashCard(page, "换号救回", dashRecovered, dashRecoveredSub, 5));
+
+        var clearBtn = PlainButton("清空调用记录");
+        clearBtn.Location = new Point(32, 216);
+        clearBtn.Click += delegate
+        {
+            Run(delegate { Program.Api("POST", "/console/api/dashboard/clear", "{}"); },
+                delegate { dashStatus.Text = "已清空调用记录（内存环，不影响统计）✓"; dashStatus.ForeColor = Accent; });
+        };
+        var webBtn = PlainButton("打开网页控制台（完整看板）");
+        webBtn.Location = new Point(180, 216);
+        webBtn.Click += delegate { Program.OpenConsole("dash"); };
+        page.Controls.Add(clearBtn);
+        page.Controls.Add(webBtn);
+
+        dashStatus.Location = new Point(32, 258);
+        dashStatus.Size = new Size(880, 20);
+        dashStatus.ForeColor = SubText;
+        page.Controls.Add(dashStatus);
+
+        var recentCaption = new Label { Text = "最近调用（新 → 旧）", Location = new Point(32, 284), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
+        dashRecent.Location = new Point(32, 310);
+        dashRecent.Size = new Size(880, 220);
+        dashRecent.View = View.Details;
+        dashRecent.FullRowSelect = true;
+        dashRecent.Columns.Add("时间", 110);
+        dashRecent.Columns.Add("模型", 220);
+        dashRecent.Columns.Add("模式", 100);
+        dashRecent.Columns.Add("状态", 66);
+        dashRecent.Columns.Add("耗时", 88);
+        dashRecent.Columns.Add("速度", 88);
+        dashRecent.Columns.Add("积分", 80);
+        dashRecent.Columns.Add("账号", 140);
+        dashRecent.Font = new Font("Microsoft YaHei UI", 9F);
+        page.Controls.Add(recentCaption);
+        page.Controls.Add(dashRecent);
+
+        var note = new Label
+        {
+            Text = "轮次 = 客户端提问；上游调用包含换号/降级重试（一次提问可能变成几次调用）。最近调用保留在内存里（最多 50 条），重启会清空。",
+            Location = new Point(32, 540), Size = new Size(880, 36), ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 8.75F),
+        };
+        page.Controls.Add(note);
+
+        page.Resize += delegate
+        {
+            int w = Math.Max(360, page.ClientSize.Width - 64);
+            dashStatus.Width = w;
+            dashRecent.Width = w;
+            dashRecent.Height = Math.Max(120, page.ClientSize.Height - 400);
+            note.Width = w;
+            int sw = (w - 5 * 12) / 6;
+            if (sw > 184) sw = 184;
+            if (sw < 108) sw = 108;
+            for (int i = 0; i < dashCards.Count; i++)
+            {
+                dashCards[i].Width = sw;
+                dashCards[i].Location = new Point(32 + i * (sw + 12), 100);
+            }
+        };
+        return page;
+    }
+
+    Panel AddDashCard(Panel page, string title, Label valueLabel, Label subLabel, int idx)
+    {
+        var card = new Panel { Location = new Point(32 + idx * 150, 100), Size = new Size(138, 100), BackColor = CardBack };
+        var t = new Label { Text = title, Location = new Point(14, 12), ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 9F), AutoSize = true };
+        valueLabel.Location = new Point(14, 34);
+        valueLabel.Font = new Font("Microsoft YaHei UI", 14F, FontStyle.Bold);
+        valueLabel.ForeColor = InkText;
+        valueLabel.Text = "—";
+        valueLabel.AutoSize = true;
+        subLabel.Location = new Point(14, 66);
+        subLabel.Font = new Font("Microsoft YaHei UI", 7.75F);
+        subLabel.ForeColor = SubText;
+        subLabel.Text = "";
+        subLabel.AutoEllipsis = true;
+        card.Controls.Add(t);
+        card.Controls.Add(valueLabel);
+        card.Controls.Add(subLabel);
+        card.Paint += delegate (object s, PaintEventArgs e)
+        {
+            using (var pen = new Pen(BorderLine)) e.Graphics.DrawRectangle(pen, 0, 0, card.Width - 1, card.Height - 1);
+        };
+        page.Controls.Add(card);
+        return card;
+    }
+
     Panel BuildUsagePage()
     {
         var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
@@ -1491,9 +1794,11 @@ class MainForm : Form
     static string NavNameOf(string page)
     {
         if (page == "accounts") return "账号管理";
+        if (page == "login") return "扫码登录";
         if (page == "tasks") return "任务中心";
         if (page == "models") return "模型";
         if (page == "agg") return "聚合渠道";
+        if (page == "dash") return "数据看板";
         if (page == "usage") return "用量";
         return "设置";
     }
@@ -1537,15 +1842,18 @@ class MainForm : Form
             string statusText = "";
             List<Dictionary<string, object>> rows = new List<Dictionary<string, object>>();
             List<string[]> siteLabels = new List<string[]>();
+            var siteCounts = new Dictionary<string, int>();      // 扫码登录页：站点 → 账号数（0.3.64）
             string todayCalls = "—", todayCredit = "—", totalCredit = "—", todayRecovered = "0";
             string curPolicy = "", pinnedIdNow = "";
-            string tasksJson = "", usageJson = "";
-            object gainedTotal = null, checkinDays = null, todayExecSource = null;
+            string tasksJson = "", usageJson = "", dashJson = "";
+            object gainedTotal = null, checkinDays = null, todayExecSource = null, gainedToday = null;
             List<Dictionary<string, object>> history = new List<Dictionary<string, object>>();
             object todayHours = null;
             List<Dictionary<string, object>> byModel = new List<Dictionary<string, object>>();
             Dictionary<string, object> bridgeTasks = null;
             Dictionary<string, object> bridgeBudget = null;
+            Dictionary<string, object> dashToday = null;         // 数据看板（0.3.64）
+            List<Dictionary<string, object>> dashRecentRows = new List<Dictionary<string, object>>();
             if (!up)
             {
                 statusText = "服务未运行——设置页可「启动服务」，或重启本客户端自动拉起";
@@ -1571,15 +1879,21 @@ class MainForm : Form
                         {
                             var site = so as Dictionary<string, object>;
                             if (site == null) continue;
+                            var siteKey = Str(site, "site");
                             var accounts = site.ContainsKey("accounts") ? site["accounts"] as object[] : null;
-                            if (accounts == null) continue;
-                            foreach (object ao in accounts)
+                            int acctN = 0;
+                            if (accounts != null)
                             {
-                                var a = ao as Dictionary<string, object>;
-                                if (a == null) continue;
-                                rows.Add(a);
-                                siteLabels.Add(new string[] { site.ContainsKey("label") ? Str(site, "label") : Str(site, "site"), site.ContainsKey("site") ? Str(site, "site") : "" });
+                                acctN = accounts.Length;
+                                foreach (object ao in accounts)
+                                {
+                                    var a = ao as Dictionary<string, object>;
+                                    if (a == null) continue;
+                                    rows.Add(a);
+                                    siteLabels.Add(new string[] { site.ContainsKey("label") ? Str(site, "label") : Str(site, "site"), siteKey });
+                                }
                             }
+                            if (siteKey != "") siteCounts[siteKey] = acctN;
                         }
                     }
                 }
@@ -1594,6 +1908,7 @@ class MainForm : Form
                 catch { }
                 try { tasksJson = Program.Api("GET", "/console/api/tasks", null); } catch { }
                 try { usageJson = Program.Api("GET", "/console/api/usage", null); } catch { }
+                try { dashJson = Program.Api("GET", "/console/api/dashboard", null); } catch { }
 
                 var ser2 = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
                 try
@@ -1603,9 +1918,21 @@ class MainForm : Form
                     {
                         todayExecSource = t;
                         gainedTotal = t.ContainsKey("gainedTotal") ? t["gainedTotal"] : null;
+                        gainedToday = t.ContainsKey("gainedToday") ? t["gainedToday"] : null;
                         checkinDays = t.ContainsKey("checkinDays") ? t["checkinDays"] : null;
                         var hist = t.ContainsKey("history") ? t["history"] as object[] : null;
                         if (hist != null) foreach (object h in hist) { var d = h as Dictionary<string, object>; if (d != null) history.Add(d); }
+                    }
+                }
+                catch { }
+                try
+                {
+                    var dv = ser2.DeserializeObject(dashJson) as Dictionary<string, object>;
+                    if (dv != null)
+                    {
+                        dashToday = dv.ContainsKey("today") ? dv["today"] as Dictionary<string, object> : null;
+                        var rec = dv.ContainsKey("recent") ? dv["recent"] as object[] : null;
+                        if (rec != null) foreach (object r in rec) { var d = r as Dictionary<string, object>; if (d != null) dashRecentRows.Add(d); }
                     }
                 }
                 catch { }
@@ -1690,6 +2017,94 @@ class MainForm : Form
                     top++;
                 }
                 topModels.EndUpdate();
+
+                // ---- 扫码登录页（0.3.64）：站点账号数 + 已连接徽章 + 自动领取横幅 ----
+                int connectedN = 0;
+                foreach (var kv in siteCounts) if (kv.Value > 0) connectedN++;
+                loginConnected.Text = "已连接 " + connectedN + " 个站点";
+                for (int i = 0; i < LoginSites.Length; i++)
+                {
+                    string siteKey = LoginSites[i];
+                    Label cl;
+                    if (loginCountLabels.TryGetValue(siteKey, out cl))
+                    {
+                        int n = siteCounts.ContainsKey(siteKey) ? siteCounts[siteKey] : 0;
+                        cl.Text = n > 0 ? "已添加 " + n + " 个账号" : "未添加";
+                        cl.ForeColor = n > 0 ? Accent : SubText;
+                    }
+                }
+                bool tasksOn = bridgeTasks == null || Str(bridgeTasks, "enabled") != "False";
+                var gToday = gainedToday as Dictionary<string, object>;
+                string banner;
+                if (!tasksOn)
+                {
+                    banner = "○ 自动任务总开关已关闭——每日积分不会自动领取（任务中心可打开）";
+                }
+                else
+                {
+                    var bits = new List<string>();
+                    if (gToday != null)
+                    {
+                        int ck = Int(gToday, "checkins"), clN = Int(gToday, "claims"), tv = Int(gToday, "travels");
+                        double cr = CreditOf(gToday);
+                        if (ck > 0) bits.Add("签到 " + ck + " 个账号");
+                        if (clN > 0) bits.Add("领奖 " + clN + " 次");
+                        if (tv > 0) bits.Add("猫猫旅行 " + tv + " 次");
+                        if (cr > 0) bits.Add("+" + cr.ToString("0.##") + " 积分");
+                    }
+                    banner = bits.Count > 0
+                        ? "✓ 自动领取每日积分 · 今日：" + string.Join("，", bits.ToArray())
+                        : "✓ 自动领取每日积分已开启 · 今日还没有执行记录（时点在任务中心设置，错过自动补跑）";
+                }
+                loginBanner.Text = banner;
+
+                // ---- 数据看板页（0.3.64）：六卡 + 最近调用 ----
+                if (dashToday != null)
+                {
+                    double promptT = ToD(dashToday, "promptTokens"), completionT = ToD(dashToday, "completionTokens");
+                    bool reported = Str(dashToday, "tokensReported") == "True";
+                    double callsN = ToD(dashToday, "calls");
+                    dashTokens.Text = reported ? ToD(dashToday, "tokens").ToString("#,0") : (callsN > 0 ? "未上报" : "—");
+                    dashTokensSub.Text = reported ? "输入 " + promptT.ToString("#,0") + " · 输出 " + completionT.ToString("#,0") : (callsN > 0 ? "上游没发 usage 帧" : "还没有调用");
+                    dashRounds.Text = ToD(dashToday, "rounds").ToString("#,0");
+                    dashRoundsSub.Text = ToD(dashToday, "upstreamCalls").ToString("#,0") + " 次上游调用";
+                    dashFails.Text = ToD(dashToday, "roundFailures").ToString("#,0");
+                    dashFailsSub.Text = ToD(dashToday, "roundFailures") > 0 ? "有整轮失败，看事件或日志" : "没有整轮失败";
+                    double msD = ToD(dashToday, "ms");
+                    dashSpeed.Text = msD > 0 ? (completionT / (msD / 1000.0)).ToString("0.0") + " tok/s" : "—";
+                    dashSpeedSub.Text = msD > 0 ? "今日平均输出速度" : "没有计时数据";
+                    double hit = ToD(dashToday, "cacheHitTokens");
+                    dashCache.Text = promptT > 0 ? (hit / promptT * 100.0).ToString("0") + "%" : "—";
+                    dashCacheSub.Text = promptT > 0 ? "命中 " + hit.ToString("#,0") + " tokens" : "上游未区分缓存 tokens";
+                    dashRecovered.Text = ToD(dashToday, "recovered").ToString("#,0");
+                    dashRecoveredSub.Text = "前一账号失败、换号后成功";
+
+                    dashRecent.BeginUpdate();
+                    dashRecent.Items.Clear();
+                    int shownDash = 0;
+                    foreach (var r in dashRecentRows)
+                    {
+                        if (shownDash >= 30) break;
+                        DateTime at;
+                        string when = DateTime.TryParse(Str(r, "at"), out at) ? at.ToString("HH:mm:ss") : "";
+                        var it = new ListViewItem(when);
+                        it.SubItems.Add(Str(r, "model"));
+                        it.SubItems.Add(Str(r, "mode"));
+                        int status = (int)ToD(r, "status");
+                        it.SubItems.Add(status.ToString());
+                        double msR = ToD(r, "ms");
+                        it.SubItems.Add(msR >= 1000 ? (msR / 1000.0).ToString("0.0") + " s" : msR.ToString("0") + " ms");
+                        it.SubItems.Add(Str(r, "tok_s") != "" ? Str(r, "tok_s") + " tok/s" : "—");
+                        object crObj;
+                        it.SubItems.Add(r.TryGetValue("credit", out crObj) && crObj != null ? CreditOf(r).ToString("0.##") : "—");
+                        it.SubItems.Add(Str(r, "account") != "" ? Str(r, "account") : "—");
+                        bool bad = status >= 400 || Str(r, "anomaly") == "True";
+                        if (bad) it.ForeColor = Danger;
+                        dashRecent.Items.Add(it);
+                        shownDash++;
+                    }
+                    dashRecent.EndUpdate();
+                }
 
                 SyncPolicyCombo(curPolicy);
                 if (!settingsDirty)
@@ -1782,6 +2197,14 @@ class MainForm : Form
     {
         double d;
         return m != null && m.ContainsKey("credit") && double.TryParse(m["credit"].ToString(), out d) ? d : 0;
+    }
+
+    /** 数值字段兜底读取（数据看板 0.3.64）：缺失/非数字一律 0，绝不抛。 */
+    static double ToD(Dictionary<string, object> d, string key)
+    {
+        if (d == null || !d.ContainsKey(key) || d[key] == null) return 0;
+        double v;
+        return double.TryParse(d[key].ToString(), out v) ? v : 0;
     }
 
     Control MakeAccountCard(Dictionary<string, object> a, string siteLabel, string site, string policy, string pinnedAccountId)

@@ -22,7 +22,7 @@ import { queryCredit, supportsCreditQuery } from './upstream.mjs';
 import { probeModel, runHealthScan, healthStatus, reloadHealthState } from './health.mjs';
 import { startLogin, pollLogin } from './device-login.mjs';
 import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel, usageCsv, reloadUsage } from './usage.mjs';
-import { recentLogs, recentRequests } from './log.mjs';
+import { recentLogs, recentRequests, clearRequests } from './log.mjs';
 import { recentEvents, recordEvent, reloadEvents } from './events.mjs';
 import { compressionStats, reloadLearned } from './compress.mjs';
 import { sendJson, writeJsonFileAtomic } from './util.mjs';
@@ -156,6 +156,21 @@ function attachBurnoutToAccounts(cfg, site, accounts, dailyAvg) {
     a.budget = accountBudgetStatus(cfg, a.id);
   }
   return accounts;
+}
+
+/**
+ * 最近请求 + T9 异常标注（/recent-requests 与 /dashboard 共用同一映射）：
+ * 单次消耗 > 该模型今日均值 ×5 且 ≥1 积分才算异常（低倍率模型的自然波动不标）。
+ */
+function recentRequestsWithAnomaly(n = 50) {
+  const avg = todayAvgCreditByModel();
+  return recentRequests(n).map((r) => {
+    const base = r.credit != null ? avg[`${r.site}/${r.model}`] : null;
+    if (base != null && base > 0 && r.credit > base * 5 && r.credit >= 1) {
+      return { ...r, creditAvg: Math.round(base * 100) / 100, anomaly: true };
+    }
+    return r;
+  });
 }
 
 export async function handleConsoleApi(ctx) {
@@ -684,15 +699,41 @@ export async function handleConsoleApi(ctx) {
   // T9：对照「该模型今日平均单次消耗」标注异常——单次 > 均值 ×5 且 ≥1 积分才算
   // （低倍率模型 0.0x 积分的自然波动不标；无基线/无 credit 的请求不标）。
   if (p === '/recent-requests' && method === 'GET') {
-    const avg = todayAvgCreditByModel();
-    const requests = recentRequests(50).map((r) => {
-      const base = r.credit != null ? avg[`${r.site}/${r.model}`] : null;
-      if (base != null && base > 0 && r.credit > base * 5 && r.credit >= 1) {
-        return { ...r, creditAvg: Math.round(base * 100) / 100, anomaly: true };
-      }
-      return r;
+    return sendJson(res, 200, { ok: true, requests: recentRequestsWithAnomaly(50) });
+  }
+
+  // ---- 数据看板（0.3.64，形态对齐 dsh-xdpool）：今日轮次/调用/失败/token/速度/缓存命中
+  // + 最近调用内存环。轮次/上游调用的口径见 usage.mjs 的 recordRound/recordUpstreamCall。----
+  if (p === '/dashboard' && method === 'GET') {
+    const snap = usageSnapshot(1);
+    const t = snap.today || {};
+    const tokens = (t.promptTokens || 0) + (t.completionTokens || 0);
+    return sendJson(res, 200, {
+      ok: true,
+      today: {
+        rounds: t.rounds || 0,
+        roundFailures: t.roundFailures || 0,
+        upstreamCalls: t.upstreamCalls || 0,
+        calls: t.calls || 0,
+        errors: t.errors || 0,
+        recovered: t.recovered || 0,
+        promptTokens: t.promptTokens || 0,
+        completionTokens: t.completionTokens || 0,
+        tokens,
+        tokensReported: t.calls > 0 && tokens > 0, // 有调用但 token 为 0 = 上游没发 usage 帧
+        cacheHitTokens: t.cacheHitTokens || 0,
+        credit: t.credit || 0,
+        ms: t.ms || 0,
+      },
+      recent: recentRequestsWithAnomaly(50),
+      ring: 50,
+      since: snap.since,
     });
-    return sendJson(res, 200, { ok: true, requests });
+  }
+  if (p === '/dashboard/clear' && method === 'POST') {
+    clearRequests();
+    recordEvent('system', '数据看板：最近调用记录已清空（内存环）');
+    return sendJson(res, 200, { ok: true });
   }
 
   // 事件时间线（T6）：系统/任务/账号/策略等结构化事件的统一视图，前端过滤 kind
