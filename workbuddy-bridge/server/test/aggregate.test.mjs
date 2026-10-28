@@ -22,7 +22,8 @@ test('AGG_PRESETS 预置厂商目录：id 可作渠道名、baseUrl 合法、无
   const seen = new Set();
   for (const p of AGG_PRESETS) {
     assert.match(p.id, /^[A-Za-z0-9_-]{1,32}$/, '渠道名非法：' + p.id);
-    assert.match(p.baseUrl, /^https:\/\/.+/, 'baseUrl 非法：' + p.id);
+    // 0.4.0：本地运行时（Ollama/LM Studio/LLaMA.cpp）刻意用 http://localhost，其余必须是 https
+    assert.match(p.baseUrl, /^https:\/\/.+|^http:\/\/localhost[:/].+/, 'baseUrl 非法：' + p.id);
     assert.ok(!seen.has(p.id), '预置重名：' + p.id);
     seen.add(p.id);
   }

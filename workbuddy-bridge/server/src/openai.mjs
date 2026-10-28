@@ -3,7 +3,7 @@
 import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId, reportFrameError } from './upstream.mjs';
 import { ensureToken } from './auth.mjs';
 import { isQuotaError } from './pool.mjs';
-import { resolveTarget, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText, effectiveSuffixText, chainCandidates } from './router.mjs';
+import { resolveTarget, projectOf, bareModelId, mergedModels, parseMultiplier, isExcluded, multiplierSuffixText, effectiveSuffixText, chainCandidates } from './router.mjs';
 import { aggregateOpen, aggregateModels } from './aggregate.mjs';
 import { recordUsage, estimateCredit, observedCostByModel } from './usage.mjs';
 import { startSSE, writeSSE, sendJson, sendError, estimateTokens, startHeartbeat } from './util.mjs';
@@ -212,7 +212,7 @@ async function openWithFallback(cfg, target, upstreamBody, signal, 原因) {
 
 export async function handleChatCompletions(ctx) {
   const { cfg, res, body, signal } = ctx;
-  const target = await resolveTarget(cfg, body.model);
+  const target = await resolveTarget(cfg, body.model, { project: projectOf(ctx.req, body) });
   let { site, model } = target;
   const publicModel = target.requested;
   const wantsStream = body.stream === true;
@@ -441,6 +441,15 @@ export async function handleModels(ctx) {
   const data = [];
   const seen = new Set();
 
+  // 模型 ID 去后缀（0.4.0）：上一轮动态登记的裸 ID 别名先撤掉，按当前目录重建，
+  // 避免模型下架后留下指向空气的别名。
+  if (Array.isArray(cfg.__bareAliases) && cfg.__bareAliases.length) {
+    for (const k of cfg.__bareAliases) {
+      if (cfg.modelAliases) delete cfg.modelAliases[k];
+    }
+    cfg.__bareAliases = [];
+  }
+
   // 别名：先解析到真实模型，若目标已被白/黑名单剔除，就不要再列进目录
   // （否则客户端会照目录逐个探测，必然失败）
   for (const [alias, targetModel] of Object.entries(cfg.modelAliases || {})) {
@@ -489,6 +498,21 @@ export async function handleModels(ctx) {
       if (suffix) {
         item.id = m.id + suffix;
         item.name = (info.name || m.id) + suffix;
+      }
+    }
+    // 模型 ID 去后缀（0.4.0，可选）：额外列一个裸 ID 条目（原 ID 保留），
+    // 并在内存里登记「裸 ID → 真实 ID」别名，选中裸 ID 也能正确路由。
+    if (cfg.pickerStripSuffix) {
+      const bare = bareModelId(m.id, m.site);
+      if (bare && bare !== m.id && !seen.has(bare) && !(cfg.modelAliases && cfg.modelAliases[bare])) {
+        seen.add(bare);
+        if (!cfg.modelAliases) cfg.modelAliases = {};
+        cfg.modelAliases[bare] = m.id;
+        if (!Array.isArray(cfg.__bareAliases)) cfg.__bareAliases = [];
+        cfg.__bareAliases.push(bare);
+        data.push({
+          id: bare, object: 'model', created: 1700000000, owned_by: m.site, name: bare, site: m.site, alias_of: m.id,
+        });
       }
     }
     data.push(item);

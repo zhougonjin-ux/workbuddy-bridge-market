@@ -4,6 +4,10 @@ node_modules/
 # 构建/诊断临时文件
 .tmp-*
 *.log
+.diag-extract.mjs
+
+# 其他智能体的本地数据目录（不随仓库分发）
+.opencode/
 
 # 桌面客户端构建产物：版本号由 build.cmd 从 server/package.json 生成，不入库
 workbuddy-bridge/client/version.txt

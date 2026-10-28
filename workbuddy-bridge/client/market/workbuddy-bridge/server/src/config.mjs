@@ -202,6 +202,14 @@ export function defaultConfig() {
     // 聚合渠道泳道（0.3.58，可选）：用户自有 key 的 OpenAI 兼容 provider，
     // 模型 ID 形如 agg:<name>/<model>
     aggregate: { providers: [] },
+    // 局域网访问（0.4.0）：默认关闭，只监听回环。开启后监听 0.0.0.0，
+    // 控制台允许「与本机同端口」的局域网来源；/v1/* 仍要求 apiKey。
+    // allowOrigins 可放行额外源（例如手机浏览器打开的 http://192.168.x.x:8788）。
+    lan: { enabled: false, allowOrigins: [] },
+    // 项目级配置（0.4.0）：按请求头 X-WB-Project / 请求体 project 覆盖调度策略与站点。
+    // map: { "shop": { "policy": "balance-first", "site": "intl-cli", "model": "..." } }
+    // 未命中的项目一律走全局配置；只在该开关打开时生效。
+    projects: { enabled: false, map: {} },
     timeouts: {
       headerMs: 90000, // 上游首字节（响应头）超时
       idleMs: 300000, // 流中空闲超时
@@ -241,6 +249,10 @@ export function defaultConfig() {
     // ZCode 模型选择器里是否把调用倍率编码进模型 ID（如 "glm-5.3-flash (x0.06)"）。
     // 关掉后选择器只显示裸 ID。调用时带不带后缀都能路由（自动剥离）。
     pickerMultiplierSuffix: true,
+    // 模型 ID 去后缀（0.4.0）：上游模型常带 -free / -thinking / -1017 等后缀，
+    // 开启后列表与选择器输出裸 ID；调用时带不带后缀都能路由（自动匹配）。
+    // 默认关闭：老配置/工作流里可能已经写了完整 ID，避免改默认行为把人搞懵。
+    pickerStripSuffix: false,
     // 模型池自动同步间隔（分钟）：定期把上游模型清单写进 ZCode 的个人供应商配置，
     // 上游加/删模型或倍率变动时，选择器无需重启会话即可跟上。
     providerSyncMinutes: 30,
@@ -612,6 +624,41 @@ export function validateConfig(cfg, defaults = defaultConfig()) {
   if (cfg.pickerMultiplierSuffix !== undefined && typeof cfg.pickerMultiplierSuffix !== 'boolean') {
     fix(`pickerMultiplierSuffix 必须是布尔值，已回退为 ${defaults.pickerMultiplierSuffix}`);
     cfg.pickerMultiplierSuffix = defaults.pickerMultiplierSuffix;
+  }
+
+  // ---- 模型 ID 去后缀开关 ----
+  if (cfg.pickerStripSuffix !== undefined && typeof cfg.pickerStripSuffix !== 'boolean') {
+    fix(`pickerStripSuffix 必须是布尔值，已回退为 ${defaults.pickerStripSuffix}`);
+    cfg.pickerStripSuffix = defaults.pickerStripSuffix;
+  }
+
+  // ---- 局域网访问 ----
+  if (!isPlainObject(cfg.lan)) {
+    fix('lan 必须是对象，已回退为默认值');
+    cfg.lan = structuredClone(defaults.lan);
+  } else {
+    if (typeof cfg.lan.enabled !== 'boolean') cfg.lan.enabled = defaults.lan.enabled;
+    if (!Array.isArray(cfg.lan.allowOrigins)) {
+      fix('lan.allowOrigins 必须是字符串数组，已回退为空');
+      cfg.lan.allowOrigins = [];
+    } else {
+      cfg.lan.allowOrigins = cfg.lan.allowOrigins
+        .filter((x) => isStr(x))
+        .map((x) => String(x).trim())
+        .filter(Boolean);
+    }
+  }
+
+  // ---- 项目级配置 ----
+  if (!isPlainObject(cfg.projects)) {
+    fix('projects 必须是对象，已回退为默认值');
+    cfg.projects = structuredClone(defaults.projects);
+  } else {
+    if (typeof cfg.projects.enabled !== 'boolean') cfg.projects.enabled = defaults.projects.enabled;
+    if (!isPlainObject(cfg.projects.map)) {
+      fix('projects.map 必须是对象，已回退为空');
+      cfg.projects.map = {};
+    }
   }
 
   // ---- 模型池自动同步间隔 ----

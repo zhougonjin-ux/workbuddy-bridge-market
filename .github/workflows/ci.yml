@@ -25,6 +25,12 @@ jobs:
       - name: 单元测试
         run: npm test
 
+      - name: 前后端路由一致性
+        run: npm run check:routes
+
+      - name: 端到端冒烟（隔离实例）
+        run: npm run e2e
+
       - name: 发布物一致性
         run: npm run check:market
 

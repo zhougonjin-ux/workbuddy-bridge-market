@@ -1,7 +1,6 @@
 {
   "name": "workbuddy-bridge-market",
   "private": true,
-  "description": "ZCode 插件市场仓库：WorkBuddy 积分桥（源码 + 市场清单 + 离线安装副本）",
   "license": "MIT",
   "engines": {
     "node": ">=20"
@@ -12,9 +11,11 @@
     "build:market": "node scripts/build-market.mjs",
     "check:market": "node scripts/build-market.mjs --check",
     "check:docs": "node scripts/check-docs.mjs",
+    "check:routes": "node scripts/check-routes.mjs",
+    "e2e": "node scripts/e2e-smoke.mjs",
     "lint": "node scripts/lint.mjs",
     "coverage": "node scripts/coverage.mjs",
-    "verify": "npm run lint && npm run test && npm run check:market && npm run check:docs",
+    "verify": "npm run lint && npm run check:routes && npm run test && npm run check:market && npm run check:docs",
     "sync:install": "node scripts/sync-install.mjs"
   }
 }

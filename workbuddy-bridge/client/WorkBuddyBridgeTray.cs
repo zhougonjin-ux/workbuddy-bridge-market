@@ -263,6 +263,13 @@ static class Program
         return m.Success ? m.Groups[1].Value : "";
     }
 
+    /** 从 JSON 里读布尔字段（缺省按 false）。 */
+    public static bool ExtractBool(string json, string key)
+    {
+        var m = System.Text.RegularExpressions.Regex.Match(json, "\"" + key + "\"\\s*:\\s*(true|false)");
+        return m.Success && m.Groups[1].Value == "true";
+    }
+
     static string ResolveServerDir()
     {
         string portable = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "server"));
@@ -293,8 +300,14 @@ static class Program
 
     public static string Api(string method, string path, string body)
     {
+        return Api(method, path, body, 120000);
+    }
+
+    /** timeoutMs 供下载/自更新这类长动作单独放宽（默认 120 秒）。 */
+    public static string Api(string method, string path, string body, int timeoutMs)
+    {
         var req = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + port + path);
-        req.Method = method; req.Timeout = 120000; req.Proxy = null;
+        req.Method = method; req.Timeout = timeoutMs; req.Proxy = null;
         req.Headers.Add("Authorization", "Bearer " + apiKey);
         req.ContentType = "application/json";
         if (body != null)
@@ -430,13 +443,19 @@ static class Program
             AppName, MessageBoxButtons.OK, ok ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
     }
 
-    public static Icon MakeIcon(bool up)
+    public static Icon MakeIcon(bool up) { return MakeIcon(up ? 1 : 0); }
+
+    /** 托盘状态灯（0.4.0）：0=停止（灰）、1=运行（绿）、2=异常（琥珀）。 */
+    public static Icon MakeIcon(int state)
     {
+        Color fill = state == 1
+            ? Color.FromArgb(5, 150, 105)
+            : (state == 2 ? Color.FromArgb(217, 119, 6) : Color.FromArgb(150, 150, 150));
         using (Bitmap bmp = new Bitmap(16, 16))
         using (Graphics g = Graphics.FromImage(bmp))
         {
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using (SolidBrush brush = new SolidBrush(up ? Color.FromArgb(5, 150, 105) : Color.FromArgb(150, 150, 150)))
+            using (SolidBrush brush = new SolidBrush(fill))
                 g.FillEllipse(brush, 2, 2, 12, 12);
             using (Pen pen = new Pen(Color.FromArgb(30, 30, 30)))
                 g.DrawEllipse(pen, 2, 2, 12, 12);
@@ -455,16 +474,45 @@ static class Program
 
 class MainForm : Form
 {
-    static readonly Color BodyBack = Color.FromArgb(246, 247, 249);
-    static readonly Color CardBack = Color.White;
-    static readonly Color InkText = Color.FromArgb(17, 24, 39);
-    static readonly Color SubText = Color.FromArgb(107, 114, 128);
+    // 主题（0.4.0）：以下 6 个基础色随深浅色切换；强调色（Accent/Danger/Warn）两套共用。
+    static readonly Color LightBody = Color.FromArgb(246, 247, 249);
+    static readonly Color LightCard = Color.White;
+    static readonly Color DarkBody = Color.FromArgb(18, 19, 22);
+    static readonly Color DarkCard = Color.FromArgb(30, 32, 36);
+    static bool DarkMode;
+    static Color BodyBack = LightBody;
+    static Color CardBack = LightCard;
+    static Color InkText = Color.FromArgb(17, 24, 39);
+    static Color SubText = Color.FromArgb(107, 114, 128);
     static readonly Color Accent = Color.FromArgb(5, 150, 105);
     static readonly Color AccentDark = Color.FromArgb(4, 120, 87);
     static readonly Color Danger = Color.FromArgb(220, 38, 38);
     static readonly Color Warn = Color.FromArgb(180, 120, 10);
-    static readonly Color BorderLine = Color.FromArgb(235, 238, 242);
-    static readonly Color NavSel = Color.FromArgb(236, 248, 244);
+    static Color BorderLine = Color.FromArgb(235, 238, 242);
+    static Color NavSel = Color.FromArgb(236, 248, 244);
+
+    static void ApplyTheme(bool dark)
+    {
+        DarkMode = dark;
+        if (dark)
+        {
+            BodyBack = DarkBody;
+            CardBack = DarkCard;
+            InkText = Color.FromArgb(235, 238, 243);
+            SubText = Color.FromArgb(148, 155, 166);
+            BorderLine = Color.FromArgb(52, 56, 62);
+            NavSel = Color.FromArgb(26, 60, 50);
+        }
+        else
+        {
+            BodyBack = LightBody;
+            CardBack = LightCard;
+            InkText = Color.FromArgb(17, 24, 39);
+            SubText = Color.FromArgb(107, 114, 128);
+            BorderLine = Color.FromArgb(235, 238, 242);
+            NavSel = Color.FromArgb(236, 248, 244);
+        }
+    }
 
     readonly Panel navPanel = new Panel();
     readonly Panel bodyPanel = new Panel();
@@ -534,6 +582,18 @@ class MainForm : Form
     readonly Panel hoursPanel = new Panel();
     readonly ListView topModels = new ListView();
     object todayHoursData = null;
+    // 用量筛选与趋势（0.4.0）
+    readonly ComboBox usageRange = new ComboBox();
+    readonly TextBox usageFilter = new TextBox();
+    readonly Label usageFilterInfo = new Label();
+    readonly Panel usageTrend = new Panel();
+    List<Dictionary<string, object>> usageDays = new List<Dictionary<string, object>>();
+    bool usageFilterLoading;
+
+    // 事件页（0.4.0）
+    readonly ListView eventsList = new ListView();
+    readonly Label eventsStatus = new Label();
+    List<Dictionary<string, object>> eventsRows = new List<Dictionary<string, object>>();
 
     // 扫码登录页（0.3.64，形态对齐 dsh-xdpool）：厂商卡 + 设备授权登录
     readonly Label loginConnected = new Label();
@@ -618,7 +678,7 @@ class MainForm : Form
         BuildTray();
 
         var timer = new System.Windows.Forms.Timer { Interval = 60000 };
-        timer.Tick += delegate { if (!busy) RefreshAll(); };
+        timer.Tick += delegate { if (!busy) RefreshAll(); WatchdogTick(); };
         timer.Start();
         Load += delegate { RestoreWindowState(); RefreshAll(); };
     }
@@ -648,8 +708,58 @@ class MainForm : Form
             Location = new Point(x, y);
             ClientSize = new Size(w, h);
             if (parts[4].Trim() == "1") WindowState = FormWindowState.Maximized;
+            if (parts.Length >= 6 && parts[5].Trim() == "1") ApplyThemeNow(true);
         }
         catch { /* 状态文件坏了就按默认居中打开 */ }
+    }
+
+    /** 立即应用主题：重设基础色 → 把已建好的控件从旧色映射到新色（无需重启窗口）。 */
+    void ApplyThemeNow(bool dark)
+    {
+        ApplyTheme(dark);
+        RecolorTree(this);
+        BackColor = BodyBack;
+        bodyPanel.BackColor = BodyBack;
+        navPanel.BackColor = CardBack;
+        foreach (var nb in navButtons) nb.Invalidate();
+        Invalidate(true);
+    }
+
+    static Color MapBackColor(Color c)
+    {
+        if (c == LightCard || c == DarkCard) return CardBack;
+        if (c == LightBody || c == DarkBody) return BodyBack;
+        return c;
+    }
+
+    static Color MapForeColor(Color c)
+    {
+        if (c == Color.FromArgb(17, 24, 39)) return InkText;
+        if (c == Color.FromArgb(107, 114, 128)) return SubText;
+        if (c == Color.FromArgb(235, 238, 243)) return InkText;
+        if (c == Color.FromArgb(148, 155, 166)) return SubText;
+        return c;
+    }
+
+    /** 递归重着色：只动基础底色/正文色，强调色（成功/警告/危险）保持原样。 */
+    void RecolorTree(Control root)
+    {
+        foreach (Control c in root.Controls)
+        {
+            c.BackColor = MapBackColor(c.BackColor);
+            c.ForeColor = MapForeColor(c.ForeColor);
+            if (c is ListView)
+            {
+                c.BackColor = CardBack;
+                c.ForeColor = InkText;
+            }
+            if (c is TextBox || c is ComboBox)
+            {
+                c.BackColor = DarkMode ? Color.FromArgb(40, 43, 48) : Color.White;
+                c.ForeColor = InkText;
+            }
+            RecolorTree(c);
+        }
     }
 
     void SaveWindowState()
@@ -660,7 +770,7 @@ class MainForm : Form
             Directory.CreateDirectory(Path.GetDirectoryName(p));
             bool max = WindowState == FormWindowState.Maximized;
             Rectangle r = max ? RestoreBounds : Bounds;
-            File.WriteAllText(p, r.X + "," + r.Y + "," + ClientSize.Width + "," + ClientSize.Height + "," + (max ? "1" : "0"));
+            File.WriteAllText(p, r.X + "," + r.Y + "," + ClientSize.Width + "," + ClientSize.Height + "," + (max ? "1" : "0") + "," + (DarkMode ? "1" : "0"));
         }
         catch { /* 保存失败不影响关闭 */ }
     }
@@ -704,7 +814,8 @@ class MainForm : Form
         AddNav("聚合渠道", "agg", 236);
         AddNav("数据看板", "dash", 278);
         AddNav("用量", "usage", 320);
-        AddNav("设置", "settings", 362);
+        AddNav("事件", "events", 362);
+        AddNav("设置", "settings", 404);
 
         navVersion.Dock = DockStyle.Bottom;
         navVersion.Height = 36;
@@ -785,6 +896,7 @@ class MainForm : Form
         pages["agg"] = BuildAggPage();
         pages["dash"] = BuildDashPage();
         pages["usage"] = BuildUsagePage();
+        pages["events"] = BuildEventsPage();
         pages["settings"] = BuildSettingsPage();
         foreach (var p in pages.Values) bodyPanel.Controls.Add(p);
         Controls.Add(bodyPanel);
@@ -919,9 +1031,60 @@ class MainForm : Form
                     : "积分刷新完成 ✓ " + (total - fail) + "/" + total + " 个成功，" + fail + " 个失败（" + string.Join("、", failSites.ToArray()) + (fail > 3 ? " 等" : "") + "，详情见网页控制台）";
             });
         };
+        // 单账号导出 / 导入（0.4.0）：导出文件含 token，提示按密钥保管
+        var exportBtn = PlainButton("导出选中账号");
+        exportBtn.Location = new Point(512, 128);
+        exportBtn.Click += delegate
+        {
+            var keys = new List<string>(selectedAccounts);
+            if (keys.Count == 0)
+            {
+                MessageBox.Show("先在账号卡左侧勾选要导出的账号（一次一个）。", Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            string key = keys[0];
+            int sep = key.IndexOf('\0');
+            string site = sep > 0 ? key.Substring(0, sep) : "cn-cli";
+            string id = sep > 0 ? key.Substring(sep + 1) : key;
+            var dlg = new SaveFileDialog
+            {
+                FileName = "wb-account-" + site + "-" + id + ".json",
+                Filter = "JSON (*.json)|*.json",
+                Title = "导出账号凭据（文件含 token，请妥善保管）",
+            };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            RunAcctWithStatus("导出", delegate
+            {
+                string json = Program.Api("GET",
+                    "/console/api/account/export?site=" + Uri.EscapeDataString(site) + "&id=" + Uri.EscapeDataString(id), null);
+                File.WriteAllText(dlg.FileName, json, new UTF8Encoding(false));
+                return "已导出到 " + dlg.FileName + "（文件含 token，别外传）";
+            });
+        };
+        var importFileBtn = PlainButton("导入账号文件");
+        importFileBtn.Location = new Point(636, 128);
+        importFileBtn.Click += delegate
+        {
+            var dlg = new OpenFileDialog { Filter = "JSON (*.json)|*.json", Title = "选择账号导出文件" };
+            if (dlg.ShowDialog(this) != DialogResult.OK) return;
+            RunAcctWithStatus("导入文件", delegate
+            {
+                string body = File.ReadAllText(dlg.FileName);
+                string outText = Program.Api("POST", "/console/api/account/import", body);
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer();
+                var d = ser.DeserializeObject(outText) as Dictionary<string, object>;
+                bool ok = d != null && d.ContainsKey("ok") && d["ok"] is bool && (bool)d["ok"];
+                if (!ok) throw new Exception(d != null && d.ContainsKey("error") ? Convert.ToString(d["error"]) : "导入失败");
+                var acc = d.ContainsKey("account") ? d["account"] as Dictionary<string, object> : null;
+                if (acc == null) acc = new Dictionary<string, object>();
+                return "已导入账号：" + Str(acc, "label") + "（同 uid 会自动覆盖原账号）";
+            });
+        };
         page.Controls.Add(addBtn);
         page.Controls.Add(importBtn);
         page.Controls.Add(refreshBtn);
+        page.Controls.Add(exportBtn);
+        page.Controls.Add(importFileBtn);
 
         // 批量操作行（0.3.72）：全选 + 批量启停/删除/保留线
         var bulkRow = new FlowLayoutPanel { Location = new Point(32, 164), Size = new Size(900, 32) };
@@ -1556,7 +1719,10 @@ class MainForm : Form
             var name = new Label { Text = PendingNames[i] + " · " + PendingVendors[i], Location = new Point(60, 14), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 10F, FontStyle.Bold) };
             var badge = new Label { Text = "未接入", Location = new Point(790, 18), Size = new Size(94, 20), ForeColor = SubText, TextAlign = ContentAlignment.MiddleRight };
             var desc = new Label { Text = PendingDescs[i], Location = new Point(60, 44), Size = new Size(800, 30), ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 8.75F) };
-            var add = new Button { Text = "暂未接入", Location = new Point(60, 72), Size = new Size(120, 26), FlatStyle = FlatStyle.Flat, Enabled = false, Font = new Font("Microsoft YaHei UI", 9F) };
+            var add = new Button { Text = "如何接入", Location = new Point(60, 72), Size = new Size(120, 26), FlatStyle = FlatStyle.Flat, ForeColor = SubText, Cursor = Cursors.Hand, Font = new Font("Microsoft YaHei UI", 9F) };
+            add.FlatAppearance.BorderSize = 1;
+            string pendingName = PendingNames[i];
+            add.Click += delegate { ShowChannelHelp(pendingName); };
             card.Controls.Add(chip);
             card.Controls.Add(name);
             card.Controls.Add(badge);
@@ -1618,6 +1784,23 @@ class MainForm : Form
     {
         loginStatus.Text = text;
         loginStatus.ForeColor = color;
+    }
+
+    /**
+     * 未内置登录的厂商（0.4.0）：把「暂未接入」死路变成可操作建议。
+     * 结论来自服务端渠道矩阵（src/channels.mjs）：这几家上游只有客户端 OAuth，
+     * 没有公开 API；能走的路只有「自有 key → 聚合渠道」或换用已接入站点。
+     */
+    void ShowChannelHelp(string name)
+    {
+        string msg = name + " 目前只提供客户端登录，没有公开 API，本桥接无法复用它的登录态。\n\n"
+            + "可选做法：\n"
+            + "1) 继续用它的官方客户端；\n"
+            + "2) 若它有 API key（OpenAI 兼容），在「聚合渠道」里填上即可，模型 ID 形如 agg:<渠道>/<模型>；\n"
+            + "3) 把常用模型切到已接入的 WorkBuddy / CodeArts 站点。\n\n"
+            + "要去「聚合渠道」页看看吗？";
+        if (MessageBox.Show(msg, name + " · 接入建议", MessageBoxButtons.YesNo, MessageBoxIcon.Information) == DialogResult.Yes)
+            ShowPage("agg");
     }
 
     /** 登录入口分发：CodeArts 走华为云 OAuth（服务端起本地回调，浏览器授权）；其余走设备授权。 */
@@ -1872,17 +2055,48 @@ class MainForm : Form
         statCards.Add(AddStatCard(page, "累计积分", usageTotalCredit, 432, 100));
         statCards.Add(AddStatCard(page, "今日换号救回", usageRecovered, 632, 100));
 
-        var hoursCaption = new Label { Text = "今日 24 小时调用分布", Location = new Point(32, 216), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
-        hoursPanel.Location = new Point(32, 242);
+        // 筛选行（0.4.0）：时间范围 + 模型/站点关键字 + 手动刷新
+        usageRange.Location = new Point(32, 208);
+        usageRange.Size = new Size(110, 26);
+        usageRange.DropDownStyle = ComboBoxStyle.DropDownList;
+        usageRange.Items.AddRange(new object[] { "近 1 天", "近 7 天", "近 30 天" });
+        usageRange.SelectedIndex = 1;
+        usageRange.SelectedIndexChanged += delegate { LoadUsageFilter(); };
+        usageFilter.Location = new Point(152, 210);
+        usageFilter.Size = new Size(300, 23);
+        var usageHint = new Label { Text = "模型/站点关键字（留空 = 全部）", Location = new Point(462, 212), AutoSize = true, ForeColor = SubText, Font = new Font("Microsoft YaHei UI", 8.5F) };
+        var usageGo = PlainButton("刷新筛选");
+        usageGo.Location = new Point(660, 206);
+        usageGo.Click += delegate { LoadUsageFilter(); };
+        usageFilterInfo.Location = new Point(32, 240);
+        usageFilterInfo.AutoSize = true;
+        usageFilterInfo.ForeColor = SubText;
+        usageFilterInfo.Text = "尚未加载筛选数据";
+        page.Controls.Add(usageRange);
+        page.Controls.Add(usageFilter);
+        page.Controls.Add(usageHint);
+        page.Controls.Add(usageGo);
+        page.Controls.Add(usageFilterInfo);
+
+        var trendCaption = new Label { Text = "每日调用趋势（跟随上方筛选）", Location = new Point(32, 268), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
+        usageTrend.Location = new Point(32, 294);
+        usageTrend.Size = new Size(880, 128);
+        usageTrend.BackColor = CardBack;
+        usageTrend.Paint += TrendPaint;
+        page.Controls.Add(trendCaption);
+        page.Controls.Add(usageTrend);
+
+        var hoursCaption = new Label { Text = "今日 24 小时调用分布", Location = new Point(32, 434), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
+        hoursPanel.Location = new Point(32, 460);
         hoursPanel.Size = new Size(880, 160);
         hoursPanel.BackColor = CardBack;
         hoursPanel.Paint += HoursPaint;
         page.Controls.Add(hoursCaption);
         page.Controls.Add(hoursPanel);
 
-        var topCaption = new Label { Text = "消耗 Top5 模型（累计）", Location = new Point(32, 416), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
-        topModels.Location = new Point(32, 442);
-        topModels.Size = new Size(880, 150);
+        var topCaption = new Label { Text = "消耗 Top5 模型（累计）", Location = new Point(32, 632), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
+        topModels.Location = new Point(32, 658);
+        topModels.Size = new Size(880, 190);
         topModels.View = View.Details;
         topModels.FullRowSelect = true;
         topModels.Columns.Add("模型", 300);
@@ -1900,6 +2114,7 @@ class MainForm : Form
         {
             int w = Math.Max(360, page.ClientSize.Width - 64);
             hoursPanel.Width = w;
+            usageTrend.Width = w;
             topModels.Width = w;
             int sw = (w - 3 * 16) / 4;
             if (sw > 184) sw = 184;
@@ -1911,6 +2126,85 @@ class MainForm : Form
             }
         };
         return page;
+    }
+
+    /** 事件时间线（0.4.0）：系统/任务/账号/策略事件，排查「什么时候换了号」用。 */
+    Panel BuildEventsPage()
+    {
+        var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
+        page.Controls.Add(PageTitle("事件"));
+        page.Controls.Add(PageSub("系统 / 任务 / 账号 / 策略的结构化事件（时间倒序，最多 200 条）。", 60));
+
+        var btns = new FlowLayoutPanel { Location = new Point(32, 92), Size = new Size(880, 40) };
+        AddBtn(btns, "刷新事件", delegate { LoadEvents(); });
+        AddBtn(btns, "去网页看完整时间线", delegate { Program.OpenConsole("events"); });
+        page.Controls.Add(btns);
+
+        eventsStatus.Location = new Point(32, 136);
+        eventsStatus.AutoSize = true;
+        eventsStatus.ForeColor = SubText;
+        eventsStatus.Text = "尚未加载";
+        page.Controls.Add(eventsStatus);
+
+        eventsList.Location = new Point(32, 164);
+        eventsList.Size = new Size(880, 420);
+        eventsList.View = View.Details;
+        eventsList.FullRowSelect = true;
+        eventsList.Columns.Add("时间", 150);
+        eventsList.Columns.Add("类型", 90);
+        eventsList.Columns.Add("内容", 600);
+        eventsList.Font = new Font("Microsoft YaHei UI", 9F);
+        page.Controls.Add(eventsList);
+
+        page.Resize += delegate
+        {
+            int w = Math.Max(360, page.ClientSize.Width - 64);
+            eventsList.Width = w;
+            eventsList.Height = Math.Max(200, page.ClientSize.Height - 200);
+            eventsList.Columns[2].Width = Math.Max(200, w - 250);
+        };
+        return page;
+    }
+
+    void LoadEvents()
+    {
+        if (!Program.Health())
+        {
+            eventsStatus.Text = "服务未运行（设置页可启动）";
+            return;
+        }
+        Run(delegate
+        {
+            string json = Program.Api("GET", "/console/api/events?limit=200", null);
+            var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            var d = ser.DeserializeObject(json) as Dictionary<string, object>;
+            object arr = null;
+            var rows = new List<Dictionary<string, object>>();
+            if (d != null && d.TryGetValue("events", out arr) && arr is object[])
+            {
+                foreach (object o in (object[])arr)
+                {
+                    var one = o as Dictionary<string, object>;
+                    if (one != null) rows.Add(one);
+                }
+            }
+            eventsRows = rows;
+        }, delegate
+        {
+            eventsList.BeginUpdate();
+            eventsList.Items.Clear();
+            foreach (var e in eventsRows)
+            {
+                string at = Str(e, "at");
+                if (at.Length >= 19) at = at.Substring(0, 19).Replace("T", " ");
+                var it = new ListViewItem(at);
+                it.SubItems.Add(Str(e, "kind"));
+                it.SubItems.Add(Str(e, "text"));
+                eventsList.Items.Add(it);
+            }
+            eventsList.EndUpdate();
+            eventsStatus.Text = "共 " + eventsRows.Count + " 条 · 更新于 " + DateTime.Now.ToString("HH:mm:ss");
+        });
     }
 
     Panel AddStatCard(Panel page, string title, Label valueLabel, int x, int y)
@@ -1969,6 +2263,84 @@ class MainForm : Form
         }
         TextRenderer.DrawText(g, "峰值 " + max + " 次/时", new Font("Microsoft YaHei UI", 8F),
             new Point(x0 + chartW - 110, y0), SubText);
+    }
+
+    /** 拉取筛选后的用量（0.4.0）：/console/api/usage/filter?days=&model= */
+    void LoadUsageFilter()
+    {
+        if (usageFilterLoading || !Program.Health()) return;
+        usageFilterLoading = true;
+        int days = usageRange.SelectedIndex == 0 ? 1 : (usageRange.SelectedIndex == 2 ? 30 : 7);
+        string q = usageFilter.Text.Trim();
+        Run(delegate
+        {
+            string path = "/console/api/usage/filter?days=" + days;
+            if (q != "") path += "&model=" + Uri.EscapeDataString(q);
+            string json = Program.Api("GET", path, null);
+            var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            var d = ser.DeserializeObject(json) as Dictionary<string, object>;
+            var list = new List<Dictionary<string, object>>();
+            object arr = null;
+            if (d != null && d.TryGetValue("days", out arr) && arr is object[])
+            {
+                foreach (object o in (object[])arr)
+                {
+                    var one = o as Dictionary<string, object>;
+                    if (one != null) list.Add(one);
+                }
+            }
+            usageDays = list;
+            double calls = 0, credit = 0;
+            foreach (var day in list)
+            {
+                calls += Val(day, "calls");
+                credit += Val(day, "credit");
+            }
+            usageFilterInfo.Text = "近 " + days + " 天" + (q == "" ? "" : " · 筛选“" + q + "”")
+                + " · 调用 " + ((long)calls) + " 次 · 积分 " + credit.ToString("0.##") + "（" + list.Count + " 天有记录）";
+        }, delegate { usageFilterLoading = false; usageTrend.Invalidate(); });
+    }
+
+    /** 每日调用趋势柱状图（数据来自 /usage/filter，随筛选变化）。 */
+    void TrendPaint(object s, PaintEventArgs e)
+    {
+        var g = e.Graphics;
+        g.Clear(CardBack);
+        var list = usageDays;
+        if (list == null || list.Count == 0)
+        {
+            TextRenderer.DrawText(g, "点「刷新筛选」查看每日趋势", new Font("Microsoft YaHei UI", 9F),
+                new Rectangle(0, 0, usageTrend.Width, usageTrend.Height), SubText,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+            return;
+        }
+        int x0 = 40, y0 = 14, chartH = usageTrend.Height - 46, chartW = Math.Max(60, usageTrend.Width - x0 - 20);
+        double max = 1;
+        for (int i = 0; i < list.Count; i++) max = Math.Max(max, Val(list[i], "calls"));
+        int colW = Math.Max(4, chartW / Math.Max(1, list.Count));
+        using (var pen = new Pen(BorderLine)) g.DrawLine(pen, x0, y0 + chartH, x0 + chartW, y0 + chartH);
+        for (int i = 0; i < list.Count; i++)
+        {
+            double calls = Val(list[i], "calls");
+            int h2 = (int)Math.Round(calls / max * (chartH - 8));
+            using (var b = new SolidBrush(Accent))
+                g.FillRectangle(b, x0 + i * colW + 2, y0 + chartH - h2, Math.Max(2, colW - 3), h2);
+            string label = Str(list[i], "date");
+            if (label.Length >= 10) label = label.Substring(5);
+            TextRenderer.DrawText(g, label, new Font("Microsoft YaHei UI", 7.5F),
+                new Rectangle(x0 + i * colW - 6, y0 + chartH + 4, colW + 12, 16), SubText,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.Top);
+        }
+        TextRenderer.DrawText(g, "峰值 " + max + " 次/天", new Font("Microsoft YaHei UI", 8F),
+            new Point(x0 + chartW - 110, y0), SubText);
+    }
+
+    static double Val(Dictionary<string, object> d, string key)
+    {
+        if (d == null || !d.ContainsKey(key) || d[key] == null) return 0;
+        double v;
+        return double.TryParse(Convert.ToString(d[key]), System.Globalization.NumberStyles.Any,
+            System.Globalization.CultureInfo.InvariantCulture, out v) ? v : 0;
     }
 
     Panel BuildSettingsPage()
@@ -2087,25 +2459,62 @@ class MainForm : Form
         serviceStatus.Location = new Point(32, 380);
         serviceStatus.Size = new Size(700, 20);
         serviceStatus.ForeColor = SubText;
-        var svcBtns = new FlowLayoutPanel { Location = new Point(32, 406), Size = new Size(860, 42) };
+        var svcBtns = new FlowLayoutPanel { Location = new Point(32, 406), Size = new Size(860, 80) };
         // 服务启停走 Run（后台线程）：StartService 最多等 15s、RestartService 20s+，同步跑会把窗口冻死
         AddBtn(svcBtns, "启动服务", delegate { serviceStatus.Text = "启动中…"; Run(delegate { Program.RunBlocking(delegate { if (!Program.Health()) Program.StartService(); }); }); });
         AddBtn(svcBtns, "停止服务", delegate { serviceStatus.Text = "停止中…"; Run(delegate { Program.RunBlocking(delegate { if (Program.Health()) Program.StopService(); }); }); });
         AddBtn(svcBtns, "重启服务", delegate { serviceStatus.Text = "重启中…"; Run(delegate { Program.RunBlocking(Program.RestartService); }); });
         AddBtn(svcBtns, "检查更新", delegate { Program.CheckUpdateUi(); });
+        AddBtn(svcBtns, "一键更新插件", delegate { RunSelfUpdate(); });
         AddBtn(svcBtns, "给智能体安装插件", delegate { new Thread(delegate() { Program.InstallPluginToZcode(); }).Start(); });
         page.Controls.Add(svcCaption);
         page.Controls.Add(serviceStatus);
         page.Controls.Add(svcBtns);
 
-        var consoleCaption = new Label { Text = "更多", Location = new Point(32, 464), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
+        var netCaption = new Label { Text = "网络与模型（改动后重启服务生效）", Location = new Point(32, 496), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
+        var netBtns = new FlowLayoutPanel { Location = new Point(32, 524), Size = new Size(880, 40) };
+        string netMsg = "";
+        AddBtn(netBtns, "切换局域网访问", delegate
+        {
+            Run(delegate
+            {
+                string cur = Program.Api("GET", "/console/api/lan", null);
+                bool on = Program.ExtractBool(cur, "enabled");
+                Program.Api("POST", "/console/api/lan", "{\"enabled\":" + Bool(!on) + "}");
+                netMsg = !on
+                    ? "局域网访问已开启：重启服务后用 http://本机IP:端口/console 访问（仅限可信网络）"
+                    : "局域网访问已关闭：重启服务后生效";
+            }, delegate { serviceStatus.Text = netMsg; });
+        });
+        AddBtn(netBtns, "切换模型去后缀", delegate
+        {
+            Run(delegate
+            {
+                string cur = Program.Api("GET", "/console/api/bridge", null);
+                bool on = Program.ExtractBool(cur, "pickerStripSuffix");
+                Program.Api("POST", "/console/api/picker/suffix", "{\"strip\":" + Bool(!on) + "}");
+                netMsg = !on
+                    ? "已开启：/v1/models 额外列出裸 ID（原 ID 保留，两种写法都能调）"
+                    : "已关闭：只列上游原始 ID";
+            }, delegate { serviceStatus.Text = netMsg; });
+        });
+        page.Controls.Add(netCaption);
+        page.Controls.Add(netBtns);
+        AddBtn(netBtns, "切换深色模式", delegate
+        {
+            ApplyThemeNow(!DarkMode);
+            SaveWindowState();
+            serviceStatus.Text = (DarkMode ? "已切到深色模式" : "已切回浅色模式") + "（下次打开窗口沿用）";
+        });
+
+        var consoleCaption = new Label { Text = "更多", Location = new Point(32, 572), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
         var consoleBtn = PlainButton("打开网页控制台（完整功能：账号详情/模型/用量明细/诊断）");
-        consoleBtn.Location = new Point(32, 492);
+        consoleBtn.Location = new Point(32, 600);
         consoleBtn.Click += delegate { Program.OpenConsole(); };
         page.Controls.Add(consoleCaption);
         page.Controls.Add(consoleBtn);
 
-        cfgStatus.Location = new Point(32, 534);
+        cfgStatus.Location = new Point(32, 642);
         cfgStatus.Size = new Size(700, 20);
         cfgStatus.ForeColor = SubText;
         page.Controls.Add(cfgStatus);
@@ -2128,6 +2537,8 @@ class MainForm : Form
         foreach (var kv in pages) kv.Value.Visible = kv.Key == page;
         if (page == "models" && modelList != null && modelList.Items.Count == 0) LoadModels();
         if (page == "agg" && aggList != null && aggList.Items.Count == 0) LoadAgg();
+        if (page == "usage" && usageDays.Count == 0) LoadUsageFilter();
+        if (page == "events" && eventsList.Items.Count == 0) LoadEvents();
         foreach (var nb in navButtons) nb.Selected = nb.Text == NavNameOf(page);
         foreach (var nb in navButtons) nb.Invalidate();
     }
@@ -2141,6 +2552,7 @@ class MainForm : Form
         if (page == "agg") return "聚合渠道";
         if (page == "dash") return "数据看板";
         if (page == "usage") return "用量";
+        if (page == "events") return "事件";
         return "设置";
     }
 
@@ -2213,6 +2625,104 @@ class MainForm : Form
         }
         else alertLabel.Visible = false;
         accountCards.ResumeLayout();
+    }
+
+    int healthFails;
+    bool watchdogRestarting;
+
+    /** 托盘状态灯：0=停止 1=运行 2=异常（只改灯，不动窗体状态）。 */
+    void SetTrayState(int state)
+    {
+        try { if (tray != null) tray.Icon = Program.MakeIcon(state); } catch { }
+    }
+
+    /**
+     * 看门狗（0.4.0）：每 60 秒探活一次。
+     *   探活失败 → 琥珀灯；连续两次（约 2 分钟）仍失败 → 后台自动拉起服务。
+     * 只看 /health，不碰模型流量；重启期间用 watchdogRestarting 防重入。
+     */
+    void WatchdogTick()
+    {
+        if (watchdogRestarting) return;
+        if (Program.Health())
+        {
+            healthFails = 0;
+            SetTrayState(1);
+            return;
+        }
+        healthFails++;
+        SetTrayState(2);
+        if (healthFails < 2) return;
+        healthFails = 0;
+        watchdogRestarting = true;
+        new Thread(delegate()
+        {
+            try
+            {
+                Program.StartService();
+                if (Program.Health())
+                {
+                    try { BeginInvoke((MethodInvoker)delegate { SetTrayState(1); }); } catch { }
+                }
+            }
+            catch { }
+            finally { watchdogRestarting = false; }
+        }).Start();
+    }
+
+    /** 一键更新插件（0.4.0）：服务端下载 + 备份 + 覆盖，成功后自动重启服务。 */
+    void RunSelfUpdate()
+    {
+        if (!Program.Health())
+        {
+            MessageBox.Show("服务未运行，先启动服务再更新。", Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            return;
+        }
+        if (MessageBox.Show(
+            "将从 GitHub（含镜像回退）下载最新插件、校验版本后覆盖安装。\n覆盖前会把整个插件目录备份成 .bak-<时间戳>，出问题可手动回滚。\n\n完成后自动重启本地服务。继续吗？",
+            Program.AppName, MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        serviceStatus.Text = "正在下载更新…（1~2 分钟，失败会自动换源）";
+        new Thread(delegate()
+        {
+            string msg;
+            try
+            {
+                string outText = Program.Api("POST", "/console/api/self-update", "{}", 300000);
+                var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+                var d = ser.DeserializeObject(outText) as Dictionary<string, object>;
+                bool ok = d != null && d.ContainsKey("ok") && d["ok"] is bool && (bool)d["ok"];
+                bool updated = d != null && d.ContainsKey("updated") && d["updated"] is bool && (bool)d["updated"];
+                string from = d != null && d.ContainsKey("from") ? Convert.ToString(d["from"]) : "?";
+                string to = d != null && d.ContainsKey("to") ? Convert.ToString(d["to"]) : "?";
+                if (ok && updated)
+                {
+                    Program.RunBlocking(Program.RestartService);
+                    msg = "已更新到 v" + to + "（原 v" + from + "），服务已重启。\n\n插件目录已备份为 .bak-* 前缀，确认无误后可手动删除。";
+                }
+                else if (ok)
+                {
+                    msg = "已是最新版本 v" + from + "。";
+                }
+                else
+                {
+                    string err = d != null && d.ContainsKey("error") ? Convert.ToString(d["error"]) : outText;
+                    msg = "更新失败：" + (err.Length > 300 ? err.Substring(0, 300) : err);
+                }
+            }
+            catch (Exception ex)
+            {
+                msg = "更新失败：" + ex.Message;
+            }
+            try
+            {
+                BeginInvoke((MethodInvoker)delegate
+                {
+                    serviceStatus.Text = msg;
+                    MessageBox.Show(msg, Program.AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                });
+            }
+            catch { }
+        }).Start();
     }
 
     void RefreshAll()

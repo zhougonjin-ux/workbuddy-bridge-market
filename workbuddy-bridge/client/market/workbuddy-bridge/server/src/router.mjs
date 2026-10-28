@@ -106,6 +106,16 @@ export function explainExcluded(cfg, site, id) {
   return null;
 }
 
+/** 去后缀后的裸模型 ID（只剥明确的装饰性后缀；不安全就返回 null）。 */
+export function bareModelId(id, site) {
+  const before = String(id || '');
+  let s = before.replace(/-(free|thinking|reasoner|preview)$/i, '');
+  // CodeArts 的模型常带 -1017 这类版本号后缀，只在该站点剥
+  if (site === 'codearts') s = s.replace(/-\d{3,4}$/, '');
+  if (!s || s === before || s.length < 2) return null;
+  return s;
+}
+
 /** 展开别名（支持链式，最多 5 层），解析不了就原样返回。 */
 function expandAlias(cfg, name, depth = 0) {
   const alias = cfg.modelAliases?.[name];
@@ -439,7 +449,22 @@ async function 改派到有额度的站点(cfg, 站点, 模型) {
  *      上限表。少了这一步，走显式前缀（`cn-cli/xxx`）的请求可能整条路径都不碰目录，
  *      压缩就因为没有上限而完全不触发，表现为长上下文照样吃 400。
  */
-export async function resolveTarget(cfg, requestedModel) {
+/** 从请求头 X-WB-Project / 请求体 project 取项目名（项目级配置用）。 */
+export function projectOf(req, body) {
+  let v = '';
+  try { v = String((req && req.headers && req.headers['x-wb-project']) || (body && body.project) || '').trim(); } catch { v = ''; }
+  return v ? v.slice(0, 80) : undefined;
+}
+
+export async function resolveTarget(cfg, requestedModel, opts = {}) {
+  // 项目级配置（0.4.0）：按项目覆盖默认站点/模型。只覆盖这两项，
+  // 不改全局 pool.policy —— 策略是进程级状态，按请求改写会互相踩。
+  if (opts.project && cfg.projects?.enabled) {
+    const p = cfg.projects.map?.[String(opts.project)];
+    if (p && (p.site || p.model)) {
+      cfg = { ...cfg, defaultSite: p.site || cfg.defaultSite, defaultModel: p.model || cfg.defaultModel };
+    }
+  }
   // T37 预算 pause：超限时拒绝新请求。这是「今天到此为止」的硬护栏，
   // 与 mode=free 的区别是它连显式指定模型也拦（显式指定正是失控烧分的元凶）。
   // 放在路由最前面：命中就直接抛，不打上游、不消耗任何额度。

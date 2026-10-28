@@ -8,6 +8,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { loadConfig, getLastConfigIssues, paths, siteKeys, authKeys, primaryKey, ROOT } from './src/config.mjs';
 import { getAuth, isLoggedIn } from './src/auth.mjs';
 import { handleChatCompletions, handleModels } from './src/openai.mjs';
@@ -187,12 +188,31 @@ function isLocalServicePort(urlObj) {
   return port === String(cfg.port);
 }
 
+/** 私网地址（RFC1918 + link-local）：只有 lan.enabled 时才认为是「可信来源」。 */
+function isPrivateHostname(hostname) {
+  const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (/^10\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  if (/^192\.168\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  if (/^169\.254\.\d{1,3}\.\d{1,3}$/.test(h)) return true;
+  return h.endsWith('.local');
+}
+
+/** 局域网模式下，来源是否指向本服务端口（同源：私网 IP + 本端口）。 */
+function isLanServicePort(urlObj) {
+  if (!cfg.lan?.enabled) return false;
+  if (!isPrivateHostname(urlObj.hostname)) return false;
+  const port = urlObj.port || (urlObj.protocol === 'https:' ? '443' : '80');
+  return port === String(cfg.port);
+}
+
 /** 控制台来源是否可信。 */
 function consoleOriginAllowed(req) {
   const host = req.headers.host || '';
   if (host) {
     try {
-      if (!isLocalServicePort(new URL(`http://${host}`))) return false;
+      const h = new URL(`http://${host}`);
+      if (!isLocalServicePort(h) && !isLanServicePort(h)) return false;
     } catch {
       return false;
     }
@@ -200,7 +220,8 @@ function consoleOriginAllowed(req) {
   const origin = req.headers.origin;
   if (!origin) return true; // 同源导航 / 本机工具：不带 Origin
   try {
-    return isLocalServicePort(new URL(origin));
+    const o = new URL(origin);
+    return isLocalServicePort(o) || isLanServicePort(o) || (cfg.lan?.enabled && (cfg.lan.allowOrigins || []).includes(origin));
   } catch {
     return false;
   }
@@ -219,7 +240,9 @@ function corsAllowed(origin) {
   if (list.includes('*')) return true;
   try {
     if (isLocalServicePort(new URL(origin))) return true;
+    if (isLanServicePort(new URL(origin))) return true;
   } catch { /* 非法 Origin 按不允许处理 */ }
+  if (cfg.lan?.enabled && Array.isArray(cfg.lan.allowOrigins) && cfg.lan.allowOrigins.includes(origin)) return true;
   return list.includes(origin);
 }
 
@@ -724,6 +747,21 @@ function reportConfigIssues() {
 //   (2) 重试期间后续 bind 失败会再次触发 error 事件、落进下面的通用分支 process.exit(1)。
 // 修复：unref 去掉（绑定成功才允许进程安眠）；hookRetryStarted 之后的 error 一律吞掉继续重试。
 let hookRetryStarted = false;
+// 局域网模式监听所有网卡；默认仍是回环（安全默认）。
+const listenHost = cfg.lan?.enabled ? '0.0.0.0' : cfg.host;
+
+/** 本机可用的私网 IPv4（局域网模式下打印给用户，方便手机/平板访问）。 */
+function lanAddresses() {
+  const out = [];
+  try {
+    for (const list of Object.values(os.networkInterfaces())) {
+      for (const it of list || []) {
+        if (it && it.family === 'IPv4' && !it.internal && isPrivateHostname(it.address)) out.push(it.address);
+      }
+    }
+  } catch { /* 取不到网卡就只打印 0.0.0.0 */ }
+  return out;
+}
 server.on('error', (e) => {
   // 拉起模式（hook 拉起 / 交棒新实例）：上个实例退出时 socket 可能仍在 TIME_WAIT，
   // 立刻 bind 会 EADDRINUSE —— 自动重试绑定，而不是静默退出导致「hook 跑了服务却没起来」。
@@ -746,7 +784,7 @@ server.on('error', (e) => {
         error(`端口重试 60 次（30 秒）仍被占用，放弃`);
         process.exit(1);
       }
-      server.listen(cfg.port, cfg.host);
+      server.listen(cfg.port, listenHost);
     }, 500);
     return;
   }
@@ -763,10 +801,17 @@ server.on('error', (e) => {
   process.exit(1);
 });
 
-server.listen(cfg.port, cfg.host, () => {
+server.listen(cfg.port, listenHost, () => {
   log('WorkBuddy 反代已启动（国内版 + 国际版多站点）');
   log(`  控制台：http://${cfg.host}:${cfg.port}/console   ← 建议用桌面快捷方式打开`);
-  log(`  监听地址：http://${cfg.host}:${cfg.port}   （仅本机可达）`);
+  if (cfg.lan?.enabled) {
+    const ips = lanAddresses();
+    warn(`  监听地址：http://0.0.0.0:${cfg.port}（局域网模式已开启，任何能访问本机端口的人都可尝试连接）`);
+    if (ips.length) warn(`  局域网访问：${ips.map((ip) => `http://${ip}:${cfg.port}/console`).join('   ')}`);
+    warn('  安全提示：请确保 apiKey 为强随机值，且只在可信网络使用；关闭后需重启服务生效。');
+  } else {
+    log(`  监听地址：http://${cfg.host}:${cfg.port}   （仅本机可达）`);
+  }
   const keys = authKeys(cfg);
   if (!keys.length) {
     warn('  config.json 未配置 apiKey，服务当前不做鉴权（任何本机程序均可调用）。建议补一个随机密钥。');

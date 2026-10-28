@@ -8,6 +8,8 @@ import { getAuth, isLoggedIn, accountSnapshot } from './auth.mjs';
 import {
   poolPathFor,
   getAccount,
+  listAccounts,
+  addAccount,
   removeAccount,
   setAccountEnabled,
   setAccountLabel,
@@ -21,7 +23,7 @@ import { getCatalog, mergedModels } from './router.mjs';
 import { queryCredit, supportsCreditQuery, openChat, aggregateFrames } from './upstream.mjs';
 import { probeModel, runHealthScan, healthStatus, reloadHealthState } from './health.mjs';
 import { startLogin, pollLogin } from './device-login.mjs';
-import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel, usageCsv, reloadUsage } from './usage.mjs';
+import { usageSnapshot, usageFiltered, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel, usageCsv, reloadUsage } from './usage.mjs';
 import { recentLogs, recentRequests, clearRequests } from './log.mjs';
 import { recentEvents, recordEvent, reloadEvents } from './events.mjs';
 import { compressionStats, reloadLearned } from './compress.mjs';
@@ -39,6 +41,7 @@ import { burnoutReport, predictAccount } from './burnout.mjs';
 import { recentDailyCreditAvg } from './usage.mjs';
 import { checkForUpdate } from './updatecheck.mjs';
 import { onboardingStatus } from './onboarding.mjs';
+import { channelMatrix } from './channels.mjs';
 import { codeartsOpenChat, codeartsCatalog } from './codearts-upstream.mjs';
 import { runDiagnostics, startDoctorLoop } from './doctor.mjs';
 import { flushLearned } from './compress.mjs';
@@ -459,6 +462,9 @@ export async function handleConsoleApi(ctx) {
     b.perAccountBudget = accountBudgetCheckAndAnnounce(cfg, bAccs);
     b.burnout = burnoutBrief(cfg); // T32：预警条的「预计用不完」项
     b.alerts = alertThresholds(cfg); // T34：预警阈值（原先写死在前端，现由配置下发）
+    // 0.4.0：客户端设置页回填用
+    b.lan = { enabled: !!cfg.lan?.enabled };
+    b.pickerStripSuffix = cfg.pickerStripSuffix === true;
     return sendJson(res, 200, b);
   }
   if (p === '/credit/refresh' && method === 'POST') {
@@ -1069,6 +1075,19 @@ export async function handleConsoleApi(ctx) {
     const days = Math.min(365, Math.max(1, Number.isFinite(n) ? Math.trunc(n) : 7));
     return sendJson(res, 200, usageSnapshot(days));
   }
+  // 按模型 / 站点过滤的用量视图（0.4.0）：days + model 子串 + site
+  if (p === '/usage/filter' && method === 'GET') {
+    const rawDays = url.searchParams.get('days');
+    const nDays = rawDays == null || rawDays === '' ? NaN : Number(rawDays);
+    const days = Math.min(365, Math.max(1, Number.isFinite(nDays) ? Math.trunc(nDays) : 7));
+    return sendJson(res, 200, {
+      ok: true,
+      ...usageFiltered(days, {
+        model: (url.searchParams.get('model') || '').slice(0, 80),
+        site: (url.searchParams.get('site') || '').slice(0, 40),
+      }),
+    });
+  }
   if (p === '/usage/reset' && method === 'POST') {
     resetUsage();
     return sendJson(res, 200, { ok: true });
@@ -1142,6 +1161,147 @@ export async function handleConsoleApi(ctx) {
     } finally {
       try { up?.close?.(); } catch { /* 已断 */ }
     }
+  }
+
+  // ---- 单账号导出 / 导入（0.4.0）----
+  // 导出给用户自己保管（换机迁移/单号备份）；文件含 accessToken，提示按密钥对待。
+  if (p === '/account/export' && method === 'GET') {
+    const site = String(url.searchParams.get('site') || cfg.defaultSite);
+    const id = String(url.searchParams.get('id') || '');
+    if (!cfg.sites[site]) return sendJson(res, 400, { ok: false, error: `未知站点 ${site}` });
+    const a = getAccount(site, id);
+    if (!a) return sendJson(res, 404, { ok: false, error: `账号不存在：${id}` });
+    const payload = {
+      ok: true,
+      kind: 'workbuddy-bridge/account',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      account: {
+        site,
+        label: a.label || a.nickname || id,
+        accessToken: a.accessToken,
+        refreshToken: a.refreshToken ?? null,
+        expiresAt: a.expiresAt ?? null,
+        domain: a.domain ?? null,
+        uid: a.uid ?? null,
+        nickname: a.nickname ?? null,
+      },
+    };
+    const safe = String(a.label || id).replace(/[^\w\u4e00-\u9fa5-]+/g, '_').slice(0, 40);
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Content-Disposition': `attachment; filename="wb-account-${site}-${safe}.json"`,
+      'Cache-Control': 'no-store',
+    });
+    return res.end(JSON.stringify(payload, null, 2));
+  }
+  if (p === '/account/import' && method === 'POST') {
+    const body = ctx.body || {};
+    const raw = body.account && typeof body.account === 'object' ? body.account : body;
+    const site = String(raw.site || body.site || cfg.defaultSite);
+    if (!cfg.sites[site]) return sendJson(res, 400, { ok: false, error: `未知站点 ${site}` });
+    if (!raw.accessToken || typeof raw.accessToken !== 'string') {
+      return sendJson(res, 400, { ok: false, error: '缺少 accessToken（请选择导出的账号 JSON 文件）' });
+    }
+    try {
+      const acc = addAccount(site, {
+        accessToken: raw.accessToken,
+        refreshToken: raw.refreshToken ?? null,
+        expiresAt: raw.expiresAt ?? null,
+        domain: raw.domain ?? null,
+        uid: raw.uid ?? null,
+        nickname: raw.nickname ?? null,
+      }, { label: raw.label ? String(raw.label).slice(0, 60) : undefined });
+      recordEvent('account', `导入账号 ${site} / ${acc.label || acc.id}`);
+      return sendJson(res, 200, { ok: true, site, account: { id: acc.id, label: acc.label, uid: acc.uid || null } });
+    } catch (e) {
+      return sendJson(res, 400, { ok: false, error: String(e.message || e).slice(0, 300) });
+    }
+  }
+
+  // ---- 渠道能力矩阵（0.4.0）----
+  if (p === '/channels' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, ...channelMatrix() });
+  }
+
+  // ---- 局域网访问开关（0.4.0，改动需重启服务）----
+  if (p === '/lan' && method === 'GET') {
+    return sendJson(res, 200, {
+      ok: true,
+      enabled: !!cfg.lan?.enabled,
+      allowOrigins: cfg.lan?.allowOrigins || [],
+      host: cfg.host,
+      port: cfg.port,
+    });
+  }
+  if (p === '/lan' && method === 'POST') {
+    const body = ctx.body || {};
+    if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+      return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+    }
+    if (body.allowOrigins !== undefined && !Array.isArray(body.allowOrigins)) {
+      return sendJson(res, 400, { ok: false, error: 'allowOrigins 必须是字符串数组' });
+    }
+    if (body.enabled !== undefined) cfg.lan.enabled = body.enabled;
+    if (body.allowOrigins !== undefined) {
+      cfg.lan.allowOrigins = body.allowOrigins.map((x) => String(x).trim()).filter(Boolean);
+    }
+    saveConfig(cfg);
+    recordEvent('system', `局域网访问已${cfg.lan.enabled ? '开启' : '关闭'}（重启服务生效）`);
+    return sendJson(res, 200, { ok: true, enabled: cfg.lan.enabled, allowOrigins: cfg.lan.allowOrigins, restartRequired: true });
+  }
+
+  // ---- 项目级配置（0.4.0）----
+  if (p === '/projects' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, enabled: !!cfg.projects?.enabled, map: cfg.projects?.map || {} });
+  }
+  if (p === '/projects' && method === 'POST') {
+    const body = ctx.body || {};
+    if (body.enabled !== undefined && typeof body.enabled !== 'boolean') {
+      return sendJson(res, 400, { ok: false, error: 'enabled 必须是布尔值' });
+    }
+    if (body.map !== undefined && (body.map === null || typeof body.map !== 'object' || Array.isArray(body.map))) {
+      return sendJson(res, 400, { ok: false, error: 'map 必须是对象' });
+    }
+    if (body.enabled !== undefined) cfg.projects.enabled = body.enabled;
+    if (body.map !== undefined) {
+      // 只接受已知字段，避免把任意对象写进配置
+      const clean = {};
+      for (const [name, v] of Object.entries(body.map)) {
+        if (!name || typeof v !== 'object' || v === null || Array.isArray(v)) continue;
+        const item = {};
+        if (typeof v.site === 'string' && cfg.sites[v.site]) item.site = v.site;
+        if (typeof v.model === 'string') item.model = v.model;
+        if (typeof v.policy === 'string') item.policy = v.policy;
+        if (typeof v.freeFirst === 'boolean') item.freeFirst = v.freeFirst;
+        clean[String(name).slice(0, 80)] = item;
+      }
+      cfg.projects.map = clean;
+    }
+    saveConfig(cfg);
+    recordEvent('system', `项目级配置已${cfg.projects.enabled ? '开启' : '关闭'}（${Object.keys(cfg.projects.map).length} 个项目）`);
+    return sendJson(res, 200, { ok: true, enabled: cfg.projects.enabled, map: cfg.projects.map });
+  }
+
+  // ---- 模型 ID 去后缀开关（0.4.0）----
+  if (p === '/picker/suffix' && method === 'POST') {
+    const body = ctx.body || {};
+    if (typeof body.strip !== 'boolean') return sendJson(res, 400, { ok: false, error: 'strip 必须是布尔值' });
+    cfg.pickerStripSuffix = body.strip;
+    saveConfig(cfg);
+    recordEvent('system', `模型 ID 去后缀已${body.strip ? '开启' : '关闭'}（模型池下次同步生效）`);
+    return sendJson(res, 200, { ok: true, strip: cfg.pickerStripSuffix });
+  }
+
+  // ---- 插件一键自更新（0.4.0）：下载 → 校验 → 备份 → 覆盖，重启服务生效 ----
+  if (p === '/self-update' && method === 'POST') {
+    const { selfUpdate } = await import('./selfupdate.mjs');
+    const r = await selfUpdate({ force: !!(ctx.body && ctx.body.force) });
+    if (r.updated) {
+      recordEvent('system', `插件自更新：v${r.from} → v${r.to}（重启服务生效）`);
+      flushEvents();
+    }
+    return sendJson(res, r.ok ? 200 : 502, r);
   }
 
   // ---- 模型探测（顺序执行，避免打爆上游） ----

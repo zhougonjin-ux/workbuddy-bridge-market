@@ -6,7 +6,7 @@
 //   Codex(Responses 请求) → 本层 → Chat Completions → 复用车载 handler → 转回 Responses
 //
 // 设计原则：只新增，不改动 /v1/chat/completions 的任何既有行为。
-import { resolveTarget } from './router.mjs';
+import { resolveTarget, projectOf } from './router.mjs';
 import { openWithModelChain } from './openai.mjs';
 import { aggregateOpen } from './aggregate.mjs';
 import { openChat, openChatRotating, classifyFrame, upstreamErrorMessage, reportFrameError } from './upstream.mjs';
@@ -274,7 +274,7 @@ export async function handleResponses(ctx) {
   const reasoningEcho = body.reasoning && typeof body.reasoning === 'object' ? body.reasoning : null;
 
   // 先解析模型（保持与 chat 相同的路由语义：支持 site/model 前缀与别名）
-  const target = await resolveTarget(cfg, body.model);
+  const target = await resolveTarget(cfg, body.model, { project: projectOf(ctx.req, body) });
   let { site, model } = target;
 
   const chatReq = toChatRequest({ ...body, model });

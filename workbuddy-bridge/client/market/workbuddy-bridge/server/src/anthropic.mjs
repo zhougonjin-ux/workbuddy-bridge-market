@@ -1,7 +1,7 @@
 // Anthropic 兼容路由：/v1/messages、/v1/messages/count_tokens
 // Trae 的「Claude 型自定义模型」走 Anthropic Messages 协议，这里做双向转换。
 import { openChat, openChatRotating, aggregateFrames, classifyFrame, upstreamErrorMessage, newId, reportFrameError } from './upstream.mjs';
-import { resolveTarget } from './router.mjs';
+import { resolveTarget, projectOf } from './router.mjs';
 import { openWithSiteFallback, openWithModelChain } from './openai.mjs';
 import { aggregateOpen } from './aggregate.mjs';
 import { recordUsage, estimateCredit } from './usage.mjs';
@@ -125,7 +125,7 @@ export async function handleMessages(ctx) {
   const publicModel = body.model || cfg.defaultModel;
   const wantsStream = body.stream === true; // 与 Anthropic 规范一致：缺省为非流式
   const started = Date.now();
-  const target = await resolveTarget(cfg, publicModel);
+  const target = await resolveTarget(cfg, publicModel, { project: projectOf(ctx.req, body) });
   let { site, model } = target;
   const openaiBody = toOpenAIBody({ ...body, model });
   if (openaiBody.max_tokens === undefined) openaiBody.max_tokens = cfg.defaultMaxTokens;

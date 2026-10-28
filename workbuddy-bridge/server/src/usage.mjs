@@ -243,6 +243,59 @@ export function usageDays() {
   return data.days;
 }
 
+/**
+ * 按模型 / 站点过滤的用量视图（0.4.0）：客户端「用量」页的筛选与趋势图用。
+ * 返回 { days: [{date, calls, credit, completionTokens,...}], totals, byModel }。
+ * 过滤只做「包含匹配」（不区分大小写），空串表示不过滤。
+ */
+export function usageFiltered(days = 7, { model = '', site = '' } = {}) {
+  ensureLoaded();
+  const keys = Object.keys(data.days).sort().slice(-days);
+  const needle = String(model || '').toLowerCase();
+  const wantSite = String(site || '');
+  const out = [];
+  const totals = { calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, cacheHitTokens: 0 };
+  const byModel = new Map();
+  for (const k of keys) {
+    const d = data.days[k] || {};
+    const day = { date: k, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, models: 0 };
+    for (const [mid, m] of Object.entries(d.models || {})) {
+      const name = String(m.model || mid);
+      if (needle && !name.toLowerCase().includes(needle) && !String(mid).toLowerCase().includes(needle)) continue;
+      if (wantSite && String(m.site || '') !== wantSite) continue;
+      day.calls += m.calls || 0;
+      day.errors += m.errors || 0;
+      day.promptTokens += m.promptTokens || 0;
+      day.completionTokens += m.completionTokens || 0;
+      day.credit += m.credit || 0;
+      day.ms += m.ms || 0;
+      day.models += 1;
+      const cur = byModel.get(mid) || {
+        id: mid, site: m.site, model: name, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, cacheHitTokens: 0,
+      };
+      cur.calls += m.calls || 0;
+      cur.errors += m.errors || 0;
+      cur.promptTokens += m.promptTokens || 0;
+      cur.completionTokens += m.completionTokens || 0;
+      cur.credit += m.credit || 0;
+      cur.ms += m.ms || 0;
+      cur.cacheHitTokens += m.cacheHitTokens || 0;
+      byModel.set(mid, cur);
+    }
+    day.credit = round2(day.credit);
+    for (const key of ['calls', 'errors', 'promptTokens', 'completionTokens', 'ms', 'cacheHitTokens']) totals[key] += day[key];
+    totals.credit += day.credit;
+    out.push(day);
+  }
+  totals.credit = round2(totals.credit);
+  return {
+    days: out,
+    totals,
+    byModel: [...byModel.values()].sort((a, b) => b.credit - a.credit || b.calls - a.calls),
+    filter: { days, model: model || null, site: site || null },
+  };
+}
+
 /** 汇总：今天 / 最近 N 天 / 按模型排行 / 余额趋势 / 今日小时分布。 */
 export function usageSnapshot(days = 7) {
   ensureLoaded();
