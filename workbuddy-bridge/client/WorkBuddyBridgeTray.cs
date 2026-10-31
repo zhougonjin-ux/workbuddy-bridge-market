@@ -598,6 +598,12 @@ class MainForm : Form
     readonly TextBox reportTimesBox = new TextBox();
     readonly TextBox checkinTimesBox = new TextBox();
     readonly Label cfgStatus = new Label();
+    // 多端同步（0.3.73，合并自 0.3.64 会话）：WebDAV 推拉账号池/配置/统计
+    readonly CheckBox syncEnabledCheck = new CheckBox();
+    readonly TextBox syncUrlBox = new TextBox();
+    readonly TextBox syncUserBox = new TextBox();
+    readonly TextBox syncPassBox = new TextBox();
+    readonly System.Windows.Forms.Label syncStatus = new System.Windows.Forms.Label();
 
     public MainForm()
     {
@@ -797,7 +803,9 @@ class MainForm : Form
     }
     static Label PageSub(string text, int y)
     {
-        return new Label { Text = text, Location = new Point(32, y), Font = new Font("Microsoft YaHei UI", 9F), ForeColor = SubText, AutoSize = true };
+        // AutoSize 的长文案会撑出页宽出横滚条（聚合渠道页长文案实测右缘超窗口）。
+        // 限宽换行：初始宽 760，页 Resize 时由各页处理器同步（返回值交给调用方持有）。
+        return new Label { Text = text, Location = new Point(32, y), Size = new Size(760, 42), Font = new Font("Microsoft YaHei UI", 9F), ForeColor = SubText };
     }
 
     static Button GreenButton(string text)
@@ -845,7 +853,8 @@ class MainForm : Form
     {
         var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill };
         page.Controls.Add(PageTitle("账号管理"));
-        page.Controls.Add(PageSub("统一管理 WorkBuddy / CodeBuddy 账号：余额、到期批次、登录状态。", 60));
+        var acctSub = PageSub("统一管理 WorkBuddy / CodeBuddy 账号：余额、到期批次、登录状态。", 60);
+        page.Controls.Add(acctSub);
 
         alertLabel.Location = new Point(32, 92);
         alertLabel.Size = new Size(900, 26);
@@ -985,6 +994,7 @@ class MainForm : Form
         page.Resize += delegate
         {
             int w = Math.Max(360, page.ClientSize.Width - 64);
+            acctSub.Width = w;
             alertLabel.Width = w;
             acctStatus.Width = w;
             accountCards.Width = w;
@@ -1002,7 +1012,8 @@ class MainForm : Form
     {
         var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
         page.Controls.Add(PageTitle("任务中心"));
-        page.Controls.Add(PageSub("积分自动化：签到、成长任务报名与代打、猫猫旅行、活跃上报。全部幂等，随时可点。", 60));
+        var taskSub = PageSub("积分自动化：签到、成长任务报名与代打、猫猫旅行、活跃上报。全部幂等，随时可点。", 60);
+        page.Controls.Add(taskSub);
 
         var btnPanel = new FlowLayoutPanel { Location = new Point(32, 100), Size = new Size(900, 44) };
         AddBtn(btnPanel, "立即签到", delegate { RunTask("checkin"); });
@@ -1056,6 +1067,7 @@ class MainForm : Form
         page.Resize += delegate
         {
             int w = Math.Max(360, page.ClientSize.Width - 64);
+            taskSub.Width = Math.Max(360, page.ClientSize.Width - 64);
             btnPanel.Width = w;
             todayExec.Width = w;
             int kw = (w - 4 * 16) / 5;
@@ -1129,7 +1141,8 @@ class MainForm : Form
     {
         var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
         page.Controls.Add(PageTitle("模型"));
-        page.Controls.Add(PageSub("可用模型目录与限流状态（跟随上游刷新）；★ = 当前默认模型，双击行或按钮设为默认。", 60));
+        var modelSub = PageSub("可用模型目录与限流状态（跟随上游刷新）；★ = 当前默认模型，双击行或按钮设为默认。", 60);
+        page.Controls.Add(modelSub);
 
         modelCur = new Label { Location = new Point(32, 86), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold), Text = "当前默认模型：—" };
         page.Controls.Add(modelCur);
@@ -1163,7 +1176,8 @@ class MainForm : Form
 
         page.HorizontalScroll.Enabled = false;
         page.HorizontalScroll.Visible = false;
-        page.Resize += delegate { modelList.Width = Math.Max(360, page.ClientSize.Width - 64); };
+        page.Resize += delegate { modelList.Width = Math.Max(360, page.ClientSize.Width - 64);
+            modelSub.Width = Math.Max(360, page.ClientSize.Width - 64); };
         return page;
     }
 
@@ -1280,24 +1294,25 @@ class MainForm : Form
     {
         var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
         page.Controls.Add(PageTitle("聚合渠道"));
-        page.Controls.Add(PageSub("自有 key 的 OpenAI 兼容 provider 接进同一个模型池；默认一家都不接，填上 key 它的模型才进选择器（ID 形如 agg:渠道/模型，多 key 自动轮换）。", 60));
+        var aggSub = PageSub("自有 key 的 OpenAI 兼容 provider 接进同一个模型池；默认一家都不接，填上 key 它的模型才进选择器（ID 形如 agg:渠道/模型，多 key 自动轮换）。", 60);
+        page.Controls.Add(aggSub);
 
         aggLaneCheck.Text = "聚合开关";
-        aggLaneCheck.Location = new Point(32, 92);
+        aggLaneCheck.Location = new Point(32, 108);
         aggLaneCheck.AutoSize = true;
         aggLaneCheck.Checked = true;
         aggLaneCheck.ThreeState = false;
         aggLaneCheck.CheckedChanged += delegate { if (aggList.Items.Count == 0) return; aggLane = aggLaneCheck.Checked; SaveAgg(aggLane ? "聚合开关已打开" : "聚合开关已关闭（渠道保留，不再贡献模型）"); };
         page.Controls.Add(aggLaneCheck);
-        aggCount.Location = new Point(140, 94);
+        aggCount.Location = new Point(140, 110);
         aggCount.AutoSize = true;
         aggCount.ForeColor = Accent;
         aggCount.Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold);
         aggCount.Text = "—";
         page.Controls.Add(aggCount);
 
-        aggList.Location = new Point(32, 122);
-        aggList.Size = new Size(880, 300);
+        aggList.Location = new Point(32, 138);
+        aggList.Size = new Size(880, 288);
         aggList.View = View.Details;
         aggList.FullRowSelect = true;
         aggList.Font = new Font("Microsoft YaHei UI", 9F);
@@ -1307,7 +1322,7 @@ class MainForm : Form
         aggList.Columns.Add("Keys", 240);
         page.Controls.Add(aggList);
 
-        var opRow = new FlowLayoutPanel { Location = new Point(32, 432), Size = new Size(900, 40) };
+        var opRow = new FlowLayoutPanel { Location = new Point(32, 436), Size = new Size(900, 40) };
         AddBtn(opRow, "启用选中", delegate { SetAggSelectedEnabled(true); });
         AddBtn(opRow, "停用选中", delegate { SetAggSelectedEnabled(false); });
         AddBtn(opRow, "删除选中", delegate
@@ -1347,9 +1362,11 @@ class MainForm : Form
             SetAggMsg("已选 " + Str(p, "name") + (ku != "" ? " · 申请 key：" + ku : "") + " —— 现在贴 key 点「＋ 添加渠道」", SubText);
         };
         page.Controls.Add(aggPresetCombo);
-        aggNameBox.Location = new Point(32, 510); aggNameBox.Width = 140;
-        aggUrlBox.Location = new Point(182, 510); aggUrlBox.Width = 320;
-        aggKeysBox.Location = new Point(512, 510);
+        // 0.3.73（合并自 0.3.64 会话）：三输入框独立一行（y=566），绝不能与 presetCaption(512)/下拉(534..558) 同带——
+        // 曾经同 y 叠放，说明文字压住名称框、下拉贴住框顶，key 框点不进（用户实测）
+        aggNameBox.Location = new Point(32, 566); aggNameBox.Width = 140;
+        aggUrlBox.Location = new Point(182, 566); aggUrlBox.Width = 320;
+        aggKeysBox.Location = new Point(512, 566); aggKeysBox.Width = 240;
         aggNameBox.Font = aggUrlBox.Font = aggKeysBox.Font = new Font("Microsoft YaHei UI", 9F);
         page.Controls.Add(aggNameBox); page.Controls.Add(aggUrlBox); page.Controls.Add(aggKeysBox);
         var addRow = new FlowLayoutPanel { Location = new Point(32, 602), Size = new Size(900, 40) };
@@ -1384,6 +1401,7 @@ class MainForm : Form
         page.Resize += delegate
         {
             int w = Math.Max(360, page.ClientSize.Width - 64);
+            aggSub.Width = Math.Max(360, page.ClientSize.Width - 64);
             aggList.Width = w;
             aggList.Columns[2].Width = Math.Max(140, w - 110 - 76 - 240 - 26); // 地址列吃剩余宽度，禁横滚（0.3.63）
             opRow.Width = w; addRow.Width = w;
@@ -1505,7 +1523,8 @@ class MainForm : Form
     {
         var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
         page.Controls.Add(PageTitle("扫码登录"));
-        page.Controls.Add(PageSub("登一次，它们的免费模型就出现在同一个选择器里。灰卡 = 暂未接入的厂商目录。", 60));
+        var chanSub = PageSub("登一次，它们的免费模型就出现在同一个选择器里。灰卡 = 暂未接入的厂商目录。", 60);
+        page.Controls.Add(chanSub);
 
         loginBanner.Location = new Point(32, 92);
         loginBanner.Size = new Size(900, 26);
@@ -1599,6 +1618,7 @@ class MainForm : Form
         page.Resize += delegate
         {
             int w = Math.Max(360, page.ClientSize.Width - 64);
+            chanSub.Width = Math.Max(360, page.ClientSize.Width - 64);
             loginBanner.Width = w;
             foreach (Control c in page.Controls)
             {
@@ -1764,7 +1784,8 @@ class MainForm : Form
     {
         var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
         page.Controls.Add(PageTitle("数据看板"));
-        page.Controls.Add(PageSub("这里每个数字，都是这个池子真实发出去的调用数出来的。", 60));
+        var dashSub = PageSub("这里每个数字，都是这个池子真实发出去的调用数出来的。", 60);
+        page.Controls.Add(dashSub);
 
         var dashCards = new List<Panel>();
         dashCards.Add(AddDashCard(page, "Token 总量", dashTokens, dashTokensSub, 0));
@@ -1819,6 +1840,7 @@ class MainForm : Form
         page.Resize += delegate
         {
             int w = Math.Max(360, page.ClientSize.Width - 64);
+            dashSub.Width = Math.Max(360, page.ClientSize.Width - 64);
             dashStatus.Width = w;
             dashRecent.Width = w;
             dashRecent.Height = Math.Max(120, page.ClientSize.Height - 400);
@@ -1864,7 +1886,8 @@ class MainForm : Form
     {
         var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
         page.Controls.Add(PageTitle("用量"));
-        page.Controls.Add(PageSub("调用与积分消耗（本机统计口径，跟随上游实时刷新）。", 60));
+        var usageSub = PageSub("调用与积分消耗（本机统计口径，跟随上游实时刷新）。", 60);
+        page.Controls.Add(usageSub);
 
         var statCards = new List<Panel>();
         statCards.Add(AddStatCard(page, "今日调用", usageTodayCalls, 32, 100));
@@ -1899,6 +1922,7 @@ class MainForm : Form
         page.Resize += delegate
         {
             int w = Math.Max(360, page.ClientSize.Width - 64);
+            usageSub.Width = Math.Max(360, page.ClientSize.Width - 64);
             hoursPanel.Width = w;
             topModels.Width = w;
             int sw = (w - 3 * 16) / 4;
@@ -1975,7 +1999,8 @@ class MainForm : Form
     {
         var page = new Panel { BackColor = BodyBack, Dock = DockStyle.Fill, AutoScroll = true };
         page.Controls.Add(PageTitle("设置"));
-        page.Controls.Add(PageSub("调度策略 / 每日预算 / 自动任务 / 服务管控。", 60));
+        var setSub = PageSub("调度策略 / 每日预算 / 自动任务 / 服务管控。", 60);
+        page.Controls.Add(setSub);
 
         var policyCaption = new Label { Text = "调度策略", Location = new Point(32, 100), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
         policyCombo.Location = new Point(32, 128);
@@ -2110,12 +2135,63 @@ class MainForm : Form
         cfgStatus.ForeColor = SubText;
         page.Controls.Add(cfgStatus);
 
+        // ---- 0.3.73 多端同步卡：WebDAV 地址/账号/密码 + 推送/拉取（合并自 0.3.64 会话）----
+        var syncCaption = new Label { Text = "多端同步（WebDAV）", Location = new Point(32, 566), AutoSize = true, ForeColor = InkText, Font = new Font("Microsoft YaHei UI", 9.5F, FontStyle.Bold) };
+        syncEnabledCheck.Text = "启用"; syncEnabledCheck.Location = new Point(32, 592); syncEnabledCheck.AutoSize = true;
+        syncUrlBox.Location = new Point(92, 590); syncUrlBox.Width = 300;
+        syncUserBox.Location = new Point(400, 590); syncUserBox.Width = 120;
+        syncPassBox.Location = new Point(528, 590); syncPassBox.Width = 140;
+        syncPassBox.UseSystemPasswordChar = true;
+        foreach (var tb in new[] { syncUrlBox, syncUserBox, syncPassBox }) tb.Font = new Font("Microsoft YaHei UI", 9F);
+        var syncSaveBtn = PlainButton("保存同步配置");
+        syncSaveBtn.Location = new Point(32, 618);
+        var syncPushBtn = PlainButton("⬆ 推送到云端");
+        syncPushBtn.Location = new Point(192, 618);
+        var syncPullBtn = PlainButton("⬇ 从云端合并");
+        syncPullBtn.Location = new Point(352, 618);
+        syncStatus.Location = new Point(32, 648);
+        syncStatus.Size = new Size(700, 20);
+        syncStatus.ForeColor = SubText;
+        page.Controls.Add(syncCaption);
+        page.Controls.Add(syncEnabledCheck);
+        page.Controls.Add(syncUrlBox);
+        page.Controls.Add(syncUserBox);
+        page.Controls.Add(syncPassBox);
+        page.Controls.Add(syncSaveBtn);
+        page.Controls.Add(syncPushBtn);
+        page.Controls.Add(syncPullBtn);
+        page.Controls.Add(syncStatus);
+        syncSaveBtn.Click += delegate
+        {
+            Run(delegate
+            {
+                Program.Api("POST", "/console/api/sync/config", "{\"enabled\":" + Bool(syncEnabledCheck.Checked)
+                    + ",\"url\":\"" + J(syncUrlBox.Text.Trim())
+                    + "\",\"username\":\"" + J(syncUserBox.Text.Trim())
+                    + "\",\"password\":\"" + J(syncPassBox.Text) + "\"}");
+            });
+        };
+        syncPushBtn.Click += delegate
+        {
+            syncStatus.Text = "推送中…";
+            Run(delegate { Program.Api("POST", "/console/api/sync/push", "{}"); },
+                delegate { LoadSyncStatus(); });
+        };
+        syncPullBtn.Click += delegate
+        {
+            if (MessageBox.Show("从云端合并会按字段规则合入远端的账号池/配置/统计（本机改过的配置键不会被覆盖）。继续？", Program.AppName, MessageBoxButtons.OKCancel, MessageBoxIcon.Question) != DialogResult.OK) return;
+            syncStatus.Text = "拉取合并中…";
+            Run(delegate { Program.Api("POST", "/console/api/sync/pull", "{}"); },
+                delegate { LoadSyncStatus(); });
+        };
+
         // 页级横滚硬禁 + 状态行/按钮面板宽度随页面 Resize
         page.HorizontalScroll.Enabled = false;
         page.HorizontalScroll.Visible = false;
         page.Resize += delegate
         {
             int w = Math.Max(360, page.ClientSize.Width - 64);
+            setSub.Width = w;
             serviceStatus.Width = w;
             cfgStatus.Width = w;
             svcBtns.Width = w;
@@ -2528,6 +2604,7 @@ class MainForm : Form
                 }
 
                 SyncPolicyCombo(curPolicy);
+                LoadSyncStatus();
                 if (!settingsDirty)
                 {
                     fillingSettings = true;
@@ -2920,6 +2997,41 @@ class MainForm : Form
         };
         return card;
     }    static string Bool(bool b) { return b ? "true" : "false"; }
+
+    /** 同步状态回填（推送/拉取完成后与设置页刷新时调用；0.3.73）。 */
+    void LoadSyncStatus()
+    {
+        try
+        {
+            string json = Program.Api("GET", "/console/api/sync", null);
+            var ser = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            var root = ser.DeserializeObject(json) as Dictionary<string, object>;
+            var st = root != null && root.ContainsKey("status") ? root["status"] as Dictionary<string, object> : null;
+            if (st == null) { syncStatus.Text = "同步状态未知"; return; }
+            bool enabled = Str(st, "enabled") == "True";
+            string url = Str(st, "url");
+            long lastPush = 0, lastPull = 0;
+            long.TryParse(Str(st, "lastPushAt"), out lastPush);
+            long.TryParse(Str(st, "lastPullAt"), out lastPull);
+            string err = Str(st, "lastPushError");
+            if (err == "") err = Str(st, "lastPullError");
+            BeginInvoke((MethodInvoker)delegate
+            {
+                syncEnabledCheck.Checked = enabled;
+                if (syncUrlBox.Text.Trim() == "") syncUrlBox.Text = url;
+                if (syncUserBox.Text.Trim() == "") syncUserBox.Text = Str(st, "username");
+                string infoTxt = !enabled || url == "" ? "未启用——填 WebDAV 地址/账号/密码后保存（坚果云等任何 WebDAV 网盘）"
+                    : "上次推送 " + (lastPush > 0 ? new DateTime(1970, 1, 1).AddMilliseconds(lastPush).ToLocalTime().ToString("MM-dd HH:mm") : "从未")
+                    + " · 上次拉取 " + (lastPull > 0 ? new DateTime(1970, 1, 1).AddMilliseconds(lastPull).ToLocalTime().ToString("MM-dd HH:mm") : "从未")
+                    + (err != "" ? " · 上次错误：" + err : "");
+                syncStatus.Text = infoTxt;
+            });
+        }
+        catch (Exception ex)
+        {
+            BeginInvoke((MethodInvoker)delegate { syncStatus.Text = "同步状态读取失败：" + ex.Message; });
+        }
+    }
 
     void SyncPolicyCombo(string policy)
     {

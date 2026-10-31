@@ -27,6 +27,7 @@ import { runTasks, taskStatus, startTaskLoop, stopTaskLoop } from './src/tasks.m
 import { startHealthLoop, stopHealthLoop } from './src/health.mjs';
 import { startWeeklyLoop, stopWeeklyLoop } from './src/weekly.mjs';
 import { startBackupLoop, stopBackupLoop } from './src/backup.mjs';
+import { startSyncLoop, stopSyncLoop } from './src/sync.mjs';
 import { startDoctorLoop, stopDoctorLoop } from './src/doctor.mjs';
 import { importLocalAccounts, startLocalImportWatch, stopLocalImportWatch } from './src/localimport.mjs';
 import { startProviderConfigSync, stopProviderConfigSync, triggerProviderConfigSyncNow } from './src/pickersync.mjs';
@@ -484,7 +485,20 @@ const server = http.createServer(async (req, res) => {
         }, { 'X-WB-New-Token': CONSOLE_TOKEN });
       }
       const body = req.method === 'POST' ? await readJsonBody(req) : null;
-      return await handleConsoleApi({ cfg, req, res, url, body });
+      return await handleConsoleApi({
+        cfg, req, res, url, body,
+        // 多端同步拉取落盘后刷新运行时 cfg：按顶层字段替换（cfg 是全模块共享的同一对象，
+        // 不能整体重新赋值，否则各模块闭包里握着的旧 cfg 就脱钩了）
+        reloadConfigAfterSync() {
+          try {
+            const fresh = loadConfig();
+            for (const k of Object.keys(fresh)) cfg[k] = fresh[k];
+            log('[sync] 已应用远端配置并刷新运行时 cfg');
+          } catch (e) {
+            warn('[sync] 远端配置刷新失败：' + (e.message || e));
+          }
+        },
+      });
     }
 
     // 只读「发现类」接口：放行免鉴权。
@@ -792,12 +806,13 @@ server.listen(cfg.port, cfg.host, () => {
   startWeeklyLoop(cfg);
   startBackupLoop(cfg);
   startDoctorLoop(cfg);
+  startSyncLoop(cfg);
   startProviderConfigSync(cfg, (e) => warn('模型池自动同步失败：', e.message));
   // 生命周期依赖注入：交棒重启（/admin/restart、/console/api/service/restart 共用）
   // 需要活跃计数与各循环的 stop/flush 函数；onClose 走 server.close → 进程退出。
   bootLifecycle({
     activeRequestsRef: () => activeRequests,
-    stoppers: [stopCreditLoop, stopTaskLoop, stopHealthLoop, stopWeeklyLoop, stopBackupLoop, stopDoctorLoop, stopProviderConfigSync, stopLocalImportWatch],
+    stoppers: [stopCreditLoop, stopTaskLoop, stopHealthLoop, stopWeeklyLoop, stopBackupLoop, stopDoctorLoop, stopSyncLoop, stopProviderConfigSync, stopLocalImportWatch],
     flushers: [flushUsage, flushPool, flushLearned, flushEvents],
   });
   setRestartHandler(doRestart);

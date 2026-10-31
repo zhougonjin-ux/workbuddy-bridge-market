@@ -21,6 +21,7 @@ import { getCatalog, mergedModels } from './router.mjs';
 import { queryCredit, supportsCreditQuery, openChat, aggregateFrames } from './upstream.mjs';
 import { probeModel, runHealthScan, healthStatus, reloadHealthState } from './health.mjs';
 import { startLogin, pollLogin } from './device-login.mjs';
+import { syncStatus, saveSyncConfig, syncPush, syncPull } from './sync.mjs';
 import { usageSnapshot, resetUsage, flushUsage, recordBalance, todayAvgCreditByModel, usageCsv, reloadUsage } from './usage.mjs';
 import { recentLogs, recentRequests, clearRequests } from './log.mjs';
 import { recentEvents, recordEvent, reloadEvents } from './events.mjs';
@@ -757,6 +758,36 @@ export async function handleConsoleApi(ctx) {
     stopBackupLoop();
     startBackupLoop(cfg);
     return sendJson(res, 200, { ok: true, config: cfg.backup });
+  }
+
+  // ---- 0.3.73：多端同步（WebDAV 推拉；0.3.64 会话成果，合并自本地分叉）----
+  if (p === '/sync' && method === 'GET') {
+    return sendJson(res, 200, { ok: true, status: syncStatus() });
+  }
+  if (p === '/sync/config' && method === 'POST') {
+    const body = ctx.body || {};
+    if (body.url !== undefined && body.url !== '' && !/^https?:\/\//.test(String(body.url))) {
+      return sendJson(res, 400, { ok: false, error: 'url 必须是 http(s):// 开头的 WebDAV 地址' });
+    }
+    const c = saveSyncConfig(body);
+    return sendJson(res, 200, { ok: true, status: syncStatus(), config: { enabled: c.enabled, url: c.url, username: c.username, remoteFile: c.remoteFile, autoPushTimes: c.autoPushTimes } });
+  }
+  if (p === '/sync/push' && method === 'POST') {
+    try {
+      const r = await syncPush(cfg);
+      return sendJson(res, r.ok ? 200 : 502, { ok: r.ok, ...r });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: String(e.message || e).slice(0, 160) });
+    }
+  }
+  if (p === '/sync/pull' && method === 'POST') {
+    try {
+      const r = await syncPull(cfg);
+      if (r.ok && Array.isArray(r.applied) && r.applied.length > 0) ctx.reloadConfigAfterSync?.();
+      return sendJson(res, r.ok ? 200 : 502, { ok: r.ok, ...r });
+    } catch (e) {
+      return sendJson(res, 500, { ok: false, error: String(e.message || e).slice(0, 160) });
+    }
   }
 
   // ---- T46：用量周报（状态/预览 + 手动生成一次并推送）----
