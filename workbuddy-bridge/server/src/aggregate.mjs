@@ -36,8 +36,13 @@ export async function aggregateCatalogFor(cfg, name, { force = false } = {}) {
     });
     clearTimeout(timer);
     const json = await res.json().catch(() => null);
+    // 0.3.73（合并自 0.3.64 会话）：剥掉上游 /v1/models 带出来的倍率/免费后缀（"hy3 (x0.06)" / "hy3 (免费)"），
+    // 透传会让模型 ID 变成 agg:self/hy3 (免费) 这样不优雅；顺带去重（有的上游同 id 出现多次）。
+    const seen = new Set();
     const list = Array.isArray(json?.data)
-      ? json.data.map((m) => (typeof m?.id === 'string' ? m.id : null)).filter(Boolean)
+      ? json.data
+        .map((m) => (typeof m?.id === 'string' ? m.id.replace(/\s*\((?:x[\d.]+|免费)\)\s*$/, '').trim() : null))
+        .filter((id) => id && !seen.has(id) && seen.add(id))
       : [];
     catalogCache.set(name, { at: Date.now(), models: list });
     return list;

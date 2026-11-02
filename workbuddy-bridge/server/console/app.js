@@ -2723,7 +2723,8 @@ function healthState(a) {
       const [bridge, keys, srr, sec, nt, pc, w, bk] = await Promise.all([
         api('/bridge'), api('/keys').catch(() => null), api('/schedule-router').catch(() => null),
         api('/security').catch(() => null), api('/notify').catch(() => null), api('/protocol').catch(() => null),
-        api('/weekly').catch(() => null), api('/backups').catch(() => null)]);
+        api('/weekly').catch(() => null), api('/backups').catch(() => null), api('/sync').catch(() => null)]);
+    const sy = syr && syr.status;
     // T34：预警阈值从 /bridge 下发，写进卡片输入框（loadAlerts 已同步更新同一份）
     const at = bridge.alerts || {};
     ALERT_TH = { ...ALERT_FALLBACK, ...(at || {}) };
@@ -2857,6 +2858,21 @@ function healthState(a) {
           <span class="muted" style="font-size:12px">备份含上游登录 token（明文），请像保存密码一样保管；恢复时同目录下的当前文件会先备份成 .prestore-*。</span>
         </div>
         <div id="bkMsg" style="margin-top:10px"></div>
+      </div>
+      <h2>多端同步 <span class="sub">0.3.73 · 账号池/配置/统计经 WebDAV 在多台设备互推（坚果云等任何 WebDAV 网盘）；拉取按字段合并，不会整包覆盖本机</span></h2>
+      <div class="card" style="margin-bottom:20px">
+        <div class="row" style="flex-wrap:wrap;gap:10px;align-items:center">
+          <label style="display:flex;align-items:center;gap:5px;font-size:13px"><input type="checkbox" id="syEnabled" ${sy && sy.enabled ? 'checked' : ''}> 启用同步</label>
+          <input id="syUrl" value="${esc(sy?.url || '')}" placeholder="WebDAV 地址，如 https://dav.jianguoyun.com/dav/" style="width:300px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);font-size:13px">
+          <input id="syUser" value="${esc(sy?.username || '')}" placeholder="账号" style="width:130px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);font-size:13px">
+          <input id="syPass" type="password" placeholder="密码（应用密码）" style="width:150px;padding:7px 9px;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text);font-size:13px">
+          <button class="btn" id="sySave">保存配置</button>
+          <button class="btn primary" id="syPush">⬆ 推送到云端</button>
+          <button class="btn" id="syPull">⬇ 从云端合并</button>
+          <span class="muted" style="font-size:12px">本机 ID：${esc(sy?.device || '—')}</span>
+        </div>
+        <div id="syMsg" style="margin-top:10px"></div>
+        <div class="muted" style="font-size:12px;margin-top:8px">合并规则：账号池同 uid 取登录时间新的一方；config 只补本机没有的键（本机改过的不会被盖）；统计/任务/事件取更新的一方。推送每天 ${esc((sy?.autoPushTimes || ['09:00']).join(' / '))} 自动执行一次；同步文档里含登录 token，WebDAV 账号密码请保管好。</div>
       </div>
       <h2>控制台访问 PIN <span class="sub">T23 · 打开控制台需先输入 PIN 解锁（4-12 位数字）；改动即时生效，无需重启</span></h2>
       <div class="card" style="margin-bottom:20px">
@@ -3099,6 +3115,32 @@ function healthState(a) {
         $('#bkMsg').innerHTML = `<span class="bad" style="font-size:12.5px">恢复失败：${esc(e.message)}</span>`;
       }
       ev.target.value = '';
+    };
+    // ---- 0.3.73 行为绑定：多端同步（WebDAV）----
+    $('#sySave').onclick = async () => {
+      try {
+        await api('/sync/config', { method: 'POST', body: {
+          enabled: $('#syEnabled').checked, url: $('#syUrl').value.trim(),
+          username: $('#syUser').value.trim(), password: $('#syPass').value,
+        } });
+        $('#syMsg').innerHTML = `<span class="ok" style="font-size:12.5px">同步配置已保存</span>`;
+        toast('同步配置已保存', 'ok');
+      } catch (e) { $('#syMsg').innerHTML = `<span class="bad" style="font-size:12.5px">保存失败：${esc(e.message)}</span>`; }
+    };
+    $('#syPush').onclick = async () => {
+      $('#syMsg').innerHTML = `<span class="muted" style="font-size:12.5px">推送中…</span>`;
+      try {
+        const r = await api('/sync/push', { method: 'POST' });
+        $('#syMsg').innerHTML = `<span class="ok" style="font-size:12.5px">✓ 已推送 ${r.files} 个文件（${new Date(r.pushedAt).toLocaleString()}）</span>`;
+      } catch (e) { $('#syMsg').innerHTML = `<span class="bad" style="font-size:12.5px">推送失败：${esc(e.message)}</span>`; }
+    };
+    $('#syPull').onclick = async () => {
+      if (!await askConfirm('从云端合并会按字段规则合入远端的账号池/配置/统计（本机改过的配置键不会被覆盖）。继续？', { okText: '开始合并' })) return;
+      $('#syMsg').innerHTML = `<span class="muted" style="font-size:12.5px">拉取合并中…</span>`;
+      try {
+        const r = await api('/sync/pull', { method: 'POST' });
+        $('#syMsg').innerHTML = `<span class="ok" style="font-size:12.5px">✓ 已合并：${esc((r.applied || []).join('、')) || '无'}${(r.skipped || []).length ? '；跳过：' + esc(r.skipped.join('、')) : ''}（来源 ${esc(r.from || '—')}）</span>`;
+      } catch (e) { $('#syMsg').innerHTML = `<span class="bad" style="font-size:12.5px">拉取失败：${esc(e.message)}</span>`; }
     };
     // ---- T23 行为绑定：控制台访问 PIN ----
     $('#pinSave').onclick = async () => {
