@@ -29,6 +29,7 @@ static class Program
     public static string apiKey = "";
     public static string serverDir;
     public static string pluginVersion = "";
+    static EventWaitHandle wakeUp; // 二次启动唤醒已运行实例（0.4.4）
 
     public static string Port { get { return port.ToString(); } }
 
@@ -39,7 +40,20 @@ static class Program
         bool createdNew;
         using (Mutex mutex = new Mutex(true, "WorkBuddyBridgeTray", out createdNew))
         {
-            if (!createdNew) { ShowMain(); return; }
+            if (!createdNew)
+            {
+                // 0.4.4：二次启动改为唤醒已运行实例——原实现在第二个进程里 new 窗体后
+                // 直接退出，用户看到的只是闪一下，已运行的窗口毫无反应。
+                try
+                {
+                    EventWaitHandle w = EventWaitHandle.OpenExisting("WorkBuddyBridgeTray.Wake");
+                    w.Set();
+                }
+                catch { }
+                return;
+            }
+            try { wakeUp = new EventWaitHandle(false, EventResetMode.AutoReset, "WorkBuddyBridgeTray.Wake"); }
+            catch { wakeUp = null; }
             serverDir = ResolveServerDir();
             LoadConfig(); // 必须在 ResolveServerDir 之后：pluginVersion 从 serverDir/package.json 读
             if (serverDir == null)
@@ -66,6 +80,22 @@ static class Program
             BuildTrayMenu();
             mainForm = new MainForm();
             if (!noOpen) mainForm.Show();
+            // 唤醒监听（0.4.4）：二次启动 Set 命名事件 → 本实例把窗口拉到前台
+            if (wakeUp != null)
+            {
+                EventWaitHandle w = wakeUp;
+                Form f = mainForm;
+                Thread wakeThread = new Thread(delegate()
+                {
+                    for (;;)
+                    {
+                        try { w.WaitOne(); } catch { return; }
+                        try { f.BeginInvoke((MethodInvoker)delegate { ShowMain(); }); } catch { return; }
+                    }
+                });
+                wakeThread.IsBackground = true;
+                wakeThread.Start();
+            }
             Application.Run();
             GC.KeepAlive(mutex);
         }
@@ -77,14 +107,25 @@ static class Program
         else { mainForm.Show(); mainForm.WindowState = FormWindowState.Normal; mainForm.Activate(); }
     }
 
+    static ToolStripMenuItem startItem, stopItem, restartItem;
+    static ToolStripMenuItem statusHeader;
+    public static int trayState = 1; // 0=停止 1=运行 2=异常——菜单状态头据此刷新
+
     public static void BuildTrayMenu()
     {
         var menu = new ContextMenuStrip();
+        // 状态头（0.4.4）：版本 + 服务状态一眼可见（原实现版本号只在窗口侧栏里）
+        statusHeader = new ToolStripMenuItem("WorkBuddy 积分桥 v" + pluginVersion + (trayState == 1 ? " · 服务运行中" : trayState == 2 ? " · 服务异常" : " · 服务未运行"));
+        statusHeader.Enabled = false;
         var open = new ToolStripMenuItem("显示窗口");
         open.Font = new Font(open.Font, FontStyle.Bold);
         open.Click += delegate { ShowMain(); };
         var web = new ToolStripMenuItem("网页控制台");
         web.Click += delegate { OpenConsole(); };
+        var tasks = new ToolStripMenuItem("任务中心");
+        tasks.Click += delegate { OpenConsole("tasks"); };
+        var accounts = new ToolStripMenuItem("账号管理");
+        accounts.Click += delegate { OpenConsole("accounts"); };
 
         var copyBase = new ToolStripMenuItem("复制 Base URL");
         copyBase.Click += delegate { CopyText("Base URL", "http://127.0.0.1:" + port + "/v1"); };
@@ -95,21 +136,22 @@ static class Program
         var logFile = new ToolStripMenuItem("查看服务日志");
         logFile.Click += delegate { OpenPath(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".zcode", "workbuddy-bridge", "server.log")); };
 
-        var start = new ToolStripMenuItem("启动服务");
-        start.Click += delegate { new Thread(delegate() { Program.RunBlocking(delegate { if (!Program.Health()) Program.StartService(); }); }).Start(); };
-        var stop = new ToolStripMenuItem("停止服务");
-        stop.Click += delegate { new Thread(delegate() { Program.RunBlocking(delegate { if (Program.Health()) Program.StopService(); }); }).Start(); };
-        var restart = new ToolStripMenuItem("重启服务");
-        restart.Click += delegate { new Thread(delegate() { Program.RunBlocking(Program.RestartService); }).Start(); };
+        startItem = new ToolStripMenuItem("启动服务");
+        startItem.Click += delegate { ServiceAction(delegate { if (!Program.Health()) Program.StartService(); }, "服务已启动"); };
+        stopItem = new ToolStripMenuItem("停止服务");
+        stopItem.Click += delegate { ServiceAction(delegate { if (Program.Health()) Program.StopService(); }, "服务已停止"); };
+        restartItem = new ToolStripMenuItem("重启服务");
+        restartItem.Click += delegate { ServiceAction(delegate { Program.RestartService(); }, "服务已重启"); };
 
         var update = new ToolStripMenuItem("检查插件更新…");
-        update.Click += delegate { CheckUpdateUi(); };
+        // 0.4.4：检查走后台线程——原实现 UI 线程同步请求，网络慢时菜单冻住最长 2 分钟
+        update.Click += delegate { new Thread(delegate() { CheckUpdateUi(); }) { IsBackground = true }.Start(); };
         var autoRun = new ToolStripMenuItem("开机自启");
         autoRun.CheckOnClick = true;
         autoRun.Checked = IsAutoRun();
         autoRun.Click += delegate { SetAutoRun(autoRun.Checked); };
         var installPlugin = new ToolStripMenuItem("给智能体安装插件…");
-        installPlugin.Click += delegate { InstallPluginToZcode(); };
+        installPlugin.Click += delegate { new Thread(delegate() { InstallPluginToZcode(); }) { IsBackground = true }.Start(); };
 
         var quit = new ToolStripMenuItem("退出");
         quit.Click += delegate
@@ -123,25 +165,96 @@ static class Program
         };
 
         menu.Items.AddRange(new ToolStripItem[] {
-            open, web, new ToolStripSeparator(),
+            statusHeader, new ToolStripSeparator(),
+            open, web, tasks, accounts, new ToolStripSeparator(),
             copyBase, copyKey, dataDir, logFile, new ToolStripSeparator(),
-            start, stop, restart, new ToolStripSeparator(),
+            startItem, stopItem, restartItem, new ToolStripSeparator(),
             update, autoRun, installPlugin, new ToolStripSeparator(), quit,
         });
         if (tray != null)
         {
             tray.ContextMenuStrip = menu;
-            tray.DoubleClick += delegate { ShowMain(); };
+            // 0.4.4：具名处理器 + 先摘后挂——Main 与 MainForm.BuildTray 各调一次本方法，
+            // 原来的匿名委托会挂两遍，双击托盘触发两次 ShowMain。
+            tray.DoubleClick -= TrayIconDoubleClick;
+            tray.DoubleClick += TrayIconDoubleClick;
         }
     }
 
-    /** 托盘菜单动作：复制到剪贴板并提示（菜单事件在 UI 线程，Clipboard 可用）。 */
+    static void TrayIconDoubleClick(object sender, EventArgs e) { ShowMain(); }
+
+    /** 菜单状态头 + 服务项可用性随实际状态刷新（SetTrayState/RefreshAll 调）。 */
+    public static void UpdateMenuStatus()
+    {
+        try
+        {
+            if (statusHeader != null)
+                statusHeader.Text = "WorkBuddy 积分桥 v" + pluginVersion + (trayState == 1 ? " · 服务运行中" : trayState == 2 ? " · 服务异常" : " · 服务未运行");
+            if (startItem != null) startItem.Enabled = trayState != 1;
+            if (stopItem != null) stopItem.Enabled = trayState != 0;
+        }
+        catch { }
+    }
+
+    /** 服务启停动作统一出口：后台线程跑，气泡反馈结果，动作期间菜单项禁用。 */
+    static void ServiceAction(Action act, string doneText)
+    {
+        SetServiceBusy(true);
+        new Thread(delegate()
+        {
+            try { act(); Notify(doneText); }
+            catch (Exception ex) { Notify(doneText + "失败：" + ex.Message, true); }
+            SetServiceBusy(false);
+        }) { IsBackground = true }.Start();
+    }
+
+    static void SetServiceBusy(bool on)
+    {
+        try
+        {
+            mainForm.BeginInvoke((MethodInvoker)delegate
+            {
+                if (startItem != null) startItem.Enabled = !on && trayState != 1;
+                if (stopItem != null) stopItem.Enabled = !on && trayState != 0;
+                if (restartItem != null) restartItem.Enabled = !on;
+            });
+        }
+        catch { }
+    }
+
+    /** 轻量气泡通知（0.4.4）：复制/启停/看门狗这类反馈不再弹模态框打断操作。 */
+    public static void Notify(string text, bool warn = false)
+    {
+        try
+        {
+            Form f = mainForm;
+            if (f != null && !f.IsDisposed && f.IsHandleCreated)
+            {
+                f.BeginInvoke((MethodInvoker)delegate { ShowBalloon(text, warn); });
+                return;
+            }
+        }
+        catch { }
+        ShowBalloon(text, warn);
+    }
+
+    static void ShowBalloon(string text, bool warn)
+    {
+        try
+        {
+            if (tray != null && tray.Visible)
+                tray.ShowBalloonTip(2500, AppName, text, warn ? ToolTipIcon.Warning : ToolTipIcon.Info);
+        }
+        catch { }
+    }
+
+    /** 托盘菜单动作：复制到剪贴板并气泡提示（0.4.4 起不再弹模态框打断操作）。 */
     static void CopyText(string label, string text)
     {
         try
         {
             Clipboard.SetText(text ?? "");
-            MessageBox.Show(label + " 已复制到剪贴板", AppName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Notify(label + " 已复制到剪贴板");
         }
         catch (Exception ex)
         {
@@ -406,10 +519,16 @@ static class Program
         psi.CreateNoWindow = true;
         using (var p = Process.Start(psi))
         {
-            string so = p.StandardOutput.ReadToEnd();
-            string se = p.StandardError.ReadToEnd();
-            p.WaitForExit(120000);
-            return so + Environment.NewLine + se;
+            // 0.4.4：原先先同步读 stdout 再读 stderr——stderr 缓冲区写满会让子进程
+            // 卡在写日志上，stdout 也永远读不完（经典双流死锁）。改为异步收两路再等退出。
+            var so = new System.Text.StringBuilder();
+            var se = new System.Text.StringBuilder();
+            p.OutputDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null) so.AppendLine(e.Data); };
+            p.ErrorDataReceived += delegate(object s, DataReceivedEventArgs e) { if (e.Data != null) se.AppendLine(e.Data); };
+            p.BeginOutputReadLine();
+            p.BeginErrorReadLine();
+            if (!p.WaitForExit(120000)) { try { p.Kill(); } catch { } }
+            return so.ToString() + Environment.NewLine + se.ToString();
         }
     }
 
@@ -2709,7 +2828,19 @@ class MainForm : Form
     /** 托盘状态灯：0=停止 1=运行 2=异常（只改灯，不动窗体状态）。 */
     void SetTrayState(int state)
     {
-        try { if (tray != null) tray.Icon = Program.MakeIcon(state); } catch { }
+        try
+        {
+            if (tray != null)
+            {
+                // 0.4.4：换图标前 Dispose 旧实例（修每 60s 一个的 GDI 句柄泄漏）
+                var old = tray.Icon;
+                tray.Icon = Program.MakeIcon(state);
+                if (old != null) old.Dispose();
+            }
+        }
+        catch { }
+        Program.trayState = state;
+        Program.UpdateMenuStatus();
     }
 
     /**
@@ -2731,6 +2862,7 @@ class MainForm : Form
         if (healthFails < 2) return;
         healthFails = 0;
         watchdogRestarting = true;
+        Program.Notify("服务失去响应，正在自动拉起…", true);
         new Thread(delegate()
         {
             try
@@ -2739,9 +2871,14 @@ class MainForm : Form
                 if (Program.Health())
                 {
                     try { BeginInvoke((MethodInvoker)delegate { SetTrayState(1); }); } catch { }
+                    Program.Notify("服务已自动拉起");
+                }
+                else
+                {
+                    Program.Notify("服务自动拉起失败，将持续重试", true);
                 }
             }
-            catch { }
+            catch { Program.Notify("服务自动拉起失败，将持续重试", true); }
             finally { watchdogRestarting = false; }
         }).Start();
     }
@@ -2961,12 +3098,32 @@ class MainForm : Form
                     }
                     acctSiteCombo.SelectedIndex = idxSel;
                 }
-                string trayTip = "WorkBuddy 积分桥 v" + verShow + " · " + enabledCount + " 账号 · 余额 " + FormatCredit(totalRemain);
+                // 0.4.4：服务未运行时 tooltip 明说（原来照常写「0 账号 · 余额 0」误导）；
+                // 换图标前 Dispose 旧实例——原来每 60s 泄漏一个 GDI 图标句柄。
+                string trayTip;
+                Icon newIcon;
+                if (!up)
+                {
+                    trayTip = "WorkBuddy 积分桥 v" + verShow + " · 服务未运行";
+                    newIcon = Program.MakeIcon(2);
+                }
+                else
+                {
+                    trayTip = "WorkBuddy 积分桥 v" + verShow + " · " + enabledCount + " 账号 · 余额 " + FormatCredit(totalRemain);
+                    newIcon = Program.MakeIcon(1);
+                }
                 if (trayTip.Length > 63) trayTip = trayTip.Substring(0, 60) + "…";
-                if (Program.tray != null) Program.tray.Text = trayTip;
+                if (Program.tray != null)
+                {
+                    var oldIcon = Program.tray.Icon;
+                    Program.tray.Icon = newIcon;
+                    if (oldIcon != null) oldIcon.Dispose();
+                    Program.tray.Text = trayTip;
+                }
+                Program.trayState = up ? 1 : 2;
+                Program.UpdateMenuStatus();
                 if (DateTime.Now >= acctMsgUntil) acctStatus.Text = up ? ("状态：" + statusText) : statusText;
                 serviceStatus.Text = "服务：" + (up ? "运行中（端口 " + Program.Port + "）" : "未运行");
-                if (Program.tray != null) Program.tray.Icon = Program.MakeIcon(up);
                 RebuildCards();
 
 
@@ -3114,7 +3271,9 @@ class MainForm : Form
                 }
 
                 SyncPolicyCombo(curPolicy);
-                LoadSyncStatus();
+                // 0.4.4：/sync 拉取改到后台线程——原来每 60s 在 UI 线程同步 GET 一次，
+                // 上游慢时设置页跟着卡。LoadSyncStatus 内部本就 BeginInvoke 回 UI。
+                new Thread(delegate() { LoadSyncStatus(); }) { IsBackground = true }.Start();
                 if (!settingsDirty)
                 {
                     fillingSettings = true;
@@ -3551,19 +3710,21 @@ class MainForm : Form
 
     static string ShowInput(string title, string initial, string placeholder)
     {
-        var form = new Form
+        using (var form = new Form
         {
             Text = title, FormBorderStyle = FormBorderStyle.FixedDialog,
             StartPosition = FormStartPosition.CenterParent, ClientSize = new Size(360, 110),
             MaximizeBox = false, MinimizeBox = false,
-        };
-        var box = new TextBox { Location = new Point(14, 30), Width = 330, Text = initial ?? "" };
-        var ok = new Button { Text = "保存", DialogResult = DialogResult.OK, Location = new Point(180, 66), Size = new Size(76, 26) };
-        var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Location = new Point(264, 66), Size = new Size(76, 26) };
-        var hint = new Label { Text = placeholder, Location = new Point(14, 8), AutoSize = true, ForeColor = SubText };
-        form.Controls.Add(box); form.Controls.Add(ok); form.Controls.Add(cancel); form.Controls.Add(hint);
-        form.AcceptButton = ok; form.CancelButton = cancel;
-        return form.ShowDialog() == DialogResult.OK ? box.Text : null;
+        })
+        {
+            var box = new TextBox { Location = new Point(14, 30), Width = 330, Text = initial ?? "" };
+            var ok = new Button { Text = "保存", DialogResult = DialogResult.OK, Location = new Point(180, 66), Size = new Size(76, 26) };
+            var cancel = new Button { Text = "取消", DialogResult = DialogResult.Cancel, Location = new Point(264, 66), Size = new Size(76, 26) };
+            var hint = new Label { Text = placeholder, Location = new Point(14, 8), AutoSize = true, ForeColor = SubText };
+            form.Controls.Add(box); form.Controls.Add(ok); form.Controls.Add(cancel); form.Controls.Add(hint);
+            form.AcceptButton = ok; form.CancelButton = cancel;
+            return form.ShowDialog() == DialogResult.OK ? box.Text : null;
+        }
     }
 
     /** 后台动作统一出口：actionBusy 防重入；完成（或失败弹框、RefreshAll）后在 UI 线程执行 after。

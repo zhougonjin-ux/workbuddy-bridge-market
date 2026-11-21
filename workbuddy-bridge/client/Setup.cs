@@ -24,6 +24,10 @@ static class SetupProgram
     const string AppName = "WorkBuddy 积分桥";
     const string RegUninstall = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\WorkBuddyBridge";
     const string RegRun = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+    // 托盘客户端写 Run 值用的名字（WorkBuddyBridgeTray.cs 的 RegRunName）——
+    // 0.4.4 修复：卸载原先只删 AppName（"WorkBuddy 积分桥"）这个从未写入的名字，
+    // 托盘设置的 "WorkBuddyBridgeTray" 自启在卸载后残留指向已删 exe。
+    const string TrayRunName = "WorkBuddyBridgeTray";
     const string ExeName = "WorkBuddyBridgeTray.exe";
 
     static string version = "0.0.0";
@@ -56,7 +60,7 @@ static class SetupProgram
             {
                 if (serverDir == null) throw new Exception("没有找到服务目录");
                 installDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WorkBuddyBridge");
-                InstallCore(false);
+                InstallCore(false, false);
                 Environment.Exit(0);
             }
             catch { Environment.Exit(1); }
@@ -263,7 +267,7 @@ static class SetupProgram
             goButton.Enabled = false;
             try
             {
-                InstallCore(deskCheck.Checked);
+                InstallCore(deskCheck.Checked, autoRunCheck.Checked);
                 Say("安装完成。");
                 var choice = MessageBox.Show(
                     "安装完成。\n\n立即启动 " + AppName + "（托盘常驻 + 打开控制台）吗？",
@@ -283,7 +287,7 @@ static class SetupProgram
     }
 
     /** 安装核心（向导与静默模式共用）。调用前 installDir/serverDir 必须就绪。 */
-    static void InstallCore(bool deskShortcut)
+    static void InstallCore(bool deskShortcut, bool autoRun)
     {
         Directory.CreateDirectory(installDir);
 
@@ -312,9 +316,11 @@ static class SetupProgram
             k.SetValue("NoModify", 1, Microsoft.Win32.RegistryValueKind.DWord);
             k.SetValue("NoRepair", 1, Microsoft.Win32.RegistryValueKind.DWord);
         }
-        using (var run = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RegRun))
+        // 0.4.3 修复：自启勾选（autoRunCheck）此前从未被读取——勾了也不写 Run 值
+        if (autoRun)
         {
-            if (run.GetValue(AppName) != null) run.DeleteValue(AppName); // 开机自启只由向导勾选写入，静默安装不改动
+            using (var run = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RegRun))
+                run.SetValue(TrayRunName, "\"" + Path.Combine(installDir, ExeName) + "\"");
         }
     }
 
@@ -367,6 +373,9 @@ static class SetupProgram
             {
                 using (var run = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RegRun))
                 {
+                    // 0.4.4：卸载要删托盘真正写的 "WorkBuddyBridgeTray"；顺带清历史遗留的
+                    // AppName 值（旧版本从未写入过它，删了也无害）
+                    if (run.GetValue(TrayRunName) != null) run.DeleteValue(TrayRunName);
                     if (run.GetValue(AppName) != null) run.DeleteValue(AppName);
                 }
                 Microsoft.Win32.Registry.CurrentUser.DeleteSubKey(RegUninstall);
