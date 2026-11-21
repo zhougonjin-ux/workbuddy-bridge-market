@@ -136,7 +136,11 @@ function main() {
       const checkJson = (file, wantObj, label) => {
         const wantText = JSON.stringify(wantObj, null, 2) + '\n';
         const haveText = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '';
-        if (haveText !== wantText) {
+        // Windows 检出（autocrlf=true，含 CI 的 windows-latest）会把磁盘上的 \n
+        // 变成 \r\n——比较前把两侧都归一化，否则这条检查在 CRLF 工作区永远失败
+        // （2026-11-22 实锤：0.4.2 推送后 CI 的「发布物一致性」整步挂红）。
+        const norm = (t) => t.replace(/\r\n/g, '\n');
+        if (norm(haveText) !== norm(wantText)) {
           ok = false;
           console.error(`✗ ${label} 与期望不一致（运行 node scripts/build-market.mjs 更新）`);
         }
