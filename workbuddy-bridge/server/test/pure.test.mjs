@@ -434,14 +434,17 @@ test('T30 reportUpstream429/waitForUpstreamSlot：指数退避、窗口内排队
   assert.ok(ms2 > 1000 && ms2 <= 30000, `第二次应翻倍，实际 ${ms2}`);
   const ms3 = reportUpstream429();
   assert.ok(ms3 >= ms2, '窗口内连续 429 继续顺延');
-  // 排队放行：惩罚快过期时排队，最多等 (惩罚剩余 + 200ms)
-  const t0 = Date.now();
+  // 排队放行：把窗压到 1 秒再排队，宽限放到 +1.9 秒——原先真实等 4 秒窗只留
+  // 200ms 宽限，CI 慢机器（node --test 26 个文件并行）计时器晚到就翻车
+  // （2026-11-21 实锤：CI「单元测试」步偶发失败）。
+  resetUpstreamCoordination();
+  reportUpstream429(); // 1 秒窗
+  assert.equal(upstreamCoolingDown(), true);
   const waited = await Promise.race([
     waitForUpstreamSlot(),
-    new Promise((r) => setTimeout(() => r('timeout'), coordinationStatus().until - Date.now() + 200)),
+    new Promise((r) => setTimeout(() => r('timeout'), coordinationStatus().until - Date.now() + 1900)),
   ]);
   assert.notEqual(waited, 'timeout', '窗开时应被放行');
-  void t0;
   resetUpstreamCoordination();
   assert.equal(upstreamCoolingDown(), false);
 });

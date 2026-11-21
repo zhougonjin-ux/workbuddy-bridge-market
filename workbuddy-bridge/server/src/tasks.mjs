@@ -691,8 +691,10 @@ export async function heatmapView(cfg, site, accountId, { force = false } = {}) 
   const { auth } = await ensureToken(cfg, site, { accountId });
   const data = await growthJSON(cfg, site, auth, cfg.sites[site], 'GET', '/activity/growth/heatmap', null, '官方热力图');
   const cells = parseHeatmapCells(data);
-  hmCache.set(key, { at: Date.now(), cells });
-  return { cells, cachedAt: Date.now(), fromCache: false };
+  // 0.4.2：同 taskCenterView——写入与返回共用一个时间戳，防跨毫秒漂移
+  const at = Date.now();
+  hmCache.set(key, { at, cells });
+  return { cells, cachedAt: at, fromCache: false };
 }
 
 /**
@@ -1249,8 +1251,12 @@ export async function taskCenterView(cfg, site, accountId, { force = false, fetc
     return { tasks: hit.tasks, cachedAt: hit.at, fromCache: true };
   }
   const tasks = await fetcher(cfg, site, accountId);
-  tcCache.set(key, { at: Date.now(), tasks });
-  return { tasks, cachedAt: Date.now(), fromCache: false };
+  // 0.4.2：写入与返回用同一个时间戳——两个独立 Date.now() 跨毫秒边界时，
+  // 返回的 cachedAt 比缓存里的 at 大 1ms，测试断言 b.cachedAt === a.cachedAt
+  // 在负载下偶发翻车（2026-11-21 CI 与本地各实锤一次）。
+  const at = Date.now();
+  tcCache.set(key, { at, tasks });
+  return { tasks, cachedAt: at, fromCache: false };
 }
 
 /** 调度预取：所有已登录站点的启用账号各刷一次（已在 TTL 内的跳过）。返回实际拉取的账号数。 */
