@@ -68,17 +68,43 @@ export function invalidateAggregateCatalog(name = null) {
   else catalogCache.delete(name);
 }
 
-/* ---------------- 多 key 轮换 ---------------- */
+/* ---------------- 多 key 轮换 + 熔断（0.4.3，借鉴 dsh-xdpool 的渠道容错） ----------------
+ * key 连续失败 3 次 → 熔断 5 分钟，轮换自动跳过它（全在熔断里就回到轮换，好过没号）；
+ * 一次成功即清零。连接级失败（超时/断连）不算 key 的账——那是 baseUrl 的问题。 */
 const keyIdx = new Map(); // name → 上次用的 key 下标
+const keyHealth = new Map(); // `${name}\u0000${key}` → { fails, coolUntil }
+const KEY_CIRCUIT_FAILS = 3;
+const KEY_CIRCUIT_COOL_MS = 5 * 60_000;
 
-/** provider 的下一个 key（轮换；单 key 恒返回它）。 */
+function keyCooling(name, key, now = Date.now()) {
+  const h = keyHealth.get(`${name}\u0000${key}`);
+  return Boolean(h && h.coolUntil > now);
+}
+
+/** 上报一次聚合请求结果：成功清零连败；连败到阈值熔断该 key 5 分钟。 */
+export function reportAggregateKey(name, key, ok) {
+  if (!key) return;
+  const id = `${name}\u0000${key}`;
+  if (ok) { keyHealth.delete(id); return; }
+  const h = keyHealth.get(id) || { fails: 0, coolUntil: 0 };
+  h.fails += 1;
+  if (h.fails >= KEY_CIRCUIT_FAILS) {
+    h.coolUntil = Date.now() + KEY_CIRCUIT_COOL_MS;
+    warn(`[aggregate:${name}] key ${maskKey(key)} 连续 ${h.fails} 次失败，熔断 5 分钟`);
+  }
+  keyHealth.set(id, h);
+}
+
+/** provider 的下一个 key（跳过熔断中的；单 key 恒返回它）。 */
 export function nextAggregateKey(provider) {
   const keys = (provider.apiKeys || []).filter((k) => typeof k === 'string' && k.trim());
   if (!keys.length) return null;
   if (keys.length === 1) return keys[0];
+  const live = keys.filter((k) => !keyCooling(provider.name, k));
+  const pool = live.length ? live : keys; // 全在熔断里：回到轮换（最后手段仍好过直接失败）
   const i = (keyIdx.get(provider.name) ?? -1) + 1;
-  keyIdx.set(provider.name, i % keys.length);
-  return keys[i % keys.length];
+  keyIdx.set(provider.name, i % pool.length);
+  return pool[i % pool.length];
 }
 
 function maskKey(k) {
@@ -122,8 +148,10 @@ export async function aggregateOpen(cfg, providerName, body, signal) {
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => '');
     signal?.removeEventListener('abort', onAbort);
+    reportAggregateKey(p.name, key, false); // 401/403/429/5xx 都记 key 的账——换下一把
     return { ok: false, status: res.status, text: `聚合渠道 ${p.name} HTTP ${res.status}：${text.slice(0, 200)}`, site: p.name, accountId: label };
   }
+  reportAggregateKey(p.name, key, true);
   log(`[aggregate:${label}] 已接通（HTTP ${res.status}）`);
   async function* frames() {
     const reader = res.body.getReader();

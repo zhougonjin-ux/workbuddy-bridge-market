@@ -54,6 +54,17 @@ const COOLDOWN_STEPS_MS = [0, 30_000, 2 * 60_000, 10 * 60_000, 30 * 60_000];
  */
 const RATE_LIMIT_COOLDOWN_MS = 30_000;
 
+/**
+ * 风控/账号级故障的冷却时长（0.4.3，移植 dsh-xdpool 2.7.1 #127 的分类与处置）。
+ *
+ * 风控：上游把「账号被网关打标」包在 403 + code 11140/11141 里——重新登录改变不了
+ * 标记，只会让用户白白扫码。冷却 30 分钟（与 dsh-xdpool 同款）换号，到期再试。
+ * 账号级故障（request illegal / trial not activated / session not found / 12153）：
+ * 等不来自愈，短冷却救不活——长冷却 6 小时（不判死，到期可复活，避免误判永远埋号）。
+ */
+const RISK_COOLDOWN_MS = 30 * 60_000;
+const ACCOUNT_FAULT_COOLDOWN_MS = 6 * 3600_000;
+
 export function poolPathFor(site) {
   return path.join(getConfigDir(), `auth.${site}.pool.json`);
 }
@@ -280,7 +291,28 @@ export function pickAccount(site, { exclude = [], now = Date.now(), fallback = f
   const skip = new Set(exclude);
   const candidates = pool.accounts.filter((a) => !skip.has(a.id) && a.enabled !== false && a.accessToken);
   const usable = candidates.filter((a) => isUsable(a, now));
-  const 池 = usable.length || !fallback ? usable : candidates;
+  let 池;
+  let fallbackOrdered = false;
+  if (usable.length || !fallback) {
+    池 = usable;
+  } else {
+    // 三段式降级（0.4.3，借鉴 dsh-xdpool rankedPool 的 ready/limited/resting 三带）：
+    // 没有全绿账号时不按策略序随手抓——冷却中的按「谁先恢复」升序（限流几分钟就过，
+    // 排最前），额度耗尽的其次（6h TTL 到期自动复活），账号级故障（风控/request illegal）
+    // 垫底。保留积分线挡掉的按用户指令排除——「这个号要省着用」不该在降级时被悄悄用掉
+    // （dsh 原话：无视它不是韧性，是无视指令）；全员都被保留线挡住时才破例启用。
+    const tier = (a) => (a.accountFaultAt ? 2 : a.exhaustedAt ? 1 : 0);
+    池 = candidates
+      .filter((a) => {
+        const m = Number(a.minRemain);
+        return !(Number.isFinite(m) && m > 0 && typeof a.creditRemain === 'number' && a.creditRemain < m);
+      })
+      .sort((x, y) => tier(x) - tier(y)
+        || ((x.cooldownUntil || 0) - (y.cooldownUntil || 0))
+        || ((x.lastUsedAt || 0) - (y.lastUsedAt || 0)));
+    if (!池.length) 池 = candidates; // 极端时局：最后手段仍好过直接失败
+    fallbackOrdered = true;
+  }
   if (!池.length) return null;
 
   let policy = 'expiry-first';
@@ -299,13 +331,15 @@ export function pickAccount(site, { exclude = [], now = Date.now(), fallback = f
   if (policy === 'sticky' && stickyKey) {
     const hit = stickyPick(site, stickyKey, 池, now);
     if (hit) return hit;
-    const sorted = orderAccounts(池, { policy: 'expiry-first', now });
+    // 降级模式下 池 已按三段式排好（恢复时间序），不能再被策略序覆盖
+    const sorted = fallbackOrdered ? 池 : orderAccounts(池, { policy: 'expiry-first', now });
     const chosen = sorted[0] || null;
     if (chosen) stickyRemember(site, stickyKey, chosen.id, now);
     return chosen;
   }
 
-  const sorted = orderAccounts(池, { policy, pinnedAccountId, now });
+  // 同上：降级模式保留三段式顺序（冷却按恢复时间），正常模式按用户策略排序
+  const sorted = fallbackOrdered ? 池 : orderAccounts(池, { policy, pinnedAccountId, now });
   return sorted[0] || null;
 }
 
@@ -444,7 +478,16 @@ function applyFailure(a, { status = 0, message = '', model = '', modelCooldownMs
   a.lastError = String(message || status || '').slice(0, 200);
   a.lastErrorAt = Date.now();
   a.lastUsedAt = Date.now();
-  if (isRateLimitError(status, message)) {
+  const fault = classifyAccountFault(status, message);
+  if (fault === 'risk_blocked') {
+    // 风控标记（0.4.3）：重登改不了它，按 dsh-xdpool 同款冷却 30 分钟——期间换号，到期再试。
+    a.riskBlockedAt = Date.now();
+    a.cooldownUntil = Math.max(a.cooldownUntil || 0, Date.now() + RISK_COOLDOWN_MS);
+  } else if (fault === 'account_fault') {
+    // 账号级故障：落实「必须让号退场」的注释承诺——长冷却 6 小时（到期可复活，防误判埋号）。
+    a.accountFaultAt = Date.now();
+    a.cooldownUntil = Math.max(a.cooldownUntil || 0, Date.now() + ACCOUNT_FAULT_COOLDOWN_MS);
+  } else if (isRateLimitError(status, message)) {
     // 限流：账号没坏，只是此刻太密。短窗冷却，不打额度耗尽标记。
     a.cooldownUntil = Date.now() + RATE_LIMIT_COOLDOWN_MS;
     if (model) {
@@ -503,6 +546,8 @@ export function markSuccess(site, id, model = '') {
     a.cooldownUntil = null;
     a.lastError = null;
     if (a.exhaustedAt) a.exhaustedAt = null;
+    if (a.riskBlockedAt) a.riskBlockedAt = null;
+    if (a.accountFaultAt) a.accountFaultAt = null;
     if (model && a.modelCooldowns) delete a.modelCooldowns[model];
     a.lastUsedAt = Date.now();
     if (model) a.lastModel = model; // 桌面客户端账号卡显示「上次模型」用
@@ -539,6 +584,7 @@ const failEventAt = new Map(); // `${site}\0${id}\0${status}` → 上次进时�
 export function markFailure(site, id, { status = 0, message = '', model = '', modelCooldownMs = 0 } = {}) {
   const evKey = `${site}\u0000${id}\u0000${status}`;
   const now = Date.now();
+  const fault = classifyAccountFault(status, message);
   if (now - (failEventAt.get(evKey) || 0) > 60_000) {
     failEventAt.set(evKey, now);
     // 事件时间线（T6）：账号失败/冷却进时间线。冷却阶梯会挡住连续重试，
@@ -546,6 +592,8 @@ export function markFailure(site, id, { status = 0, message = '', model = '', mo
     recordEvent(
       'account',
       `账号请求失败${status ? `（HTTP ${status}）` : ''}：${String(message || '未知原因').slice(0, 140)}`
+        + (fault === 'risk_blocked' ? '，判定风控标记（冷却 30 分钟，自动换号）' : '')
+        + (fault === 'account_fault' ? '，判定账号级故障（冷却 6 小时）' : '')
         + (isQuotaError(status, message) ? '，判定额度耗尽' : ''),
       { site, accountId: id },
     );
@@ -674,6 +722,26 @@ const RATE_MARKERS = /rate[\s-]?limit|too many requests|usage limit|请求过于
 
 /** 账号级终态关键词：等不来自愈，短冷却救不活，必须让号退场。 */
 const ACCOUNT_FAULT_MARKERS = /request illegal|trial not activated|session not found|12153/i;
+
+/** 网关风控业务码：账号被标记（重新登录改变不了它）。 */
+const RISK_BLOCK_CODES = ['11140', '11141'];
+
+/**
+ * 账号级故障分类（0.4.3，移植 dsh-xdpool 2.7.1 #127）：
+ *   - 'risk_blocked'   风控标记：业务码 11140/11141（三种 JSON 形态都认）。上游措辞
+ *     会变、数字码不会；200 业务信封里嵌 11140 也按风控算（信封比状态码具体）。
+ *   - 'account_fault'  其他账号级问题（request illegal / trial not activated / …）。
+ *   - null             不是账号级故障——交给限流/额度分类裁决。
+ */
+export function classifyAccountFault(status, body = '') {
+  const text = String(body || '');
+  void status; // 状态码只作参考：信封里的具体业务码比它权威（403 与 200 信封都出现过）
+  for (const code of RISK_BLOCK_CODES) {
+    if (text.includes(`"code":${code}`) || text.includes(`"code": ${code}`) || text.includes(`"code":"${code}"`)) return 'risk_blocked';
+  }
+  if (ACCOUNT_FAULT_MARKERS.test(text)) return 'account_fault';
+  return null;
+}
 
 /** 从报文里取结构化业务码（如 {"code":14003,…}）。 */
 function businessCode(m) {

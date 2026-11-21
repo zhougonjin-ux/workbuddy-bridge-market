@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ensureToken } from './auth.mjs';
-import { markSuccess, markFailure, isQuotaError, isRateLimitError, usableCount, listModelCooldownAccounts, stickyKeyOf, listAccounts } from './pool.mjs';
+import { markSuccess, markFailure, isQuotaError, isRateLimitError, classifyAccountFault, usableCount, listModelCooldownAccounts, stickyKeyOf, listAccounts } from './pool.mjs';
 import { recordRecovered, recordUpstreamCall } from './usage.mjs';
 import {
   fitMessages,
@@ -1223,8 +1223,10 @@ export async function openChatRotating(cfg, site, body, { signal, maxAccounts = 
       } catch (e) { warn('[账号池] 摘要生成失败：', e.message || String(e)); }
       return { up, tried };
     }
-    const 原因 = isRateLimitError(up.status, up.text)
-      ? '触发限流'
+    const fault = classifyAccountFault(up.status, up.text);
+    const 原因 = fault === 'risk_blocked' ? '风控标记（冷却 30 分钟）'
+      : fault === 'account_fault' ? '账号级故障（冷却 6 小时）'
+      : isRateLimitError(up.status, up.text) ? '触发限流'
       : isQuotaError(up.status, up.text) ? '额度不足' : `HTTP ${up.status}`;
     warn(`[${site}] 账号 ${up.accountId} ${原因}，切换下一个账号重试`);
   }
