@@ -471,20 +471,30 @@ export function fitMessages(messages, {
   const 其余 = list.slice(sysEnd);
   const blocks = splitBlocks(其余);
 
-  // 2) 从最老的块开始丢，但至少给最近 minKeepMessages 条留位置
+  // 2) 从最老的块开始丢，但至少给最近 minKeepMessages 条留位置。
+  //    每块只估一次，丢弃时做减法——原先 while 条件里每丢一块就对剩余全量
+  //    estimateMessages（JSON.stringify 整个消息数组 + 逐字符加权），百万 token
+  //    长会话要丢 800+ 块，等于每请求做 800+ 次全量扫描，事件循环被同步卡住
+  //    数秒到数十秒：/health 跟着 1.5 秒超时，看门狗误判服务死亡每分钟拉新实例
+  //    （只会 EADDRINUSE 重试 30 秒后放弃），并发的小请求也被拖到 ttfb 200 秒+
+  //    （2026-11-16 全天事故的根因）。估算近似可加（每块 ceil 误差 ≤1 token，
+  //    预算本身带 5% 安全边），最终 stats.after 仍按全量精确重算一次兜底。
   const 保留条数 = (bs) => bs.reduce((n, b) => n + b.length, 0);
+  const 系统估算 = estimateMessages(系统块);
+  const 块估算 = blocks.map((b) => estimateMessages(b));
+  let 剩余估算 = 系统估算 + 块估算.reduce((a, b) => a + b, 0);
   let 起点 = 0;
-  let 当前 = 系统块.concat(...blocks.map((b) => b));
-  while (起点 < blocks.length && estimateMessages(当前) > 预算) {
+  while (起点 < blocks.length && 剩余估算 > 预算) {
     // 如果丢掉这一块会让剩余条数少于 minKeepMessages，就停下（先保住最近的对话）
     if (保留条数(blocks.slice(起点)) <= minKeepMessages) break;
+    剩余估算 -= 块估算[起点];
     起点++;
-    当前 = 系统块.concat(...blocks.slice(起点));
   }
+  const 当前 = 系统块.concat(...blocks.slice(起点));
   stats.dropped = 起点 > 0 ? 保留条数(blocks.slice(0, 起点)) : 0;
 
   // 3) 还是超 → 从最新往回逐条截断内容（最新的最该保住，所以从最老的开始截）
-  if (estimateMessages(当前) > 预算) {
+  if (剩余估算 > 预算) {
     const 系统token = estimateMessages(系统块);
     const 可分配 = Math.max(512, 预算 - 系统token);
     const 每条预算 = Math.max(256, Math.floor(可分配 / Math.max(1, 当前.length - 系统块.length)));

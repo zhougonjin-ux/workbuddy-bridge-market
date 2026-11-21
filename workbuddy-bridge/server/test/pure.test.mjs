@@ -713,17 +713,18 @@ test('B4 端到端：隔离实例跑完整同步，全局 provider_config.json �
   const restore = setConfigDir(iso);
   try {
     delete process.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
-    // 端口指向一个不存在的服务 → fetchPickerModels 失败 → 走 fallbackModels，
-    // 与试启事故里「试启实例照样写全局配置」的路径完全一致
+    // 端口指向一个不存在的服务 → fetchPickerModels 失败。0.4.2 起**跳过本轮**，
+    // 绝不再把 fallbackModels（DEFAULT_MODELS 6 条）写进选择器——那会让 ZCode
+    // 60 秒内热加载缩水清单，钉住的模型全部失效（「模型已不可用」的根源，
+    // 10-03/10-04/11-14/11-16 共发生 8 次）。
     const r = await runProviderConfigSync({
       port: 8794,
       apiKey: 'sk-wb-test',
       fallbackModels: ['space-bunny (x0.03)'],
     });
-    assert.equal(r.target, path.join(iso, 'provider_config.json'), '同步目标应是隔离目录');
-    assert.ok(fs.existsSync(path.join(iso, 'provider_config.json')), '隔离目录里应生成配置文件');
-    const written = fs.readFileSync(path.join(iso, 'provider_config.json'), 'utf8');
-    assert.match(written, /127\.0\.0\.1:8794/, '隔离实例自己写自己的端口（允许）');
+    assert.equal(r.result, 'skipped-no-models', '拉不到清单应跳过本轮');
+    assert.equal(r.models, 0);
+    assert.ok(!fs.existsSync(path.join(iso, 'provider_config.json')), '兜底清单绝不能写进配置文件');
     assert.equal(
       fs.readFileSync(sentinel, 'utf8'),
       sentinelBody,
@@ -798,8 +799,9 @@ test('模型分组按 site（权威）而不是模型名正则：腾讯/华为�
   const rules = doc.config.providerConfigRules.providerRules;
   const wb = rules.find((x) => x.providerId === 'workbuddy-bridge');
   const ca = rules.find((x) => x.providerId === 'workbuddy-bridge-codearts');
-  assert.deepEqual(wb.config.personalModelIds, ['glm-5.2 (x0.3)'], '腾讯站点模型进 WorkBuddy');
-  assert.deepEqual(ca.config.personalModelIds, ['GLM-5.2 (x0.7)', 'brand-new-huawei-sku (x0.2)'], '华为站点模型全部进 CodeArts');
+  // 0.4.2：选择器 ID 一律裸 ID（倍率后缀含观测成本，翻变会废掉钉住旧 ID 的会话）
+  assert.deepEqual(wb.config.personalModelIds, ['glm-5.2'], '腾讯站点模型进 WorkBuddy（裸 ID）');
+  assert.deepEqual(ca.config.personalModelIds, ['GLM-5.2', 'brand-new-huawei-sku'], '华为站点模型全部进 CodeArts（裸 ID）');
 });
 
 test('兜底模型没有 site 时仍按名字正则分组（升级兼容）', async () => {
@@ -817,8 +819,87 @@ test('兜底模型没有 site 时仍按名字正则分组（升级兼容）', as
     target,
   });
   const rules = JSON.parse(fs.readFileSync(target, 'utf8')).config.providerConfigRules.providerRules;
-  assert.deepEqual(rules.find((x) => x.providerId === 'workbuddy-bridge').config.personalModelIds, ['glm-5.3 (x0.69)']);
-  assert.deepEqual(rules.find((x) => x.providerId === 'workbuddy-bridge-codearts').config.personalModelIds, ['codearts/glm-5.3 (x0.69)']);
+  assert.deepEqual(rules.find((x) => x.providerId === 'workbuddy-bridge').config.personalModelIds, ['glm-5.3']);
+  assert.deepEqual(rules.find((x) => x.providerId === 'workbuddy-bridge-codearts').config.personalModelIds, ['codearts/glm-5.3']);
+});
+
+/* ---------------- 0.4.2 选择器稳定性：裸 ID / 缩量护栏 ---------------- */
+
+// 背景见 pickersync.mjs 0.4.2 注释。「当前使用的模型已不可用」的三个来源：
+// 兜底清单泄漏（B4 已测）、倍率后缀随观测/促销翻变、上游目录抖动缩水。
+test('0.4.2 裸 ID 稳定化：倍率/免费后缀剥离，跨站点同名去重', async () => {
+  const { syncProviderConfigFile } = await import('../src/pickersync.mjs');
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-bareid-'));
+  const target = path.join(iso, 'provider_config.json');
+  const base = { contextWindow: 200000, maxOutputTokens: 32000, supportsImages: false };
+  const r = syncProviderConfigFile({
+    apiKey: 'sk-wb-test',
+    baseUrl: 'http://127.0.0.1:8788/v1',
+    models: [
+      { ...base, id: 'glm-5.3 (x0.69)', site: 'cn-cli' },
+      { ...base, id: 'hy4flash-free (免费)', site: 'cn-cli' },
+      // 同一模型的另一倍率变体（促销翻转后）：裸 ID 相同 → 去重保留第一个
+      { ...base, id: 'glm-5.3 (免费)', site: 'cn-cli' },
+    ],
+    target,
+  });
+  assert.equal(r, 'written');
+  const wb = JSON.parse(fs.readFileSync(target, 'utf8'))
+    .config.providerConfigRules.providerRules.find((x) => x.providerId === 'workbuddy-bridge');
+  assert.deepEqual(wb.config.personalModelIds, ['glm-5.3', 'hy4flash-free'], '裸 ID 且已去重');
+});
+
+test('0.4.2 keepMultiplierSuffix:true 恢复旧行为（保留后缀）', async () => {
+  const { syncProviderConfigFile } = await import('../src/pickersync.mjs');
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-suffix-'));
+  const target = path.join(iso, 'provider_config.json');
+  const r = syncProviderConfigFile({
+    apiKey: 'sk-wb-test',
+    baseUrl: 'http://127.0.0.1:8788/v1',
+    models: [{ id: 'glm-5.3 (x0.69)', contextWindow: 200000, maxOutputTokens: 32000, supportsImages: false, site: 'cn-cli' }],
+    target,
+    keepMultiplierSuffix: true,
+  });
+  assert.equal(r, 'written');
+  const wb = JSON.parse(fs.readFileSync(target, 'utf8'))
+    .config.providerConfigRules.providerRules.find((x) => x.providerId === 'workbuddy-bridge');
+  assert.deepEqual(wb.config.personalModelIds, ['glm-5.3 (x0.69)'], '旧行为可配置恢复');
+});
+
+test('0.4.2 缩量护栏：上游抖动缩水 30%+ 先跳过，连续 3 轮才放行', async () => {
+  const { syncProviderConfigFile, _resetShrinkGuard } = await import('../src/pickersync.mjs');
+  _resetShrinkGuard();
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-shrink-'));
+  const target = path.join(iso, 'provider_config.json');
+  const base = { contextWindow: 200000, maxOutputTokens: 32000, supportsImages: false, site: 'cn-cli' };
+  const ten = Array.from({ length: 10 }, (_, i) => ({ ...base, id: `m-${i}` }));
+  assert.equal(syncProviderConfigFile({ apiKey: 'k', baseUrl: 'b', models: ten, target }), 'written');
+  const full = fs.readFileSync(target, 'utf8');
+
+  // 上游抖动：一轮只剩 4 个（少 6 个 ≥ 30%×10=3）→ 跳过，文件保持原样
+  const four = ten.slice(0, 4);
+  assert.equal(syncProviderConfigFile({ apiKey: 'k', baseUrl: 'b', models: four, target }), 'skipped-shrink', '第 1 轮跳过');
+  assert.equal(syncProviderConfigFile({ apiKey: 'k', baseUrl: 'b', models: four, target }), 'skipped-shrink', '第 2 轮跳过');
+  assert.equal(fs.readFileSync(target, 'utf8'), full, '护栏期间文件逐字节不变');
+
+  // 连续第 3 轮仍是缩水清单 → 认定真下架，放行写入
+  assert.equal(syncProviderConfigFile({ apiKey: 'k', baseUrl: 'b', models: four, target }), 'written', '第 3 轮放行');
+  const doc = JSON.parse(fs.readFileSync(target, 'utf8'));
+  const wb = doc.config.providerConfigRules.providerRules.find((x) => x.providerId === 'workbuddy-bridge');
+  assert.equal(wb.config.personalModelIds.length, 4, '放行后按新清单写入');
+});
+
+test('0.4.2 缩量护栏：小幅增减（<30%）不受影响，正常写入', async () => {
+  const { syncProviderConfigFile, _resetShrinkGuard } = await import('../src/pickersync.mjs');
+  _resetShrinkGuard();
+  const iso = fs.mkdtempSync(path.join(os.tmpdir(), 'wb-shrink2-'));
+  const target = path.join(iso, 'provider_config.json');
+  const base = { contextWindow: 200000, maxOutputTokens: 32000, supportsImages: false, site: 'cn-cli' };
+  const ten = Array.from({ length: 10 }, (_, i) => ({ ...base, id: `m-${i}` }));
+  syncProviderConfigFile({ apiKey: 'k', baseUrl: 'b', models: ten, target });
+  // 少 1 个（上游正常下架一个模型）：直接跟随，不触发护栏
+  const r = syncProviderConfigFile({ apiKey: 'k', baseUrl: 'b', models: ten.slice(0, 9), target });
+  assert.equal(r, 'written', '小幅缩减应直接写入');
 });
 
 /* ---------------- T33/T34/T35/T36/T37/T39：新功能纯函数 ---------------- */

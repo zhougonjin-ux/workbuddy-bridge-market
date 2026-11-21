@@ -28,6 +28,7 @@ import { runTasks, taskStatus, startTaskLoop, stopTaskLoop } from './src/tasks.m
 import { startHealthLoop, stopHealthLoop } from './src/health.mjs';
 import { startWeeklyLoop, stopWeeklyLoop } from './src/weekly.mjs';
 import { startBackupLoop, stopBackupLoop } from './src/backup.mjs';
+import { startSyncLoop, stopSyncLoop } from './src/sync.mjs';
 import { startDoctorLoop, stopDoctorLoop } from './src/doctor.mjs';
 import { importLocalAccounts, startLocalImportWatch, stopLocalImportWatch } from './src/localimport.mjs';
 import { startProviderConfigSync, stopProviderConfigSync, triggerProviderConfigSyncNow } from './src/pickersync.mjs';
@@ -507,7 +508,20 @@ const server = http.createServer(async (req, res) => {
         }, { 'X-WB-New-Token': CONSOLE_TOKEN });
       }
       const body = req.method === 'POST' ? await readJsonBody(req) : null;
-      return await handleConsoleApi({ cfg, req, res, url, body });
+      return await handleConsoleApi({
+        cfg, req, res, url, body,
+        // 多端同步拉取落盘后刷新运行时 cfg：按顶层字段替换（cfg 是全模块共享的同一对象，
+        // 不能整体重新赋值，否则各模块闭包里握着的旧 cfg 就脱钩了）
+        reloadConfigAfterSync() {
+          try {
+            const fresh = loadConfig();
+            for (const k of Object.keys(fresh)) cfg[k] = fresh[k];
+            log('[sync] 已应用远端配置并刷新运行时 cfg');
+          } catch (e) {
+            warn('[sync] 远端配置刷新失败：' + (e.message || e));
+          }
+        },
+      });
     }
 
     // 只读「发现类」接口：放行免鉴权。
@@ -837,12 +851,13 @@ server.listen(cfg.port, listenHost, () => {
   startWeeklyLoop(cfg);
   startBackupLoop(cfg);
   startDoctorLoop(cfg);
+  startSyncLoop(cfg);
   startProviderConfigSync(cfg, (e) => warn('模型池自动同步失败：', e.message));
   // 生命周期依赖注入：交棒重启（/admin/restart、/console/api/service/restart 共用）
   // 需要活跃计数与各循环的 stop/flush 函数；onClose 走 server.close → 进程退出。
   bootLifecycle({
     activeRequestsRef: () => activeRequests,
-    stoppers: [stopCreditLoop, stopTaskLoop, stopHealthLoop, stopWeeklyLoop, stopBackupLoop, stopDoctorLoop, stopProviderConfigSync, stopLocalImportWatch],
+    stoppers: [stopCreditLoop, stopTaskLoop, stopHealthLoop, stopWeeklyLoop, stopBackupLoop, stopDoctorLoop, stopSyncLoop, stopProviderConfigSync, stopLocalImportWatch],
     flushers: [flushUsage, flushPool, flushLearned, flushEvents],
   });
   setRestartHandler(doRestart);
@@ -877,3 +892,14 @@ process.on('SIGINT', () => {
 });
 process.on('unhandledRejection', (e) => error('未处理的 Promise 异常：', e));
 process.on('uncaughtException', (e) => error('未处理的同步异常（进程保活）：', e)); // 0.3.61：会话依赖本服务，崩了断线；记录但绝不退出
+
+// 退出终笔（2026-11-17 排查事故新增）：所有优雅退出路径（gracefulExit/SIGINT/绑定失败）
+// 都有自己的日志，但「事件循环空了自退」和「外部硬杀（任务管理器/杀软）」此前完全无痕，
+// 三次静默消失只能靠排除法倒推。exit 事件是同步终笔的最后机会：
+//   - 有这行 + code=0 → 进程自己退的（去查句柄谁被 unref 清空了）
+//   - 没这行 → 进程是被 TerminateProcess 级硬杀的（任务管理器结束进程不触发 exit 事件）
+process.on('exit', (code) => {
+  try {
+    fs.writeSync(2, `[${new Date().toLocaleString()}] 进程退出 code=${code}（uptime=${Math.round(process.uptime())}s，hookSpawn=${process.env.WB_HOOK_SPAWN ? '1' : '0'}）\n`);
+  } catch { /* 终笔尽力而为 */ }
+});

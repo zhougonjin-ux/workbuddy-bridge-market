@@ -124,11 +124,20 @@ export function buildModelRule(m) {
   };
 }
 
+/** 缩量护栏的连续计数：比上一份已同步清单少超阈值时累加，连续 3 轮才放行写入。 */
+let shrinkStrikes = 0;
+
+/** 仅测试用：重置缩量护栏计数（模块级状态会跨用例存活）。 */
+export function _resetShrinkGuard() {
+  shrinkStrikes = 0;
+}
+
 /**
  * 把 WorkBuddy 供应商条目合并进 provider_config.json（只动自己的条目）。
- * 返回 'written' | 'unchanged'；结构不合法的现存文件不动（那是应用恢复逻辑的事）。
+ * 返回 'written' | 'unchanged' | 'skipped-shrink'；结构不合法的现存文件不动（那是应用恢复逻辑的事）。
+ * 0.4.2：keepMultiplierSuffix=true 时保留倍率后缀（旧行为）；默认剥掉（ID 稳定化）。
  */
-export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
+export function syncProviderConfigFile({ apiKey, baseUrl, models, target, keepMultiplierSuffix = false }) {
   // 读文件时区分「不存在」与「存在但读不了/解析不了」：后者绝不能整份重建——
   // ZCode 自己也在写这个文件（共享锁/半截写入），整份重建会把用户的其他供应商
   // 条目连同 apiKey 一起抹掉。跳过本轮，等下一轮 30 分钟后再试。
@@ -185,10 +194,48 @@ export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
   // 回落到 codeartsGroupOf 的名字正则。这样上游新增华为 SKU 不需要改代码，
   // 腾讯/华为同名模型（glm-5.2 vs GLM-5.2）也不会再错分。
   const isCodeartsModel = (m) => (m.site ? m.site === 'codearts' : codeartsGroupOf(m.id));
-  const wbModels = models.filter((m) => !isCodeartsModel(m));
-  const caModels = models.filter((m) => isCodeartsModel(m));
+  // 0.4.2：写进选择器的模型 ID 一律用裸 ID（config.json 设 "pickerMultiplierSuffix": true
+  // 可恢复旧行为）。倍率后缀（" (x0.29)"/" (免费)"）来自目录价 + 最近一次实付观测——
+  // 夜间免费时段一次实付 0 就从 (x0.11) 翻成 (免费)，促销调价再翻回来；ID 一变，
+  // ZCode 里钉住旧 ID 的会话全部「当前使用的模型已不可用」。请求路由两种写法本来就
+  // 都认（resolveTargetInner 会剥后缀），裸 ID 是唯一稳定形态。剥后缀后跨站点同名
+  // 模型（cn-cli/intl-cli 各一份）会撞 ID，去重保留第一个。
+  const stripMult = (id) => String(id || '').replace(/\s*\((?:x[\d.]+|免费)\)\s*$/, '').trim();
+  const normalizeList = (list) => {
+    const out = [];
+    const seenIds = new Set();
+    for (const m of list) {
+      const id = keepMultiplierSuffix ? m.id : stripMult(m.id);
+      if (!id || seenIds.has(id)) continue;
+      seenIds.add(id);
+      out.push(keepMultiplierSuffix ? m : { ...m, id });
+    }
+    return out;
+  };
+  const wbModels = normalizeList(models.filter((m) => !isCodeartsModel(m)));
+  const caModels = normalizeList(models.filter((m) => isCodeartsModel(m)));
   const personalModelIds = wbModels.map((m) => m.id);
   if (personalModelIds.length === 0 && !previous) return 'skipped'; // 首次注册但一个模型都拿不到，等下次
+
+  // 0.4.2 缩量护栏：上游目录抖动（网关 500/部分超时）会让某一轮清单比上一份已同步
+  // 的少一大截。上一份清单就存在这份文件的 personalModelIds 里——少超过 30%（且
+  // 至少 2 个）时视为抖动，跳过本轮不写；连续 3 轮都这么少才认定为真下架，放行写入。
+  // 否则一次上游抖动 = ZCode 60 秒内热加载缩水清单 = 用户钉住的模型全部失效。
+  const prevBareIds = Array.isArray(previous?.config?.personalModelIds)
+    ? [...new Set(previous.config.personalModelIds.map(stripMult).filter(Boolean))]
+    : [];
+  if (prevBareIds.length && personalModelIds.length < prevBareIds.length) {
+    const dropped = prevBareIds.length - personalModelIds.length;
+    const threshold = Math.max(2, Math.ceil(prevBareIds.length * 0.3));
+    if (dropped >= threshold) {
+      shrinkStrikes += 1;
+      if (shrinkStrikes < 3) return 'skipped-shrink';
+    } else {
+      shrinkStrikes = 0;
+    }
+  } else {
+    shrinkStrikes = 0;
+  }
 
   const buildProviderEntry = (providerId, providerName, list) => ({
     providerId,
@@ -246,19 +293,21 @@ export function syncProviderConfigFile({ apiKey, baseUrl, models, target }) {
 }
 
 /**
- * 完整同步流程：拉模型清单（代理不在时退回 fallbackModels，
- * 再不行保留已注册的旧清单）→ 合并写入。异常向上抛由调用方兜住。
+ * 完整同步流程：拉模型清单 → 合并写入。异常向上抛由调用方兜住。
+ * 0.4.2：清单拉不到（代理忙/上游目录失败）时**跳过本轮**，绝不再拿 fallbackModels
+ * （DEFAULT_MODELS 6 条）写入——兜底清单写进 provider_config.json 后，ZCode 60 秒内
+ * 热加载，用户钉住的模型瞬间消失 →「当前使用的模型已不可用」。历史：10-03/10-04/
+ * 11-14/11-16 共 8 轮同步把 6 条兜底清单写进去过。保留上一份配置永远比写入缩水
+ * 清单安全；fallbackModels 参数保留兼容旧调用方，但不再使用。
  */
-export async function runProviderConfigSync({ port, apiKey, fallbackModels = [] }) {
+export async function runProviderConfigSync({ port, apiKey }) {
   let models = [];
   try {
     models = await fetchPickerModels(port);
   } catch {
-    /* 代理没起来，走兜底 */
+    /* 拉不到就跳过本轮 */
   }
-  if (models.length === 0 && fallbackModels.length > 0) {
-    models = fallbackModels.map((id) => ({ id, contextWindow: null, maxOutputTokens: null, supportsImages: false }));
-  }
+  if (!models.length) return { result: 'skipped-no-models', models: 0, target: providerConfigTarget() };
   const target = providerConfigTarget();
   const result = syncProviderConfigFile({ apiKey, baseUrl: `http://127.0.0.1:${port}/v1`, models, target });
   return { result, models: models.length, target };
@@ -280,7 +329,7 @@ export async function triggerProviderConfigSyncNow() {
     const r = await runProviderConfigSync({
       port: currentCfg.port,
       apiKey: primaryKey(currentCfg),
-      fallbackModels: (currentCfg.models || []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
+      keepMultiplierSuffix: currentCfg.pickerMultiplierSuffix === true,
     });
     if (r.result === 'written') {
       const { log } = await import('./log.mjs');
@@ -303,7 +352,7 @@ export function startProviderConfigSync(cfg, onError) {
       const r = await runProviderConfigSync({
         port: cfg.port,
         apiKey: primaryKey(cfg),
-        fallbackModels: (cfg.models || []).map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean),
+        keepMultiplierSuffix: cfg.pickerMultiplierSuffix === true,
       });
       if (r.result === 'written') {
         const { log } = await import('./log.mjs');

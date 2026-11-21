@@ -258,7 +258,7 @@ export function usageFiltered(days = 7, { model = '', site = '' } = {}) {
   const byModel = new Map();
   for (const k of keys) {
     const d = data.days[k] || {};
-    const day = { date: k, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, models: 0 };
+    const day = { date: k, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, cacheHitTokens: 0, models: 0 };
     for (const [mid, m] of Object.entries(d.models || {})) {
       const name = String(m.model || mid);
       if (needle && !name.toLowerCase().includes(needle) && !String(mid).toLowerCase().includes(needle)) continue;
@@ -269,6 +269,7 @@ export function usageFiltered(days = 7, { model = '', site = '' } = {}) {
       day.completionTokens += m.completionTokens || 0;
       day.credit += m.credit || 0;
       day.ms += m.ms || 0;
+      day.cacheHitTokens += m.cacheHitTokens || 0;
       day.models += 1;
       const cur = byModel.get(mid) || {
         id: mid, site: m.site, model: name, calls: 0, errors: 0, promptTokens: 0, completionTokens: 0, credit: 0, ms: 0, cacheHitTokens: 0,

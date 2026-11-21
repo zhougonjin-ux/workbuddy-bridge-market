@@ -62,9 +62,19 @@ function runTar(args, cwd) {
   return new Promise((resolve, reject) => {
     const p = spawn(process.platform === 'win32' ? 'tar.exe' : 'tar', args, { cwd, windowsHide: true });
     let err = '';
+    // tar 偶发卡死（杀毒软件扫包 / 磁盘卡顿）会让 selfUpdate 的 Promise 永不落定，
+    // 控制台请求悬死——60 秒兜底杀掉。
+    const timer = setTimeout(() => {
+      try { p.kill(); } catch { /* 已退出 */ }
+      reject(new Error('tar 解压超时（60 秒）'));
+    }, 60_000);
     p.stderr.on('data', (d) => { err += d.toString(); });
-    p.on('error', reject);
-    p.on('close', (code) => (code === 0 ? resolve() : reject(new Error(`tar 退出码 ${code}：${err.slice(0, 300)}`))));
+    p.on('error', (e) => { clearTimeout(timer); reject(e); });
+    p.on('close', (code) => {
+      clearTimeout(timer);
+      if (code === 0) resolve();
+      else reject(new Error(`tar 退出码 ${code}：${err.slice(0, 300)}`));
+    });
   });
 }
 

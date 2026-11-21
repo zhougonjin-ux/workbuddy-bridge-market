@@ -892,3 +892,14 @@ process.on('SIGINT', () => {
 });
 process.on('unhandledRejection', (e) => error('未处理的 Promise 异常：', e));
 process.on('uncaughtException', (e) => error('未处理的同步异常（进程保活）：', e)); // 0.3.61：会话依赖本服务，崩了断线；记录但绝不退出
+
+// 退出终笔（2026-11-17 排查事故新增）：所有优雅退出路径（gracefulExit/SIGINT/绑定失败）
+// 都有自己的日志，但「事件循环空了自退」和「外部硬杀（任务管理器/杀软）」此前完全无痕，
+// 三次静默消失只能靠排除法倒推。exit 事件是同步终笔的最后机会：
+//   - 有这行 + code=0 → 进程自己退的（去查句柄谁被 unref 清空了）
+//   - 没这行 → 进程是被 TerminateProcess 级硬杀的（任务管理器结束进程不触发 exit 事件）
+process.on('exit', (code) => {
+  try {
+    fs.writeSync(2, `[${new Date().toLocaleString()}] 进程退出 code=${code}（uptime=${Math.round(process.uptime())}s，hookSpawn=${process.env.WB_HOOK_SPAWN ? '1' : '0'}）\n`);
+  } catch { /* 终笔尽力而为 */ }
+});

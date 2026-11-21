@@ -8,6 +8,7 @@
 // 行为约定：幂等（活着就不动）、绝不抛错（失败返回状态对象）、
 // 分离进程拉起（不随宿主退出）、autostart.json 开关可永久关闭。
 import { spawn } from 'node:child_process';
+import net from 'node:net';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -70,6 +71,28 @@ export async function isProxyAlive(port, timeoutMs = 1500) {
 }
 
 /**
+ * 端口上有没有活进程在监听（原始 TCP 连接，几十毫秒出结果）。
+ *
+ * 与 isProxyAlive 的区别：/health 是 HTTP 层探测，事件循环被大请求（如百万 token
+ * 会话的压缩）卡住时会超时，但端口仍被活实例占着——这时再拉新实例只会
+ * EADDRINUSE 重试 30 秒后放弃，除了刷日志毫无作用（2026-11-16 全天事故）。
+ * TCP 能连上 = 有 LISTENER = 一定不要拉起。TIME_WAIT 不影响 connect，不会误报。
+ */
+export function tcpReachable(port, timeoutMs = 1000) {
+  return new Promise((resolve) => {
+    const s = net.connect({ host: '127.0.0.1', port });
+    const done = (v) => {
+      clearTimeout(t);
+      try { s.destroy(); } catch { /* 已销毁 */ }
+      resolve(v);
+    };
+    const t = setTimeout(() => done(false), timeoutMs);
+    s.once('connect', () => done(true));
+    s.once('error', () => done(false));
+  });
+}
+
+/**
  * 分离进程拉起代理（不随宿主退出），返回是否成功发起。
  * 子进程输出落到数据目录 server.log（带来源标注）：拉起失败时可以查原因，不再静默消失。
  * 超过 5 MB 时轮转为 server.log.1（只保留一份）：常驻服务每天重启会无限追加，
@@ -116,6 +139,9 @@ export async function ensureProxyRunning({ waitMs = 0, source = 'unknown' } = {}
     if (autostartDisabled()) return { ok: true, action: 'disabled' };
     const port = readPort();
     if (await isProxyAlive(port)) return { ok: true, action: 'alive', port };
+    // /health 不通但 TCP 能连上：有活实例占着端口（多半是事件循环被大请求暂时卡住）。
+    // 拉新实例注定 EADDRINUSE，只会白刷 30 秒端口重试日志——按「活着」处理，不拉。
+    if (await tcpReachable(port)) return { ok: true, action: 'alive', port, note: 'health-timeout-port-busy' };
     if (!fs.existsSync(SERVER_ENTRY)) return { ok: false, action: 'missing', port };
     if (!spawnProxy(source)) return { ok: false, action: 'spawn-failed', port };
     if (waitMs > 0) {
